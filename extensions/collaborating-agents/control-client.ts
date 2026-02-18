@@ -95,6 +95,7 @@ export async function sendPromptAndWaitTurnEnd(
 
     let buffer = "";
     let sendAcked = false;
+    let pendingTurnEndData: { message?: { content?: string }; turnIndex?: number } | null = null;
     let settled = false;
 
     const done = (err?: Error, result?: RemoteTurnResult) => {
@@ -109,6 +110,13 @@ export async function sendPromptAndWaitTurnEnd(
       }
       if (err) reject(err);
       else resolve(result ?? { assistantText: "" });
+    };
+
+    const finishFromTurnEnd = (data: { message?: { content?: string }; turnIndex?: number }) => {
+      done(undefined, {
+        assistantText: data.message?.content || "",
+        turnIndex: data.turnIndex,
+      });
     };
 
     const timeout = setTimeout(() => {
@@ -143,20 +151,26 @@ export async function sendPromptAndWaitTurnEnd(
               return;
             }
             sendAcked = true;
+            if (pendingTurnEndData) {
+              finishFromTurnEnd(pendingTurnEndData);
+              return;
+            }
           }
           continue;
         }
 
         if (parsed.type === "event" && parsed.event === "turn_end") {
-          if (!sendAcked) continue;
           const data = (parsed.data || {}) as {
             message?: { content?: string };
             turnIndex?: number;
           };
-          done(undefined, {
-            assistantText: data.message?.content || "",
-            turnIndex: data.turnIndex,
-          });
+
+          if (!sendAcked) {
+            pendingTurnEndData = data;
+            continue;
+          }
+
+          finishFromTurnEnd(data);
           return;
         }
       }

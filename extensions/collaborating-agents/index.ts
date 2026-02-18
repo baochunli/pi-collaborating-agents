@@ -16,7 +16,6 @@ import {
   processInbox,
   readMessageLog,
   readMessageLogTail,
-  clearMessageLog,
   registerSelf,
   sendBroadcast,
   sendDirect,
@@ -348,6 +347,9 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           refreshRegistration(ctx);
         }, WATCH_DEBOUNCE_MS);
       });
+
+      // Drain once more after attaching the watcher to reduce startup race windows.
+      processInboxNow();
     } catch {
       ctx.ui.notify("collaborating-agents: failed to start inbox watcher", "warning");
     }
@@ -770,7 +772,6 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     refreshRegistration(ctx);
 
     if (!process.env.PI_AGENT_NAME && !state.hasClearedSubagentHistory) {
-      clearMessageLog(dirs);
       state.hasClearedSubagentHistory = true;
     }
 
@@ -1156,7 +1157,6 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     state.activeSubagentRuns += 1;
     state.completedSubagents = [];
     state.unreadCounts.clear();
-    clearMessageLog(dirs);
     updateStatus(ctx);
 
     void (async () => {
@@ -1885,7 +1885,10 @@ By default subagents use the same model as the spawning session.` ,
     stopWatcher();
     stopRemoteSessionAutoRefresh();
     if (state.registered) {
-      unregisterSelf(dirs, state.agentName);
+      unregisterSelf(dirs, state.agentName, {
+        pid: process.pid,
+        sessionId: lastContext?.sessionManager.getSessionId(),
+      });
       state.registered = false;
     }
     if (lastContext) clearStatus(lastContext);

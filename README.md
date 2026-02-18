@@ -49,7 +49,7 @@ The `/agents` slash command opens an integrated _agents and messages_ overlay wi
   - `File reservations` tab shows active reservation patterns and which agent currently owns each one.
   - `Chat` tab provides a shared chat stream and input box for `@all` broadcasts and direct `@AgentName` messages.
 
-Newly-started agents show up immediately; if their transcript file is not persisted yet they are marked `session pending`. Completed subagents remain visible in the `Agents` tab as `completed` until the next time an orchestrator agent spawns new subagents, which clears prior historical subagent states and their messages.
+Newly-started agents show up immediately; if their transcript file is not persisted yet they are marked `session pending`. Completed subagents remain visible in the `Agents` tab as `completed` until the next time an orchestrator agent spawns new subagents, which clears prior historical completed-subagent entries from that list.
 
 Messaging input is available in the `Chat` tab. Use `@AgentName message` for direct messages or `@all message` for broadcast. Prefix the message body with `!!` to mark it urgent.
 

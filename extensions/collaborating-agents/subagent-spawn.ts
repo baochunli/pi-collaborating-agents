@@ -415,7 +415,8 @@ export async function runSpawnTask(
   },
 ): Promise<SpawnResult> {
   const generatedCallsign = reserveReadableCallsign(options.runId, options.index);
-  const childName = sanitizeAgentName(`${task.agent}-${generatedCallsign}`);
+  const runToken = options.runId.slice(0, 4);
+  const childName = sanitizeAgentName(`${task.agent}-${runToken}-${generatedCallsign}`);
 
   const args: string[] = ["--mode", "json", "-p"];
   if (options.enableSessionControl !== false) args.push("--session-control");
