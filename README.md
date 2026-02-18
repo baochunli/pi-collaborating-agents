@@ -20,6 +20,12 @@ pi config
 
 To confirm that the `collaborating-agents` extension and the `collaborating-agents-system` skill have been activated. Use `Esc` to leave the configuration session.
 
+To uninstall this extension:
+
+```bash
+pi remove https://github.com/baochunli/pi-collaborating-Agents
+```
+
 ## Opening the _Agents and Messages_ Overlay with the `/agents` Command
 
 The `/agents` slash command opens an integrated _agents and messages_ overlay, which includes the following tabs:
