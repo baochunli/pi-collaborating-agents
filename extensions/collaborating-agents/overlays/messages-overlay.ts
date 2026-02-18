@@ -206,9 +206,19 @@ export class MessagesOverlay implements Component, Focusable {
     this.mentionCompletion = null;
   }
 
-  private currentMentionToken(): string | null {
-    const match = this.inputText.match(/^@([^\s]*)$/);
-    return match ? (match[1] ?? "") : null;
+  private currentMentionRange(): { atIndex: number; token: string } | null {
+    const atIndex = this.inputText.lastIndexOf("@");
+    if (atIndex === -1) return null;
+
+    if (atIndex > 0) {
+      const prev = this.inputText[atIndex - 1] ?? "";
+      if (!/\s/.test(prev)) return null;
+    }
+
+    const token = this.inputText.slice(atIndex + 1);
+    if (token.includes(" ")) return null;
+
+    return { atIndex, token };
   }
 
   private getMentionCandidates(agents: AgentRegistration[]): string[] {
@@ -224,8 +234,6 @@ export class MessagesOverlay implements Component, Focusable {
       out.push(value);
     };
 
-    add("all");
-
     for (const agent of agents) {
       add(this.displayAgentName(agent.name));
       add(this.normalizeAgentDisplayName(agent.name));
@@ -235,8 +243,8 @@ export class MessagesOverlay implements Component, Focusable {
   }
 
   private tryCompleteMention(agents: AgentRegistration[], direction: 1 | -1): boolean {
-    const token = this.currentMentionToken();
-    if (token === null) {
+    const mention = this.currentMentionRange();
+    if (!mention) {
       this.resetMentionCompletion();
       return false;
     }
@@ -247,7 +255,7 @@ export class MessagesOverlay implements Component, Focusable {
       return false;
     }
 
-    const lowerToken = token.toLowerCase();
+    const lowerToken = mention.token.toLowerCase();
     const active = this.mentionCompletion;
     if (active && active.candidates.length > 0) {
       const current = active.candidates[active.index];
@@ -260,7 +268,7 @@ export class MessagesOverlay implements Component, Focusable {
         const nextIndex = (active.index + direction + active.candidates.length) % active.candidates.length;
         active.index = nextIndex;
         const completed = active.candidates[nextIndex] ?? "";
-        this.inputText = `@${completed}`;
+        this.inputText = `${this.inputText.slice(0, mention.atIndex)}@${completed}`;
 
         const resolvedTarget = this.resolveChatTarget(completed, agents);
         if (resolvedTarget) this.chatTarget = `@${resolvedTarget}`;
@@ -279,7 +287,7 @@ export class MessagesOverlay implements Component, Focusable {
     const index = direction === 1 ? 0 : matches.length - 1;
     this.mentionCompletion = { candidates: matches, index };
     const completed = matches[index] ?? "";
-    this.inputText = `@${completed}`;
+    this.inputText = `${this.inputText.slice(0, mention.atIndex)}@${completed}`;
 
     const resolvedTarget = this.resolveChatTarget(completed, agents);
     if (resolvedTarget) this.chatTarget = `@${resolvedTarget}`;
@@ -407,7 +415,7 @@ export class MessagesOverlay implements Component, Focusable {
     }
 
     if (matchesKey(data, "tab")) {
-      if (this.selectedTab === CHAT_TAB && this.currentMentionToken() !== null) {
+      if (this.selectedTab === CHAT_TAB && this.currentMentionRange() !== null) {
         this.tryCompleteMention(agents, 1);
         return;
       }
@@ -417,7 +425,7 @@ export class MessagesOverlay implements Component, Focusable {
     }
 
     if (matchesKey(data, "shift+tab")) {
-      if (this.selectedTab === CHAT_TAB && this.currentMentionToken() !== null) {
+      if (this.selectedTab === CHAT_TAB && this.currentMentionRange() !== null) {
         this.tryCompleteMention(agents, -1);
         return;
       }
@@ -751,7 +759,7 @@ export class MessagesOverlay implements Component, Focusable {
 
     const completionCandidates = this.mentionCompletion?.candidates ?? [];
     const completionLineCount = completionCandidates.length > 1 ? 1 : 0;
-    const entryLineCount = 3 + completionLineCount;
+    const entryLineCount = 2 + completionLineCount;
     const bodyHeight = Math.max(1, height - entryLineCount);
 
     const maxTop = Math.max(0, noMessages.length - bodyHeight);
@@ -774,7 +782,6 @@ export class MessagesOverlay implements Component, Focusable {
       out.push(truncateToWidth(hints, width));
     }
 
-    out.push(truncateToWidth(this.theme.fg("dim", `To: ${this.chatTarget}`), width));
     out.push(truncateToWidth(`> ${this.inputText}`, width));
 
     while (out.length < height) out.push("");
@@ -843,7 +850,7 @@ export class MessagesOverlay implements Component, Focusable {
       this.selectedTab === AGENTS_TAB
         ? "Navigate [↑↓] Switch [Enter] Tabs [Tab] Exit [Esc]"
         : this.selectedTab === CHAT_TAB
-          ? "Scroll [↑↓] Complete mention [Tab] Send [Enter] Exit [Esc]"
+          ? "Broadcast @all  Scroll [↑↓] Complete mention [Tab] Send [Enter] Exit [Esc]"
           : "Scroll [↑↓] Tabs [Tab] Exit [Esc]";
 
     return truncateToWidth(this.theme.fg("dim", hint), width);
