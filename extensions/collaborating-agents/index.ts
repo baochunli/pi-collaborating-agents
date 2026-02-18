@@ -30,6 +30,7 @@ import type {
   AgentRole,
   CollaboratingAgentsConfig,
   ExtensionState,
+  InboxMessage,
   MessageLogEvent,
 } from "./types.js";
 import {
@@ -44,7 +45,6 @@ import {
 const STATUS_KEY = "collab";
 const WATCH_DEBOUNCE_MS = 40;
 const REMOTE_SESSION_REFRESH_MS = 1000;
-const INTERACTIVE_INBOX_AUTOTURN_COOLDOWN_MS = 4000;
 
 const ADJECTIVES = ["Swift", "Calm", "Bright", "Vivid", "Rapid", "Lunar", "Cedar", "Amber"];
 const NOUNS = ["Tiger", "Falcon", "River", "Quartz", "Harbor", "Nova", "Pine", "Raven"];
@@ -78,6 +78,11 @@ const AgentMessageParams = Type.Object({
   to: Type.Optional(Type.String({ description: "Target agent name (required for send/thread)" })),
   message: Type.Optional(Type.String({ description: "Message text (required for send/broadcast)" })),
   replyTo: Type.Optional(Type.String({ description: "Reply message id (optional, for send)" })),
+  urgent: Type.Optional(
+    Type.Boolean({
+      description: "If true, interrupt recipients immediately. If false, queue after current turn.",
+    }),
+  ),
   limit: Type.Optional(Type.Number({ description: "Max messages to return (feed/thread), default 20" })),
   paths: Type.Optional(Type.Array(Type.String(), { description: "Reservation path patterns (reserve/release)" })),
   reason: Type.Optional(Type.String({ description: "Optional reservation reason (reserve)" })),
@@ -148,7 +153,6 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   let remoteSessionRefreshRunning = false;
   let remoteSessionRefreshScheduled = false;
   let remoteSessionSwitchContext: ExtensionCommandContext | null = null;
-  let lastInteractiveInboxAutoTurnAt = 0;
 
   registerRenderers(pi);
 
@@ -293,60 +297,17 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     }
   }
 
-  function shouldAutoTurnInteractiveDirectMessage(msg: {
-    text: string;
-    kind: "direct" | "broadcast";
-  }): boolean {
-    if (msg.kind !== "direct") return false;
-
-    const text = msg.text.trim();
-    if (!text) return false;
-
-    if (text.includes("?")) return true;
-
-    const lower = text.toLowerCase();
-    if (/^(can|could|would|should|what|which|who|when|where|why|how)\b/.test(lower)) return true;
-
-    const blockerKeywords = [
-      "blocked",
-      "blocker",
-      "stuck",
-      "need input",
-      "need help",
-      "please advise",
-      "please confirm",
-      "awaiting",
-      "waiting for",
-      "cannot proceed",
-      "can't proceed",
-      "unable to proceed",
-      "need answer",
-      "dependency",
-      "error",
-      "failed",
-      "failure",
-      "exception",
-    ];
-
-    return blockerKeywords.some((keyword) => lower.includes(keyword));
-  }
-
-  function deliverInboxMessage(msg: {
-    id: string;
-    from: string;
-    to: string;
-    text: string;
-    kind: "direct" | "broadcast";
-    timestamp: string;
-    replyTo?: string | null;
-  }): void {
+  function deliverInboxMessage(msg: InboxMessage): void {
     if (msg.from !== state.agentName) {
       const current = state.unreadCounts.get(msg.from) ?? 0;
       state.unreadCounts.set(msg.from, current + 1);
     }
 
     const senderLabel = formatAgentDisplayName(msg.from);
-    const prefix = msg.kind === "broadcast" ? `Broadcast message from ${senderLabel}:` : `Direct message from ${senderLabel}:`;
+    const prefix =
+      msg.kind === "broadcast"
+        ? `${msg.urgent ? "Urgent " : ""}broadcast message from ${senderLabel}:`
+        : `${msg.urgent ? "Urgent " : ""}direct message from ${senderLabel}:`;
     const content = `${prefix}\n\n${msg.text}`;
 
     const custom = {
@@ -359,36 +320,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       },
     };
 
-    const ctx = lastContext;
-
-    if (ctx?.hasUI) {
-      const shouldAutoTurn = shouldAutoTurnInteractiveDirectMessage(msg);
-      if (!shouldAutoTurn) {
-        pi.sendMessage(custom, { triggerTurn: false });
-        return;
-      }
-
-      const now = Date.now();
-      const inCooldown = now - lastInteractiveInboxAutoTurnAt < INTERACTIVE_INBOX_AUTOTURN_COOLDOWN_MS;
-      if (inCooldown) {
-        pi.sendMessage(custom, { triggerTurn: false });
-        return;
-      }
-
-      lastInteractiveInboxAutoTurnAt = now;
-      if (ctx.isIdle()) {
-        pi.sendMessage(custom, { triggerTurn: true });
-      } else {
-        pi.sendMessage(custom, { triggerTurn: true, deliverAs: "steer" });
-      }
-      return;
-    }
-
-    if (!ctx || ctx.isIdle()) {
-      pi.sendMessage(custom, { triggerTurn: true });
-    } else {
-      pi.sendMessage(custom, { triggerTurn: true, deliverAs: "steer" });
-    }
+    const deliverAs = msg.urgent ? "steer" : "followUp";
+    pi.sendMessage(custom, { triggerTurn: true, deliverAs });
   }
 
   function processInboxNow(): void {
@@ -621,7 +554,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     const timestamp = new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     const target = event.to === "all" ? "all" : String(event.to);
     const text = event.text.length > 240 ? `${event.text.slice(0, 237)}...` : event.text;
-    return `${timestamp} ${event.from} -> ${target}: ${text}`;
+    const priority = event.urgent ? " [urgent]" : "";
+    return `${timestamp}${priority} ${event.from} -> ${target}: ${text}`;
   }
 
   function formatAgentDisplayName(agentName: string): string {
@@ -1247,8 +1181,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 Actions:
 - status: Current agent identity/focus/peer count
 - list: List active agents
-- send: Send direct message to one active agent
-- broadcast: Send message to all active peers
+- send: Send direct message to one active agent (set urgent: true to interrupt immediately)
+- broadcast: Send message to all active peers (set urgent: true to interrupt immediately)
 - feed: Read recent global messages
 - thread: Read direct-message thread with one peer agent
 - reserve: Reserve files/directories for exclusive write/edit intent
@@ -1338,7 +1272,8 @@ Actions:
           };
         }
 
-        const sendResult = sendDirect(dirs, state.agentName, params.to, params.message, params.replyTo);
+        const urgent = params.urgent === true;
+        const sendResult = sendDirect(dirs, state.agentName, params.to, params.message, params.replyTo, urgent);
         if (!sendResult.ok) {
           return {
             content: [{ type: "text", text: sendResult.error }],
@@ -1348,8 +1283,8 @@ Actions:
         }
 
         return {
-          content: [{ type: "text", text: `Sent direct message to ${params.to}.` }],
-          details: { action, to: params.to, ok: true },
+          content: [{ type: "text", text: `Sent ${urgent ? "urgent " : ""}direct message to ${params.to}.` }],
+          details: { action, to: params.to, urgent, ok: true },
         };
       }
 
@@ -1362,7 +1297,8 @@ Actions:
           };
         }
 
-        const broadcastResult = sendBroadcast(dirs, state.agentName, params.message);
+        const urgent = params.urgent === true;
+        const broadcastResult = sendBroadcast(dirs, state.agentName, params.message, urgent);
         if (!broadcastResult.ok) {
           return {
             content: [{ type: "text", text: broadcastResult.error }],
@@ -1375,11 +1311,12 @@ Actions:
           content: [
             {
               type: "text",
-              text: `Broadcast sent to ${broadcastResult.delivered.length} agent(s).`,
+              text: `${urgent ? "Urgent " : ""}broadcast sent to ${broadcastResult.delivered.length} agent(s).`,
             },
           ],
           details: {
             action,
+            urgent,
             delivered: broadcastResult.delivered,
             failed: broadcastResult.failed,
           },
@@ -1709,8 +1646,8 @@ By default subagents use the same model as the spawning session.` ,
             loadAgents: () => listMessagePeers(),
             loadSwitchTargets: () => listOverlaySwitchTargets(),
             loadMessages: (limit) => readMessageLogTail(dirs, Math.max(limit, config.messageHistoryLimit)),
-            sendDirect: (to, text) => sendDirect(dirs, state.agentName, to, text),
-            sendBroadcast: (text) => sendBroadcast(dirs, state.agentName, text),
+            sendDirect: (to, text, urgent) => sendDirect(dirs, state.agentName, to, text, undefined, urgent),
+            sendBroadcast: (text, urgent) => sendBroadcast(dirs, state.agentName, text, urgent),
             onFocusLocal: () => focusLocal(ctx),
             onFocusRemote: async (target) => {
               const isCoordinatorSwitchEntry =

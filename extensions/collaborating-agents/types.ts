@@ -30,6 +30,7 @@ export interface InboxMessage {
   text: string;
   kind: DeliveryKind;
   timestamp: string;
+  urgent?: boolean;
   replyTo?: string | null;
 }
 
@@ -40,6 +41,7 @@ export interface MessageLogEvent {
   text: string;
   kind: DeliveryKind;
   timestamp: string;
+  urgent?: boolean;
   recipients?: string[];
   replyTo?: string | null;
 }

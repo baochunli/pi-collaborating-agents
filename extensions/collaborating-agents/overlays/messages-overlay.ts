@@ -67,8 +67,8 @@ interface MessagesOverlayDeps {
   loadAgents: () => AgentRegistration[];
   loadSwitchTargets?: () => AgentRegistration[];
   loadMessages: (limit: number) => MessageLogEvent[];
-  sendDirect: (to: string, text: string) => { ok: boolean; error?: string };
-  sendBroadcast: (text: string) => { ok: boolean; delivered?: string[]; failed?: string[]; error?: string };
+  sendDirect: (to: string, text: string, urgent?: boolean) => { ok: boolean; error?: string };
+  sendBroadcast: (text: string, urgent?: boolean) => { ok: boolean; delivered?: string[]; failed?: string[]; error?: string };
   onFocusLocal: () => void | Promise<void>;
   onFocusRemote: (target: AgentRegistration) => void | Promise<void>;
   notify: (message: string, level?: "info" | "warning" | "error") => void;
@@ -361,8 +361,16 @@ export class MessagesOverlay implements Component, Focusable {
 
     if (!text) return;
 
+    let urgent = false;
+    if (text.startsWith("!! ")) {
+      urgent = true;
+      text = text.slice(3).trim();
+    }
+
+    if (!text) return;
+
     if (broadcast || this.selectedTab === ALL_TAB || this.selectedTab === AGENTS_TAB) {
-      const r = this.deps.sendBroadcast(text);
+      const r = this.deps.sendBroadcast(text, urgent);
       if (!r.ok) {
         this.deps.notify(r.error || "Failed to broadcast", "error");
         return;
@@ -375,7 +383,7 @@ export class MessagesOverlay implements Component, Focusable {
     }
 
     const target = explicitTarget ?? this.selectedTab;
-    const r = this.deps.sendDirect(target, text);
+    const r = this.deps.sendDirect(target, text, urgent);
     if (!r.ok) {
       this.deps.notify(r.error || `Failed to send to ${target}`, "error");
       return;
@@ -700,7 +708,8 @@ export class MessagesOverlay implements Component, Focusable {
         ? "→"
         : "←";
 
-    const headerRaw = `${direction} ${actor} ${this.theme.fg("dim", "to")} ${target} ${ts}`;
+    const urgentTag = msg.urgent ? ` ${this.theme.fg("warning", "[urgent]")}` : "";
+    const headerRaw = `${direction} ${actor} ${this.theme.fg("dim", "to")} ${target}${urgentTag} ${ts}`;
     const header = truncateToWidth(headerRaw, width);
 
     const textLines = this.wrapText(msg.text, width);
@@ -739,7 +748,7 @@ export class MessagesOverlay implements Component, Focusable {
 
   private renderInputBar(width: number, agents: AgentRegistration[]): string {
     const prompt = this.theme.fg("accent", "> ");
-    const hintLabel = "Navigate [Tab] Act/Send [Enter] Exit [Esc]";
+    const hintLabel = "Navigate [Tab] Send [Enter] Exit [Esc]";
     const hint = this.theme.fg("dim", hintLabel);
     const hintLen = visibleWidth(hintLabel);
 
@@ -747,9 +756,9 @@ export class MessagesOverlay implements Component, Focusable {
     if (this.selectedTab === AGENTS_TAB) {
       placeholder = "Press Enter to switch focus (or type a message to broadcast)";
     } else if (this.selectedTab !== ALL_TAB) {
-      placeholder = `Message ${this.displayAgentLabel(this.selectedTab, this.resolveRole(this.selectedTab, agents))}...`;
+      placeholder = `Message ${this.displayAgentLabel(this.selectedTab, this.resolveRole(this.selectedTab, agents))}... (use !! for urgent)`;
     } else if (this.selectedTab === ALL_TAB) {
-      placeholder = "Broadcast to all active agents";
+      placeholder = "Broadcast to all active agents (prefix with !! for urgent)";
     }
 
     const text = this.inputText || this.theme.fg("dim", placeholder);

@@ -9,7 +9,7 @@ All sessions auto-register immediately when they start; so when a new Pi session
 To install this extension and its included skill:
 
 ```bash
-pi install https://github.com/baochunli/pi-collaborating-Agents
+pi install https://github.com/baochunli/pi-collaborating-agents
 ```
 
 Use the command:
@@ -23,7 +23,7 @@ To confirm that the `collaborating-agents` extension and the `collaborating-agen
 To uninstall this extension:
 
 ```bash
-pi remove https://github.com/baochunli/pi-collaborating-Agents
+pi remove https://github.com/baochunli/pi-collaborating-agents
 ```
 
 ## Opening the _Agents and Messages_ Overlay with the `/agents` Command
@@ -36,13 +36,13 @@ The `/agents` slash command opens an integrated _agents and messages_ overlay, w
 
 Newly-started agents show up immediately; if their transcript file is not persisted yet they are marked `session pending`. Completed subagents remain visible in the `Agents` tab as `completed` until the next time an orchestrator agent spawns new subagents, which clears prior historical subagent states and their messages.
 
-The overlay also allows a user to send a message directly to an agent using `@AgentName message` (in a tab for an individual agent or in the `All messages` tab), or `@all message` to broadcast to all agents. Sending a message in the `Agents` tab broadcasts it to all agents by default.
+The overlay also allows a user to send a message directly to an agent using `@AgentName message` (in a tab for an individual agent or in the `All messages` tab), or `@all message` to broadcast to all agents. Prefix the message body with `!!` to mark it urgent. Sending a message in the `Agents` tab broadcasts it to all agents by default.
 
 ## Spawning a subagent via the `/subagent` command
 
 The user can spawn a single subagent manually in the background using the `/subagent <task>` slash command. It uses a built-in collaborating subagent prompt from this extension, and the subagent defaults to the same model as the spawning session. All agents use a readable two-word callsigns (for example: `SilverHarbor`). An immediate `Spawning subagent ...` status message with runtime name and prompt will be shown immediately.
 
-The parent (orchestrator agent) sessions automatically collect final subagent outputs on completion (single and parallel), without requiring subagents to send a separate final direct message summary. All direct subagent→parent status messages are optional, but are useful for blockers/questions only. In interactive mode, incoming direct messages auto-trigger a turn only for likely blocker/question content (with cooldown).
+The parent (orchestrator agent) sessions automatically collect final subagent outputs on completion (single and parallel), without requiring subagents to send a separate final direct message summary. All direct subagent→parent status messages are optional, but are useful for blockers/questions only. Inbox delivery uses Pi's message routing: normal messages are queued with `followUp`, and `urgent: true` messages interrupt immediately with `steer`.
 
 ## Autonomous Tool API for Agents
 
@@ -56,8 +56,8 @@ Actions:
 
 - `status` – current identity, focus mode, peer count, and your reservation count
 - `list` – list active agents (includes reservation counts when present)
-- `send` – send direct message (`to` + `message`)
-- `broadcast` – send to all active peers (`message`)
+- `send` – send direct message (`to` + `message`, optional `urgent`)
+- `broadcast` – send to all active peers (`message`, optional `urgent`)
 - `feed` – recent global message log (`limit` optional)
 - `thread` – direct-message thread with one peer (`to`, `limit` optional)
 - `reserve` – reserve files/directories for write/edit coordination (`paths`, optional `reason`)
@@ -68,6 +68,7 @@ Examples:
 ```ts
 agent_message({ action: "list" })
 agent_message({ action: "send", to: "BlueFalcon", message: "I finished parsing" })
+agent_message({ action: "send", to: "BlueFalcon", message: "Need your decision now", urgent: true })
 agent_message({ action: "broadcast", message: "Wave 2 complete" })
 agent_message({ action: "thread", to: "BlueFalcon", limit: 10 })
 agent_message({ action: "reserve", paths: ["src/server/", "src/routes/account.tsx"], reason: "auth refactor" })

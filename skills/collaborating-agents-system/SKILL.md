@@ -1,11 +1,11 @@
 ---
 name: collaborating-agents-system
-description: Operating guide for coordinator and spawned subagents using the collaborating-agents extension. Covers agent_message actions, subagent spawning, reservations, messaging protocol, limits, defaults, and failure handling.
+description: Operating guide for coordinator and spawned subagents using the collaborating-agents extension. Covers agent_message actions, subagent spawning, reservations, delivery semantics, limits, defaults, and failure handling.
 ---
 
 # Collaborating Agents System (Coordinator + Subagent Playbook)
 
-Use this skill before operating the `collaborating-agents` extension so both coordinator and workers follow the same protocol.
+Use this skill when operating the `collaborating-agents` extension so coordinators and subagents follow the same protocol.
 
 ## What this system provides
 
@@ -22,13 +22,18 @@ The extension gives you:
 Actions:
 
 - `status` — self identity, focus, peer count, reservations
-- `list` — all active agents
-- `send` — direct message to one peer (`to`, `message`, optional `replyTo`)
-- `broadcast` — message all peers (`message`)
+- `list` — active agents
+- `send` — direct message to one peer (`to`, `message`, optional `replyTo`, optional `urgent`)
+- `broadcast` — message all peers (`message`, optional `urgent`)
 - `feed` — recent global message log (`limit`, default 20, max 400)
 - `thread` — DM history with one peer (`to`, optional `limit`)
 - `reserve` — reserve write/edit targets (`paths`, optional `reason`)
 - `release` — release specific `paths`, or all if omitted
+
+Delivery semantics (important):
+
+- Normal messages (`urgent: false` or omitted) are delivered with Pi `followUp` (queued until the current turn completes).
+- Urgent messages (`urgent: true`) are delivered with Pi `steer` (interrupt immediately).
 
 Common calls:
 
@@ -36,10 +41,17 @@ Common calls:
 agent_message({ action: "status" })
 agent_message({ action: "list" })
 agent_message({ action: "send", to: "BlueFalcon", message: "Started task X" })
+agent_message({ action: "send", to: "BlueFalcon", message: "Need decision now", urgent: true })
+agent_message({ action: "broadcast", message: "Wave 2 complete" })
 agent_message({ action: "thread", to: "BlueFalcon", limit: 20 })
 agent_message({ action: "reserve", paths: ["src/server/"], reason: "auth refactor" })
 agent_message({ action: "release", paths: ["src/server/"] })
 ```
+
+Notes:
+
+- In the `/agents` overlay, prefix message text with `!!` to send urgent.
+- Use urgent only for blockers/decisions that cannot wait.
 
 ## 2) `subagent` (spawn workers)
 
@@ -68,22 +80,22 @@ subagent({
 3. **Spawn workers** with `subagent`
 4. **Track progress** using `thread`/`feed`
 5. **Coordinate reservations** so only one writer owns a target path
-6. **Collect worker completion reports**
+6. **Collect worker completion output** (auto-collected by orchestrator)
 7. **Release reservations** after merge/finalization
 
 ## Subagent workflow (required behavior)
 
-Spawned workers use a built-in collaborating worker prompt. At minimum they should:
+Spawned workers use a built-in collaborating subagent prompt. At minimum they should:
 
 1. At startup call:
    - `agent_message({ action: "status" })`
    - `agent_message({ action: "list" })`
-2. Send direct updates to coordinator (if coordinator is known):
-   - "Started task: ..."
-   - "Task complete: ..."
-3. Use direct messages for blockers/questions
-4. Avoid broadcast progress unless explicitly requested
-5. Read before edit, keep changes scoped, run validation when possible
+2. Send direct updates to coordinator only when useful:
+   - startup acknowledgement
+   - blockers/questions needing input
+3. Do **not** send a mandatory final DM summary; coordinator collects final output automatically.
+4. Avoid broadcast progress unless explicitly requested.
+5. Read before edit, keep changes scoped, run validation when possible.
 
 Expected final report structure from workers:
 
@@ -110,6 +122,7 @@ Best practice:
 
 - Parallel task count max: **8**
 - Parallel runtime concurrency: `min(taskCount, 4)`
+- One active `subagent` run at a time per orchestrator session
 - Child recursion guard: blocked when depth >= max depth
   - Depth env: `PI_COLLAB_SUBAGENT_DEPTH`
   - Max env: `PI_COLLAB_SUBAGENT_MAX_DEPTH` (default 2)
@@ -144,7 +157,6 @@ Loaded and merged in this order:
 
 Config keys:
 
-- `autoRegister` (default `true`)
 - `staleAgentSeconds` (default `120`)
 - `controlSocketDir` (default `~/.pi/session-control`)
 - `requireSessionControl` (default `true`)
@@ -153,8 +165,8 @@ Config keys:
 
 ## Failure handling
 
-- `send`: fails if target is inactive, self-targeted, or empty message
-- `broadcast`: fails when no active recipients or empty message
+- `send`: fails if target is inactive, self-targeted, or message is empty
+- `broadcast`: fails when no active recipients or message is empty
 - `thread`: requires `to`
 - `reserve`: requires non-empty `paths`
 - `release`: if `paths` provided, must contain valid entries
@@ -164,6 +176,7 @@ Config keys:
 
 - Prefer **direct** messages for task traffic
 - Use **broadcast** only for milestone-level announcements
+- Use `urgent: true` sparingly for time-critical blockers/decisions
 - Reserve early, release promptly
 - Keep worker scope narrow and report with structured output
 - Coordinator is responsible for conflict resolution and final synthesis

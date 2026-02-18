@@ -276,7 +276,8 @@ export function processInbox(
         typeof parsed.id === "string" &&
         typeof parsed.from === "string" &&
         typeof parsed.to === "string" &&
-        typeof parsed.text === "string"
+        typeof parsed.text === "string" &&
+        (typeof parsed.urgent === "undefined" || typeof parsed.urgent === "boolean")
       ) {
         onMessage(parsed);
       }
@@ -296,6 +297,7 @@ export function sendDirect(
   to: string,
   text: string,
   replyTo?: string,
+  urgent: boolean = false,
 ): { ok: true } | { ok: false; error: string } {
   const trimmed = text.trim();
   if (!trimmed) return { ok: false, error: "Message is empty" };
@@ -311,6 +313,7 @@ export function sendDirect(
     text: trimmed,
     kind: "direct",
     timestamp: new Date().toISOString(),
+    urgent,
     replyTo: replyTo ?? null,
   };
 
@@ -323,6 +326,7 @@ export function sendDirect(
     text: trimmed,
     kind: "direct",
     timestamp: message.timestamp,
+    urgent,
     replyTo: message.replyTo,
   });
 
@@ -333,6 +337,7 @@ export function sendBroadcast(
   dirs: Dirs,
   from: string,
   text: string,
+  urgent: boolean = false,
 ): { ok: true; delivered: string[]; failed: string[] } | { ok: false; error: string } {
   const trimmed = text.trim();
   if (!trimmed) return { ok: false, error: "Message is empty" };
@@ -354,6 +359,7 @@ export function sendBroadcast(
         text: trimmed,
         kind: "broadcast",
         timestamp,
+        urgent,
       };
       enqueueInboxMessage(dirs, target, message);
       delivered.push(target);
@@ -369,6 +375,7 @@ export function sendBroadcast(
     text: trimmed,
     kind: "broadcast",
     timestamp,
+    urgent,
     recipients,
   });
 
