@@ -101,6 +101,70 @@ subagent({
 })
 ```
 
+## Configuration
+
+This extension supports both **JSON config files** and **environment variables**.
+
+### Configuration file locations and precedence
+
+The extension loads and merges configuration in this order:
+
+1. Built-in defaults
+2. Global config: `~/.pi/agent/collaborating-agents.json`
+3. Project config: `<cwd>/.pi/collaborating-agents.json` (overrides global)
+
+Only positive numeric values and non-empty strings are accepted. Invalid values fall back to defaults.
+
+### Config keys
+
+#### `staleAgentSeconds` (number, default: `120`)
+
+How long (in seconds) an agent registration can go without heartbeat updates before it is considered stale and excluded from active-agent views.
+
+- Lower values make stale cleanup more aggressive.
+- Higher values are more tolerant of short pauses.
+
+Use this if you see agents lingering after crashes or disappearing too quickly during heavy local load.
+
+#### `messageHistoryLimit` (number, default: `400`)
+
+Default history depth used by the overlay feed/chat loader.
+
+- Larger values allow more history at once but increase read/format work.
+- Smaller values keep UI snappier in very high-message sessions.
+
+This is a default baseline; runtime calls may still request larger limits.
+
+
+#### `COLLABORATING_AGENTS_DIR`
+
+Overrides the storage root used by the extension. Default:
+
+- `~/.pi/agent/collaborating-agents`
+
+This affects:
+
+- `registry/` (active agent registrations)
+- `inbox/` (per-agent inbound queue)
+- `messages.jsonl` (global append-only message log)
+
+Use this to isolate per-project state or relocate agent data.
+
+#### `PI_AGENT_NAME`
+
+Forces an explicit runtime agent name instead of auto-generated names.
+
+Useful for deterministic scripts/tests or named coordinator sessions.
+
+#### `PI_COLLAB_SUBAGENT_DEPTH` and `PI_COLLAB_SUBAGENT_MAX_DEPTH`
+
+Recursion guard for nested subagent spawning.
+
+- `PI_COLLAB_SUBAGENT_DEPTH` tracks current depth.
+- `PI_COLLAB_SUBAGENT_MAX_DEPTH` sets max allowed depth (default max is `2`).
+
+If `depth >= max`, subagent spawn is blocked.
+
 ## How It Works
 
 Messages use Pi's delivery system: normal messages queue until the recipient finishes their current turn, urgent ones interrupt immediately. No polling is needed.

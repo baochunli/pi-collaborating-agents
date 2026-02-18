@@ -85,9 +85,6 @@ export interface ExtensionState {
 
 export interface CollaboratingAgentsConfig {
   staleAgentSeconds: number;
-  controlSocketDir: string;
-  requireSessionControl: boolean;
-  remoteWaitMs: number;
   messageHistoryLimit: number;
 }
 

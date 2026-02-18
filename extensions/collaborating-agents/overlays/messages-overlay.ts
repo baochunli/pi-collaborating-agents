@@ -89,7 +89,6 @@ export class MessagesOverlay implements Component, Focusable {
 
   private selectedTab: string;
   private inputText = "";
-  private chatTarget = "@all";
   private scrollPosition = 0;
   private selectedAgentRow = 0;
   private refreshTimer: ReturnType<typeof setInterval>;
@@ -270,9 +269,6 @@ export class MessagesOverlay implements Component, Focusable {
         const completed = active.candidates[nextIndex] ?? "";
         this.inputText = `${this.inputText.slice(0, mention.atIndex)}@${completed}`;
 
-        const resolvedTarget = this.resolveChatTarget(completed, agents);
-        if (resolvedTarget) this.chatTarget = `@${resolvedTarget}`;
-
         this.tui.requestRender();
         return true;
       }
@@ -288,9 +284,6 @@ export class MessagesOverlay implements Component, Focusable {
     this.mentionCompletion = { candidates: matches, index };
     const completed = matches[index] ?? "";
     this.inputText = `${this.inputText.slice(0, mention.atIndex)}@${completed}`;
-
-    const resolvedTarget = this.resolveChatTarget(completed, agents);
-    if (resolvedTarget) this.chatTarget = `@${resolvedTarget}`;
 
     if (matches.length === 1) {
       this.inputText += " ";
@@ -366,7 +359,6 @@ export class MessagesOverlay implements Component, Focusable {
         }
 
         explicitTarget = resolved;
-        this.chatTarget = `@${resolved}`;
         text = text.slice(spaceIdx + 1).trim();
       }
     }
@@ -381,8 +373,7 @@ export class MessagesOverlay implements Component, Focusable {
 
     if (!text) return;
 
-    const defaultTarget = this.resolveChatTarget(this.chatTarget.replace(/^@/, ""), agents) ?? "all";
-    const target = explicitTarget ?? defaultTarget;
+    const target = explicitTarget ?? "all";
 
     if (target === "all") {
       const r = this.deps.sendBroadcast(text, urgent);
@@ -399,7 +390,6 @@ export class MessagesOverlay implements Component, Focusable {
     }
 
     this.inputText = "";
-    this.chatTarget = "@all";
     this.scrollPosition = Number.MAX_SAFE_INTEGER;
     this.resetMentionCompletion();
     this.tui.requestRender();
@@ -737,23 +727,7 @@ export class MessagesOverlay implements Component, Focusable {
     const events = this.getMessages(600).slice(-600);
     const ordered = [...events].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
-    const messageLines = ordered.map((event) => {
-      const time = this.theme.fg(
-        "dim",
-        new Date(event.timestamp).toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-          hour12: false,
-        }),
-      );
-      const actorLabel =
-        event.from === this.deps.selfName
-          ? this.theme.fg("accent", "You")
-          : this.displayAgentLabel(event.from, this.resolveRole(event.from, agents));
-      const urgentTag = event.urgent ? ` ${this.theme.fg("warning", "[urgent]")}` : "";
-
-      return truncateToWidth(`${time} ${actorLabel}${urgentTag}: ${event.text}`, width);
-    });
+    const messageLines = ordered.flatMap((event) => this.renderChatEventLines(event, width, agents));
 
     const noMessages = messageLines.length === 0 ? [this.theme.fg("dim", "No messages yet.")] : messageLines;
 
@@ -786,6 +760,38 @@ export class MessagesOverlay implements Component, Focusable {
 
     while (out.length < height) out.push("");
     return out.slice(0, height);
+  }
+
+  private renderChatEventLines(event: MessageLogEvent, width: number, agents: AgentRegistration[]): string[] {
+    const time = this.theme.fg(
+      "dim",
+      new Date(event.timestamp).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      }),
+    );
+    const actorLabel =
+      event.from === this.deps.selfName
+        ? this.theme.fg("accent", "You")
+        : this.displayAgentLabel(event.from, this.resolveRole(event.from, agents));
+    const urgentTag = event.urgent ? ` ${this.theme.fg("warning", "[urgent]")}` : "";
+
+    const prefix = `${time} ${actorLabel}${urgentTag}:`;
+    const prefixWidth = visibleWidth(prefix);
+    const messageWidth = Math.max(1, width - prefixWidth - 1);
+    const wrappedMessage = this.wrapText(event.text, messageWidth);
+
+    const lines: string[] = [];
+    lines.push(truncateToWidth(`${prefix} ${wrappedMessage[0] ?? ""}`, width));
+
+    const continuationIndent = Math.max(0, Math.min(width - 1, prefixWidth + 1));
+    const continuationPrefix = " ".repeat(continuationIndent);
+    for (const segment of wrappedMessage.slice(1)) {
+      lines.push(truncateToWidth(`${continuationPrefix}${segment}`, width));
+    }
+
+    return lines;
   }
 
   private renderMessage(msg: MessageLogEvent, width: number, agents: AgentRegistration[]): string[] {

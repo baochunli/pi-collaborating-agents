@@ -1610,10 +1610,28 @@ By default subagents use the same model as the spawning session.` ,
     const coordinator = buildCoordinatorSwitchEntry();
     if (!coordinator) return peers;
 
-    const alreadyPresent = peers.some((agent) => !!agent.sessionFile && agent.sessionFile === coordinator.sessionFile);
+    const byNameIndex = peers.findIndex((agent) => agent.name === coordinator.name);
+    if (byNameIndex >= 0) {
+      const existing = peers[byNameIndex]!;
+      const merged = [...peers];
+      merged[byNameIndex] = {
+        ...existing,
+        sessionId: coordinator.sessionId,
+        sessionFile: coordinator.sessionFile,
+        pid: coordinator.pid,
+      };
+      return merged;
+    }
+
+    const alreadyPresent = peers.some(
+      (agent) =>
+        !!agent.sessionFile &&
+        !!coordinator.sessionFile &&
+        agent.sessionFile === coordinator.sessionFile,
+    );
 
     if (alreadyPresent) return peers;
-    return [coordinator, ...peers];
+    return [coordinator, ...peers].sort((a, b) => a.name.localeCompare(b.name));
   }
 
   async function switchToCoordinatorSession(ctx: ExtensionContext): Promise<boolean> {
@@ -1780,9 +1798,11 @@ By default subagents use the same model as the spawning session.` ,
 
   pi.on("tool_call", async (event, _ctx) => {
     if (!state.registered) return;
-    if (event.toolName !== "edit" && event.toolName !== "write") return;
 
     const input = event.input as Record<string, unknown>;
+
+    if (event.toolName !== "edit" && event.toolName !== "write") return;
+
     const path = typeof input.path === "string" ? input.path.trim() : "";
     if (!path) return;
 

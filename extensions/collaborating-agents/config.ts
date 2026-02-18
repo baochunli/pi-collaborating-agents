@@ -5,9 +5,6 @@ import type { CollaboratingAgentsConfig } from "./types.js";
 
 const DEFAULT_CONFIG: CollaboratingAgentsConfig = {
   staleAgentSeconds: 120,
-  controlSocketDir: join(homedir(), ".pi", "session-control"),
-  requireSessionControl: true,
-  remoteWaitMs: 300_000,
   messageHistoryLimit: 400,
 };
 
@@ -39,15 +36,6 @@ export function loadConfig(cwd: string): CollaboratingAgentsConfig {
       typeof merged.staleAgentSeconds === "number" && merged.staleAgentSeconds > 0
         ? merged.staleAgentSeconds
         : DEFAULT_CONFIG.staleAgentSeconds,
-    controlSocketDir:
-      typeof merged.controlSocketDir === "string" && merged.controlSocketDir.trim().length > 0
-        ? merged.controlSocketDir
-        : DEFAULT_CONFIG.controlSocketDir,
-    requireSessionControl: merged.requireSessionControl !== false,
-    remoteWaitMs:
-      typeof merged.remoteWaitMs === "number" && merged.remoteWaitMs > 0
-        ? merged.remoteWaitMs
-        : DEFAULT_CONFIG.remoteWaitMs,
     messageHistoryLimit:
       typeof merged.messageHistoryLimit === "number" && merged.messageHistoryLimit > 0
         ? merged.messageHistoryLimit

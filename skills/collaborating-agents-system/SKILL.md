@@ -128,7 +128,6 @@ Best practice:
   - Max env: `PI_COLLAB_SUBAGENT_MAX_DEPTH` (default 2)
 - Spawned worker default tools:
   - `read`, `write`, `edit`, `bash`, `agent_message`
-- Child session control default: enabled (`--session-control`) unless explicitly disabled
 
 ## Identity and storage
 
@@ -147,21 +146,6 @@ Agent naming:
 
 - `PI_AGENT_NAME` can force explicit agent name
 - otherwise extension generates readable names and resolves collisions
-
-## Config files
-
-Loaded and merged in this order:
-
-1. Global: `~/.pi/agent/collaborating-agents.json`
-2. Project: `<cwd>/.pi/collaborating-agents.json` (overrides global)
-
-Config keys:
-
-- `staleAgentSeconds` (default `120`)
-- `controlSocketDir` (default `~/.pi/session-control`)
-- `requireSessionControl` (default `true`)
-- `remoteWaitMs` (default `300000`)
-- `messageHistoryLimit` (default `400`)
 
 ## Failure handling
 
