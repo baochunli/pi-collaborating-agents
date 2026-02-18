@@ -28,16 +28,16 @@ pi remove https://github.com/baochunli/pi-collaborating-agents
 
 ## Opening the _Agents and Messages_ Overlay with the `/agents` Command
 
-The `/agents` slash command opens an integrated _agents and messages_ overlay, which includes the following tabs:
+The `/agents` slash command opens an integrated _agents and messages_ overlay with four tabs:
 
   - `Agents` tab contains a list of all active and recently completed agents, and it allows the user to switch to the selected active session and tracks the target session in real time.
+  - `Feed` tab shows recent message activity across agents.
   - `File reservations` tab shows active reservation patterns and which agent currently owns each one.
-  - One tab for each agent to show the messages sent to and from this agent.
-  - `All messages` tab to show all recent messages since the last time subagents have been spawned by an orchestrator agent.
+  - `Chat` tab provides a shared chat stream and input box for `@all` broadcasts and direct `@AgentName` messages.
 
 Newly-started agents show up immediately; if their transcript file is not persisted yet they are marked `session pending`. Completed subagents remain visible in the `Agents` tab as `completed` until the next time an orchestrator agent spawns new subagents, which clears prior historical subagent states and their messages.
 
-The overlay also allows a user to send a message directly to an agent using `@AgentName message` (in a tab for an individual agent or in the `All messages` tab), or `@all message` to broadcast to all agents. Prefix the message body with `!!` to mark it urgent. Sending a message in the `Agents` or `File reservations` tab broadcasts it to all agents by default.
+Messaging input is available in the `Chat` tab. Use `@AgentName message` for direct messages or `@all message` for broadcast. Prefix the message body with `!!` to mark it urgent.
 
 ## Spawning a subagent via the `/subagent` command
 

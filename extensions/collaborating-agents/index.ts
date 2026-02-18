@@ -1572,8 +1572,7 @@ By default subagents use the same model as the spawning session.` ,
         return;
       }
 
-      // Backward-compatible convenience: strip old leading "worker" prefix.
-      const task = trimmed.replace(/^worker\s+/i, "").trim();
+      const task = trimmed;
       if (!task) {
         notifyUsage();
         return;
@@ -1595,7 +1594,7 @@ By default subagents use the same model as the spawning session.` ,
   }
 
   function listMessagePeers(): AgentRegistration[] {
-    const active = listActiveAgents(dirs, state.agentName);
+    const active = listActiveAgents(dirs);
     const merged = new Map<string, AgentRegistration>();
 
     for (const agent of active) merged.set(agent.name, agent);

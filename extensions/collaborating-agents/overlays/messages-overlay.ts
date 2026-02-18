@@ -5,8 +5,9 @@ import type { Theme } from "@mariozechner/pi-coding-agent";
 import type { AgentRegistration, AgentRole, FocusState, MessageLogEvent } from "../types.js";
 
 const AGENTS_TAB = "[agents]";
+const FEED_TAB = "[feed]";
 const RESERVATIONS_TAB = "[reservations]";
-const ALL_TAB = "[all]";
+const CHAT_TAB = "[chat]";
 const OVERLAY_WIDTH = 132;
 const MESSAGE_AREA_HEIGHT = 24;
 
@@ -88,6 +89,7 @@ export class MessagesOverlay implements Component, Focusable {
 
   private selectedTab: string;
   private inputText = "";
+  private chatTarget = "@all";
   private scrollPosition = 0;
   private selectedAgentRow = 0;
   private refreshTimer: ReturnType<typeof setInterval>;
@@ -117,9 +119,8 @@ export class MessagesOverlay implements Component, Focusable {
     this.refreshTimer.unref?.();
   }
 
-  private getTabs(agents: AgentRegistration[]): string[] {
-    const peerNames = agents.map((a) => a.name).filter((name) => name !== this.deps.selfName);
-    return [AGENTS_TAB, RESERVATIONS_TAB, this.deps.selfName, ...peerNames, ALL_TAB];
+  private getTabs(_agents: AgentRegistration[]): string[] {
+    return [AGENTS_TAB, FEED_TAB, RESERVATIONS_TAB, CHAT_TAB];
   }
 
   private getSwitchTargets(agents: AgentRegistration[]): AgentRegistration[] {
@@ -127,7 +128,7 @@ export class MessagesOverlay implements Component, Focusable {
   }
 
   private normalizeAgentDisplayName(name: string): string {
-    return name.replace(/^worker(?:-agent)?-?/i, "").replace(/^subagent-?/i, "").trim();
+    return name.replace(/^subagent-?/i, "").trim();
   }
 
   private resolveRole(name: string, agents: AgentRegistration[]): AgentRole | undefined {
@@ -258,7 +259,12 @@ export class MessagesOverlay implements Component, Focusable {
       if (currentMatchesInput && stillValid) {
         const nextIndex = (active.index + direction + active.candidates.length) % active.candidates.length;
         active.index = nextIndex;
-        this.inputText = `@${active.candidates[nextIndex]}`;
+        const completed = active.candidates[nextIndex] ?? "";
+        this.inputText = `@${completed}`;
+
+        const resolvedTarget = this.resolveChatTarget(completed, agents);
+        if (resolvedTarget) this.chatTarget = `@${resolvedTarget}`;
+
         this.tui.requestRender();
         return true;
       }
@@ -272,7 +278,11 @@ export class MessagesOverlay implements Component, Focusable {
 
     const index = direction === 1 ? 0 : matches.length - 1;
     this.mentionCompletion = { candidates: matches, index };
-    this.inputText = `@${matches[index]}`;
+    const completed = matches[index] ?? "";
+    this.inputText = `@${completed}`;
+
+    const resolvedTarget = this.resolveChatTarget(completed, agents);
+    if (resolvedTarget) this.chatTarget = `@${resolvedTarget}`;
 
     if (matches.length === 1) {
       this.inputText += " ";
@@ -314,50 +324,42 @@ export class MessagesOverlay implements Component, Focusable {
     const idx = current === -1 ? 0 : current;
     const next = (idx + delta + tabs.length) % tabs.length;
     this.selectedTab = tabs[next] ?? AGENTS_TAB;
-    this.scrollPosition = 0;
+    this.scrollPosition = this.selectedTab === CHAT_TAB ? Number.MAX_SAFE_INTEGER : 0;
     this.clampAgentSelection(switchTargets);
     this.resetMentionCompletion();
   }
 
   private getMessages(limit: number): MessageLogEvent[] {
-    const all = this.deps.loadMessages(limit);
-    if (this.selectedTab === ALL_TAB) return all;
     if (this.selectedTab === AGENTS_TAB || this.selectedTab === RESERVATIONS_TAB) return [];
-
-    const peer = this.selectedTab;
-    return all.filter((m) => {
-      if (m.kind === "direct") {
-        return m.from === peer || m.to === peer;
-      }
-
-      if (m.kind === "broadcast") {
-        if (m.from === peer) return true;
-        if (Array.isArray(m.recipients) && m.recipients.includes(peer)) return true;
-      }
-
-      return false;
-    });
+    return this.deps.loadMessages(limit);
   }
 
-  private sendFromInput(agents: AgentRegistration[]): void {
+  private resolveChatTarget(token: string, agents: AgentRegistration[]): string | null {
+    const target = token.trim();
+    if (!target) return null;
+    if (target.toLowerCase() === "all") return "all";
+    return this.resolveAgentInputName(target, agents);
+  }
+
+  private sendChatMessage(agents: AgentRegistration[]): void {
     let text = this.inputText.trim();
     if (!text) return;
 
     let explicitTarget: string | null = null;
-    let broadcast = false;
 
-    if (text.startsWith("@all ")) {
-      broadcast = true;
-      text = text.slice(5).trim();
-    } else if (text.startsWith("@")) {
+    if (text.startsWith("@")) {
       const spaceIdx = text.indexOf(" ");
       if (spaceIdx > 1) {
         const candidate = text.slice(1, spaceIdx);
-        const resolved = this.resolveAgentInputName(candidate, agents);
-        if (resolved) {
-          explicitTarget = resolved;
-          text = text.slice(spaceIdx + 1).trim();
+        const resolved = this.resolveChatTarget(candidate, agents);
+        if (!resolved) {
+          this.deps.notify(`Unknown agent: ${candidate}`, "warning");
+          return;
         }
+
+        explicitTarget = resolved;
+        this.chatTarget = `@${resolved}`;
+        text = text.slice(spaceIdx + 1).trim();
       }
     }
 
@@ -371,33 +373,26 @@ export class MessagesOverlay implements Component, Focusable {
 
     if (!text) return;
 
-    if (
-      broadcast ||
-      this.selectedTab === ALL_TAB ||
-      this.selectedTab === AGENTS_TAB ||
-      this.selectedTab === RESERVATIONS_TAB
-    ) {
+    const defaultTarget = this.resolveChatTarget(this.chatTarget.replace(/^@/, ""), agents) ?? "all";
+    const target = explicitTarget ?? defaultTarget;
+
+    if (target === "all") {
       const r = this.deps.sendBroadcast(text, urgent);
       if (!r.ok) {
         this.deps.notify(r.error || "Failed to broadcast", "error");
         return;
       }
-      this.inputText = "";
-      this.scrollPosition = 0;
-      this.resetMentionCompletion();
-      this.tui.requestRender();
-      return;
-    }
-
-    const target = explicitTarget ?? this.selectedTab;
-    const r = this.deps.sendDirect(target, text, urgent);
-    if (!r.ok) {
-      this.deps.notify(r.error || `Failed to send to ${target}`, "error");
-      return;
+    } else {
+      const r = this.deps.sendDirect(target, text, urgent);
+      if (!r.ok) {
+        this.deps.notify(r.error || `Failed to send to ${target}`, "error");
+        return;
+      }
     }
 
     this.inputText = "";
-    this.scrollPosition = 0;
+    this.chatTarget = "@all";
+    this.scrollPosition = Number.MAX_SAFE_INTEGER;
     this.resetMentionCompletion();
     this.tui.requestRender();
   }
@@ -412,7 +407,7 @@ export class MessagesOverlay implements Component, Focusable {
     }
 
     if (matchesKey(data, "tab")) {
-      if (this.currentMentionToken() !== null) {
+      if (this.selectedTab === CHAT_TAB && this.currentMentionToken() !== null) {
         this.tryCompleteMention(agents, 1);
         return;
       }
@@ -422,7 +417,7 @@ export class MessagesOverlay implements Component, Focusable {
     }
 
     if (matchesKey(data, "shift+tab")) {
-      if (this.currentMentionToken() !== null) {
+      if (this.selectedTab === CHAT_TAB && this.currentMentionToken() !== null) {
         this.tryCompleteMention(agents, -1);
         return;
       }
@@ -455,7 +450,8 @@ export class MessagesOverlay implements Component, Focusable {
 
     if (matchesKey(data, "down")) {
       if (this.selectedTab === AGENTS_TAB) {
-        this.selectedAgentRow = Math.min(this.totalAgentRows(switchTargets) - 1, this.selectedAgentRow + 1);
+        const maxRow = Math.max(0, this.totalAgentRows(switchTargets) - 1);
+        this.selectedAgentRow = Math.min(maxRow, this.selectedAgentRow + 1);
       } else {
         this.scrollPosition += 1;
       }
@@ -475,7 +471,7 @@ export class MessagesOverlay implements Component, Focusable {
 
     if (matchesKey(data, "end")) {
       if (this.selectedTab === AGENTS_TAB) {
-        this.selectedAgentRow = this.totalAgentRows(switchTargets) - 1;
+        this.selectedAgentRow = Math.max(0, this.totalAgentRows(switchTargets) - 1);
       } else {
         this.scrollPosition = Number.MAX_SAFE_INTEGER;
       }
@@ -484,11 +480,15 @@ export class MessagesOverlay implements Component, Focusable {
     }
 
     if (matchesKey(data, "enter")) {
-      if (this.selectedTab === AGENTS_TAB && this.inputText.trim().length === 0) {
+      if (this.selectedTab === AGENTS_TAB) {
         this.activateAgentSelection(switchTargets);
-      } else {
-        this.sendFromInput(agents);
+      } else if (this.selectedTab === CHAT_TAB) {
+        this.sendChatMessage(agents);
       }
+      return;
+    }
+
+    if (this.selectedTab !== CHAT_TAB) {
       return;
     }
 
@@ -516,7 +516,7 @@ export class MessagesOverlay implements Component, Focusable {
 
     const tabs = this.getTabs(agents);
     if (!tabs.includes(this.selectedTab)) {
-      this.selectedTab = ALL_TAB;
+      this.selectedTab = AGENTS_TAB;
       this.scrollPosition = 0;
     }
 
@@ -546,14 +546,16 @@ export class MessagesOverlay implements Component, Focusable {
     const messageLines =
       this.selectedTab === AGENTS_TAB
         ? this.renderAgentsView(innerWidth - 2, messageAreaHeight, switchTargets)
-        : this.selectedTab === RESERVATIONS_TAB
-          ? this.renderReservationsView(innerWidth - 2, messageAreaHeight)
-          : this.renderMessagesView(innerWidth - 2, messageAreaHeight, agents);
+        : this.selectedTab === FEED_TAB
+          ? this.renderFeedView(innerWidth - 2, messageAreaHeight, agents)
+          : this.selectedTab === RESERVATIONS_TAB
+            ? this.renderReservationsView(innerWidth - 2, messageAreaHeight)
+            : this.renderChatView(innerWidth - 2, messageAreaHeight, agents);
 
     for (const line of messageLines) lines.push(row(line));
 
     lines.push(border("├" + "─".repeat(innerWidth) + "┤"));
-    lines.push(row(this.renderInputBar(innerWidth - 2, agents)));
+    lines.push(row(this.renderFooterHint(innerWidth - 2)));
     lines.push(border("╰" + "─".repeat(innerWidth) + "╯"));
 
     return lines;
@@ -574,11 +576,13 @@ export class MessagesOverlay implements Component, Focusable {
       const label =
         tab === AGENTS_TAB
           ? "Agents"
-          : tab === RESERVATIONS_TAB
-            ? "File reservations"
-            : tab === ALL_TAB
-              ? "All messages"
-              : this.displayAgentLabel(tab, this.resolveRole(tab, agents));
+          : tab === FEED_TAB
+            ? "Feed"
+            : tab === RESERVATIONS_TAB
+              ? "File reservations"
+              : tab === CHAT_TAB
+                ? "Chat"
+                : tab;
       const prefix = selected ? "▸ " : "";
       parts.push(prefix + this.theme.fg(selected ? "accent" : "muted", label));
     }
@@ -635,10 +639,11 @@ export class MessagesOverlay implements Component, Focusable {
           (focus.targetAgent === agent.name ||
             (focus.targetSessionId !== undefined && focus.targetSessionId === agent.sessionId));
         const name = this.displayAgentLabel(agent.name, agent.role);
+        const selfTag = agent.name === this.deps.selfName ? " (you)" : "";
         const canSwitch = !!agent.sessionFile && existsSync(agent.sessionFile);
         const isCompleted = agent.pid <= 0;
         const availability = isCompleted ? " • completed" : canSwitch ? "" : " • session pending";
-        const line = `${selected ? "▸" : " "} ${name} • ${agent.model} • ${agent.cwd.split("/").pop() || agent.cwd}${focused ? " • focused" : ""}${availability}`;
+        const line = `${selected ? "▸" : " "} ${name}${selfTag} • ${agent.model} • ${agent.cwd.split("/").pop() || agent.cwd}${focused ? " • focused" : ""}${availability}`;
         out.push(truncateToWidth(line, width));
       }
     }
@@ -695,7 +700,7 @@ export class MessagesOverlay implements Component, Focusable {
     return out.slice(0, height);
   }
 
-  private renderMessagesView(width: number, height: number, agents: AgentRegistration[]): string[] {
+  private renderFeedView(width: number, height: number, agents: AgentRegistration[]): string[] {
     const messages = this.getMessages(600);
 
     if (messages.length === 0) {
@@ -720,6 +725,62 @@ export class MessagesOverlay implements Component, Focusable {
     return lines;
   }
 
+  private renderChatView(width: number, height: number, agents: AgentRegistration[]): string[] {
+    const events = this.getMessages(600).slice(-600);
+    const ordered = [...events].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+    const messageLines = ordered.map((event) => {
+      const time = this.theme.fg(
+        "dim",
+        new Date(event.timestamp).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        }),
+      );
+      const actorLabel =
+        event.from === this.deps.selfName
+          ? this.theme.fg("accent", "You")
+          : this.displayAgentLabel(event.from, this.resolveRole(event.from, agents));
+      const urgentTag = event.urgent ? ` ${this.theme.fg("warning", "[urgent]")}` : "";
+
+      return truncateToWidth(`${time} ${actorLabel}${urgentTag}: ${event.text}`, width);
+    });
+
+    const noMessages = messageLines.length === 0 ? [this.theme.fg("dim", "No messages yet.")] : messageLines;
+
+    const completionCandidates = this.mentionCompletion?.candidates ?? [];
+    const completionLineCount = completionCandidates.length > 1 ? 1 : 0;
+    const entryLineCount = 3 + completionLineCount;
+    const bodyHeight = Math.max(1, height - entryLineCount);
+
+    const maxTop = Math.max(0, noMessages.length - bodyHeight);
+    const top = Math.max(0, Math.min(maxTop, this.scrollPosition));
+    this.scrollPosition = top;
+
+    const out = noMessages.slice(top, top + bodyHeight);
+    while (out.length < bodyHeight) out.push("");
+
+    out.push(this.theme.fg("dim", "─".repeat(Math.max(1, width))));
+
+    if (completionCandidates.length > 1) {
+      const hints = completionCandidates
+        .map((candidate, idx) =>
+          idx === this.mentionCompletion?.index
+            ? this.theme.fg("accent", `@${candidate}`)
+            : this.theme.fg("dim", `@${candidate}`),
+        )
+        .join("  ");
+      out.push(truncateToWidth(hints, width));
+    }
+
+    out.push(truncateToWidth(this.theme.fg("dim", `To: ${this.chatTarget}`), width));
+    out.push(truncateToWidth(`> ${this.inputText}`, width));
+
+    while (out.length < height) out.push("");
+    return out.slice(0, height);
+  }
+
   private renderMessage(msg: MessageLogEvent, width: number, agents: AgentRegistration[]): string[] {
     const fromSelf = msg.from === this.deps.selfName;
     const actorLabel = fromSelf
@@ -727,47 +788,17 @@ export class MessagesOverlay implements Component, Focusable {
       : this.displayAgentLabel(msg.from, this.resolveRole(msg.from, agents));
     const actor = fromSelf ? this.theme.fg("accent", actorLabel) : this.theme.fg("warning", actorLabel);
 
-    const selectedPeer =
-      this.selectedTab !== AGENTS_TAB &&
-      this.selectedTab !== RESERVATIONS_TAB &&
-      this.selectedTab !== ALL_TAB
-        ? this.selectedTab
-        : null;
-    const selectedPeerLabel = selectedPeer
-      ? this.displayAgentLabel(selectedPeer, this.resolveRole(selectedPeer, agents))
-      : null;
-
-    const isBroadcastToPeer =
-      msg.to === "all" &&
-      Boolean(selectedPeer) &&
-      msg.from !== selectedPeer &&
-      Array.isArray(msg.recipients) &&
-      msg.recipients.includes(selectedPeer);
-
     const targetName = String(msg.to);
     const targetLabel =
       msg.to === "all"
-        ? selectedPeerLabel && msg.from !== selectedPeer
-          ? `${selectedPeerLabel} (broadcast)`
-          : "all"
+        ? "all"
         : targetName === this.deps.selfName
           ? "You"
           : this.displayAgentLabel(targetName, this.resolveRole(targetName, agents));
     const target = this.theme.fg("muted", targetLabel);
 
     const ts = this.theme.fg("dim", new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
-
-    const direction = selectedPeer
-      ? msg.to === selectedPeer || isBroadcastToPeer
-        ? "→"
-        : msg.from === selectedPeer
-          ? "←"
-          : fromSelf
-            ? "→"
-            : "←"
-      : fromSelf
-        ? "→"
-        : "←";
+    const direction = fromSelf ? "→" : "←";
 
     const urgentTag = msg.urgent ? ` ${this.theme.fg("warning", "[urgent]")}` : "";
     const headerRaw = `${direction} ${actor} ${this.theme.fg("dim", "to")} ${target}${urgentTag} ${ts}`;
@@ -807,28 +838,15 @@ export class MessagesOverlay implements Component, Focusable {
     return lines.length > 0 ? lines : [""];
   }
 
-  private renderInputBar(width: number, agents: AgentRegistration[]): string {
-    const prompt = this.theme.fg("accent", "> ");
-    const hintLabel = "Navigate [Tab] Send [Enter] Exit [Esc]";
-    const hint = this.theme.fg("dim", hintLabel);
-    const hintLen = visibleWidth(hintLabel);
+  private renderFooterHint(width: number): string {
+    const hint =
+      this.selectedTab === AGENTS_TAB
+        ? "Navigate [↑↓] Switch [Enter] Tabs [Tab] Exit [Esc]"
+        : this.selectedTab === CHAT_TAB
+          ? "Scroll [↑↓] Complete mention [Tab] Send [Enter] Exit [Esc]"
+          : "Scroll [↑↓] Tabs [Tab] Exit [Esc]";
 
-    let placeholder = "@name msg or @all msg";
-    if (this.selectedTab === AGENTS_TAB) {
-      placeholder = "Press Enter to switch focus (or type a message to broadcast)";
-    } else if (this.selectedTab === RESERVATIONS_TAB) {
-      placeholder = "Viewing reservations. Type a message to broadcast (use !! for urgent).";
-    } else if (this.selectedTab !== ALL_TAB) {
-      placeholder = `Message ${this.displayAgentLabel(this.selectedTab, this.resolveRole(this.selectedTab, agents))}... (use !! for urgent)`;
-    } else if (this.selectedTab === ALL_TAB) {
-      placeholder = "Broadcast to all active agents (prefix with !! for urgent)";
-    }
-
-    const text = this.inputText || this.theme.fg("dim", placeholder);
-    const maxTextLen = Math.max(1, width - 2 - hintLen - 1);
-    const display = truncateToWidth(text, maxTextLen);
-    const padLen = Math.max(0, width - 2 - visibleWidth(display) - hintLen);
-    return `${prompt}${display}${" ".repeat(padLen)}${hint}`;
+    return truncateToWidth(this.theme.fg("dim", hint), width);
   }
 
   invalidate(): void {
