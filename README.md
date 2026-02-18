@@ -6,7 +6,15 @@ All sessions auto-register immediately when they start; so when a new Pi session
 
 ## Quick Start
 
-To install this extension and its included skill:
+Install this extension and its included skill using **either** npm (recommended) or the git URL.
+
+### Option 1: Install from npm
+
+```bash
+pi install npm:@baochunli/pi-collaborating-agents
+```
+
+### Option 2: Install from git URL
 
 ```bash
 pi install https://github.com/baochunli/pi-collaborating-agents
@@ -21,6 +29,12 @@ pi config
 To confirm that the `collaborating-agents` extension and the `collaborating-agents-system` skill have been activated. Use `Esc` to leave the configuration session.
 
 To uninstall this extension:
+
+```bash
+pi remove npm:@baochunli/pi-collaborating-agents
+```
+
+or (if you installed using git URL):
 
 ```bash
 pi remove https://github.com/baochunli/pi-collaborating-agents
