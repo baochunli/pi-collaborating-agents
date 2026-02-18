@@ -39,15 +39,22 @@ Newly-started agents show up immediately; if their transcript file is not persis
 
 Messaging input is available in the `Chat` tab. Use `@AgentName message` for direct messages or `@all message` for broadcast. Prefix the message body with `!!` to mark it urgent.
 
+Examples:
+
+- Direct: `@BlueFalcon Status update: parsing complete.`
+- Direct + urgent: `@BlueFalcon !! Need your decision now.`
+- Broadcast: `@all Wave 2 complete.`
+- Broadcast + urgent: `@all !! Stop edits in src/server/ until migration finishes.`
+
 ## Spawning a subagent via the `/subagent` command
 
 The user can spawn a single subagent manually in the background using the `/subagent <task>` slash command. It uses a built-in collaborating subagent prompt from this extension, and the subagent defaults to the same model as the spawning session. All agents use a readable two-word callsigns (for example: `SilverHarbor`). An immediate `Spawning subagent ...` status message with runtime name and prompt will be shown immediately.
 
-The parent (orchestrator agent) sessions automatically collect final subagent outputs on completion (single and parallel), without requiring subagents to send a separate final direct message summary. All direct subagent→parent status messages are optional, but are useful for blockers/questions only. Inbox delivery uses Pi's message routing: normal messages are queued with `followUp`, and `urgent: true` messages interrupt immediately with `steer`.
+The parent (orchestrator agent) sessions automatically collect final subagent outputs on completion (single and parallel), without requiring subagents to send a separate final direct message summary. All direct subagent → parent status messages are optional, but are useful for blockers/questions only. Inbox delivery uses Pi's message routing: normal messages are queued with `followUp`, and `urgent: true` messages interrupt immediately with `steer`.
 
 ## Autonomous Tool API for Agents
 
-The following tool is provided for agents to call autonomously. Users should use the slash commands above.
+The following tools are provided for agents to call autonomously. Users should use the slash commands above.
 
 ### The `agent_message` Tool
 
@@ -135,6 +142,7 @@ Default history depth used by the overlay feed/chat loader.
 
 This is a default baseline; runtime calls may still request larger limits.
 
+### Environment variables
 
 #### `COLLABORATING_AGENTS_DIR`
 
