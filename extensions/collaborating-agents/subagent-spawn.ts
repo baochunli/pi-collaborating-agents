@@ -36,6 +36,7 @@ export interface SpawnResult {
     PI_AGENT_NAME: string;
     PI_COLLAB_SUBAGENT_DEPTH: string;
   };
+  launchDelayMs?: number;
   resolvedModel?: string;
   resolvedTools?: string[];
   coordinator?: string;
@@ -393,6 +394,11 @@ function buildLaunchCommand(args: string[]): string {
   return `pi ${args.map(quoteShellArg).join(" ")}`;
 }
 
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function runSpawnTask(
   runtimeCwd: string,
   task: SpawnTask,
@@ -404,6 +410,7 @@ export async function runSpawnTask(
     enableSessionControl?: boolean;
     recursionDepth: number;
     parentAgentName?: string;
+    launchDelayMs?: number;
     onLaunch?: (launch: SpawnResult) => void | Promise<void>;
   },
 ): Promise<SpawnResult> {
@@ -467,6 +474,8 @@ export async function runSpawnTask(
 
   const launchArgs = [...args];
 
+  const launchDelayMs = Math.max(0, Math.floor(options.launchDelayMs ?? 0));
+
   const result: SpawnResult = {
     agent: task.agent,
     name: childName,
@@ -481,12 +490,17 @@ export async function runSpawnTask(
       PI_AGENT_NAME: childName,
       PI_COLLAB_SUBAGENT_DEPTH: String(options.recursionDepth + 1),
     },
+    launchDelayMs,
     resolvedModel: model,
     resolvedTools: agentDef.tools ? [...agentDef.tools] : undefined,
     coordinator: options.parentAgentName,
   };
 
   try {
+    if (launchDelayMs > 0) {
+      await sleep(launchDelayMs);
+    }
+
     result.exitCode = await new Promise<number>((resolve) => {
       const proc = spawn("pi", args, {
         cwd,

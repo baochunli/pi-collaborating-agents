@@ -77,6 +77,31 @@ function inboxDir(dirs: Dirs, agentName: string): string {
   return join(dirs.inbox, agentName);
 }
 
+function writeFileAtomic(path: string, content: string): boolean {
+  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+
+  try {
+    fs.writeFileSync(tempPath, content, "utf-8");
+
+    try {
+      fs.renameSync(tempPath, path);
+    } catch {
+      // Best-effort fallback for environments where rename cannot replace existing files.
+      fs.rmSync(path, { force: true });
+      fs.renameSync(tempPath, path);
+    }
+
+    return true;
+  } catch {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // best effort
+    }
+    return false;
+  }
+}
+
 export function registerSelf(dirs: Dirs, registration: AgentRegistration): boolean {
   ensureDirSync(dirs.base);
   ensureDirSync(dirs.registry);
@@ -91,23 +116,14 @@ export function registerSelf(dirs: Dirs, registration: AgentRegistration): boole
     }
   }
 
-  try {
-    fs.writeFileSync(path, JSON.stringify(registration, null, 2), "utf-8");
-    return true;
-  } catch {
-    return false;
-  }
+  return writeFileAtomic(path, JSON.stringify(registration, null, 2));
 }
 
 export function updateSelfHeartbeat(dirs: Dirs, registration: AgentRegistration): void {
   const path = registrationPath(dirs, registration.name);
   if (!fs.existsSync(path)) return;
 
-  try {
-    fs.writeFileSync(path, JSON.stringify(registration, null, 2), "utf-8");
-  } catch {
-    // best effort
-  }
+  writeFileAtomic(path, JSON.stringify(registration, null, 2));
 }
 
 export function unregisterSelf(dirs: Dirs, agentName: string): void {
@@ -133,15 +149,10 @@ export function listActiveAgents(dirs: Dirs, excludeAgentName?: string): AgentRe
   for (const entry of entries) {
     if (!entry.endsWith(".json")) continue;
     const file = join(dirs.registry, entry);
-    const parsed = readJsonFile<AgentRegistration>(file);
-    if (!isValidRegistration(parsed)) {
-      try {
-        fs.unlinkSync(file);
-      } catch {
-        // best effort
-      }
-      continue;
-    }
+    const parsed = readJsonFile<unknown>(file);
+
+    // Do not delete unreadable/invalid files here. They may be observed mid-update.
+    if (!parsed || !isValidRegistration(parsed)) continue;
 
     if (!isProcessAlive(parsed.pid)) {
       try {
@@ -324,20 +335,25 @@ export function sendDirect(
     replyTo: replyTo ?? null,
   };
 
-  enqueueInboxMessage(dirs, to, message);
+  try {
+    enqueueInboxMessage(dirs, to, message);
 
-  appendMessageLogEvent(dirs, {
-    id: message.id,
-    from,
-    to,
-    text: trimmed,
-    kind: "direct",
-    timestamp: message.timestamp,
-    urgent,
-    replyTo: message.replyTo,
-  });
+    appendMessageLogEvent(dirs, {
+      id: message.id,
+      from,
+      to,
+      text: trimmed,
+      kind: "direct",
+      timestamp: message.timestamp,
+      urgent,
+      replyTo: message.replyTo,
+    });
 
-  return { ok: true };
+    return { ok: true };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `Failed to send direct message to '${to}': ${reason}` };
+  }
 }
 
 export function sendBroadcast(

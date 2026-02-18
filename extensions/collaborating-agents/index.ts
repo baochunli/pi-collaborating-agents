@@ -103,6 +103,7 @@ const SubagentParams = Type.Object({
 const SUBAGENT_MAX_PARALLEL = 8;
 const SUBAGENT_MAX_CONCURRENCY = 4;
 const SUBAGENT_DEFAULT_MAX_DEPTH = 2;
+const SUBAGENT_LAUNCH_STAGGER_MS = 250;
 
 function formatToolCallArgs(args: unknown): string {
   const json = JSON.stringify(args, null, 2) ?? "{}";
@@ -700,6 +701,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       `- **Model used:** ${result.resolvedModel ?? "(default model)"}`,
       `- **Tools enabled:** ${result.resolvedTools && result.resolvedTools.length > 0 ? result.resolvedTools.join(", ") : "(default tools)"}`,
       `- **Parent routing:** ${result.coordinator ? `direct updates to ${result.coordinator}` : "no parent specified"}`,
+      `- **Launch delay:** ${result.launchDelayMs ?? 0}ms`,
       `- **Launch environment:** PI_AGENT_NAME=${result.launchEnv.PI_AGENT_NAME}, PI_COLLAB_SUBAGENT_DEPTH=${result.launchEnv.PI_COLLAB_SUBAGENT_DEPTH}`,
     ];
 
@@ -719,6 +721,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       `- Runtime subagent name: ${result.name}`,
       `- Session ID: ${result.sessionId ?? "(not reported)"}`,
       `- Working directory: ${result.workingDirectory}`,
+      `- Launch delay: ${result.launchDelayMs ?? 0}ms`,
     ];
 
     return lines.join("\n");
@@ -872,6 +875,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     }
 
     const concurrency = Math.max(1, Math.min(SUBAGENT_MAX_CONCURRENCY, tasks.length));
+    const launchStaggerMs = SUBAGENT_LAUNCH_STAGGER_MS;
 
     const results = await mapWithConcurrencyLimit(resolvedTasks, concurrency, async (entry, index) => {
       return await runSpawnTask(ctx.cwd, entry.task, entry.def, {
@@ -881,6 +885,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         enableSessionControl,
         recursionDepth: depthState.depth,
         parentAgentName: state.agentName,
+        launchDelayMs: launchStaggerMs * index,
         onLaunch: options?.onLaunch
           ? (launch) =>
               options.onLaunch?.({
@@ -905,6 +910,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 
     const resultSummaryLines = [
       `Parallel subagents: ${successCount}/${results.length} succeeded`,
+      `Launch stagger: ${launchStaggerMs}ms between subagent starts`,
       resolvedModel.warning ? `⚠️ ${resolvedModel.warning}` : undefined,
       "",
       "## Result Summary",
@@ -928,6 +934,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         runId,
         single: false,
         concurrency,
+        launchStaggerMs,
         profile: defaultAgent.name,
         results,
         modelResolutionWarning: resolvedModel.warning,
