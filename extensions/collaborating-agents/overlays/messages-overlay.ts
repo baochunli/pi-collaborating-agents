@@ -5,6 +5,7 @@ import type { Theme } from "@mariozechner/pi-coding-agent";
 import type { AgentRegistration, AgentRole, FocusState, MessageLogEvent } from "../types.js";
 
 const AGENTS_TAB = "[agents]";
+const RESERVATIONS_TAB = "[reservations]";
 const ALL_TAB = "[all]";
 const OVERLAY_WIDTH = 132;
 const MESSAGE_AREA_HEIGHT = 24;
@@ -66,6 +67,7 @@ interface MessagesOverlayDeps {
   focus: FocusState;
   loadAgents: () => AgentRegistration[];
   loadSwitchTargets?: () => AgentRegistration[];
+  loadReservationAgents: () => AgentRegistration[];
   loadMessages: (limit: number) => MessageLogEvent[];
   sendDirect: (to: string, text: string, urgent?: boolean) => { ok: boolean; error?: string };
   sendBroadcast: (text: string, urgent?: boolean) => { ok: boolean; delivered?: string[]; failed?: string[]; error?: string };
@@ -117,7 +119,7 @@ export class MessagesOverlay implements Component, Focusable {
 
   private getTabs(agents: AgentRegistration[]): string[] {
     const peerNames = agents.map((a) => a.name).filter((name) => name !== this.deps.selfName);
-    return [AGENTS_TAB, this.deps.selfName, ...peerNames, ALL_TAB];
+    return [AGENTS_TAB, RESERVATIONS_TAB, this.deps.selfName, ...peerNames, ALL_TAB];
   }
 
   private getSwitchTargets(agents: AgentRegistration[]): AgentRegistration[] {
@@ -320,7 +322,7 @@ export class MessagesOverlay implements Component, Focusable {
   private getMessages(limit: number): MessageLogEvent[] {
     const all = this.deps.loadMessages(limit);
     if (this.selectedTab === ALL_TAB) return all;
-    if (this.selectedTab === AGENTS_TAB) return [];
+    if (this.selectedTab === AGENTS_TAB || this.selectedTab === RESERVATIONS_TAB) return [];
 
     const peer = this.selectedTab;
     return all.filter((m) => {
@@ -369,7 +371,12 @@ export class MessagesOverlay implements Component, Focusable {
 
     if (!text) return;
 
-    if (broadcast || this.selectedTab === ALL_TAB || this.selectedTab === AGENTS_TAB) {
+    if (
+      broadcast ||
+      this.selectedTab === ALL_TAB ||
+      this.selectedTab === AGENTS_TAB ||
+      this.selectedTab === RESERVATIONS_TAB
+    ) {
       const r = this.deps.sendBroadcast(text, urgent);
       if (!r.ok) {
         this.deps.notify(r.error || "Failed to broadcast", "error");
@@ -539,7 +546,9 @@ export class MessagesOverlay implements Component, Focusable {
     const messageLines =
       this.selectedTab === AGENTS_TAB
         ? this.renderAgentsView(innerWidth - 2, messageAreaHeight, switchTargets)
-        : this.renderMessagesView(innerWidth - 2, messageAreaHeight, agents);
+        : this.selectedTab === RESERVATIONS_TAB
+          ? this.renderReservationsView(innerWidth - 2, messageAreaHeight)
+          : this.renderMessagesView(innerWidth - 2, messageAreaHeight, agents);
 
     for (const line of messageLines) lines.push(row(line));
 
@@ -565,9 +574,11 @@ export class MessagesOverlay implements Component, Focusable {
       const label =
         tab === AGENTS_TAB
           ? "Agents"
-          : tab === ALL_TAB
-            ? "All messages"
-            : this.displayAgentLabel(tab, this.resolveRole(tab, agents));
+          : tab === RESERVATIONS_TAB
+            ? "File reservations"
+            : tab === ALL_TAB
+              ? "All messages"
+              : this.displayAgentLabel(tab, this.resolveRole(tab, agents));
       const prefix = selected ? "▸ " : "";
       parts.push(prefix + this.theme.fg(selected ? "accent" : "muted", label));
     }
@@ -636,6 +647,54 @@ export class MessagesOverlay implements Component, Focusable {
     return out.slice(0, height);
   }
 
+  private renderReservationsView(width: number, height: number): string[] {
+    const out: string[] = [];
+    const reservationAgents = this.deps.loadReservationAgents();
+    const reservations = reservationAgents
+      .flatMap((agent) =>
+        (agent.reservations ?? []).map((reservation) => ({
+          agent,
+          reservation,
+        })),
+      )
+      .sort((a, b) => {
+        const byAgent = a.agent.name.localeCompare(b.agent.name);
+        if (byAgent !== 0) return byAgent;
+        return a.reservation.pattern.localeCompare(b.reservation.pattern);
+      });
+
+    out.push(this.theme.fg("dim", "Active file reservations (write/edit locks)"));
+    out.push("");
+
+    const headerRows = out.length;
+    const bodyHeight = Math.max(1, height - headerRows);
+
+    if (reservations.length === 0) {
+      out.push(this.theme.fg("dim", "No active reservations."));
+    } else {
+      const maxTop = Math.max(0, reservations.length - bodyHeight);
+      const top = Math.max(0, Math.min(maxTop, this.scrollPosition));
+      this.scrollPosition = top;
+
+      for (let row = 0; row < bodyHeight; row++) {
+        const idx = top + row;
+        const item = reservations[idx];
+        if (!item) {
+          out.push("");
+          continue;
+        }
+
+        const name = this.displayAgentLabel(item.agent.name, item.agent.role);
+        const reason = item.reservation.reason ? ` • ${item.reservation.reason}` : "";
+        const line = `${name} • ${item.reservation.pattern}${reason}`;
+        out.push(truncateToWidth(line, width));
+      }
+    }
+
+    while (out.length < height) out.push("");
+    return out.slice(0, height);
+  }
+
   private renderMessagesView(width: number, height: number, agents: AgentRegistration[]): string[] {
     const messages = this.getMessages(600);
 
@@ -669,7 +728,9 @@ export class MessagesOverlay implements Component, Focusable {
     const actor = fromSelf ? this.theme.fg("accent", actorLabel) : this.theme.fg("warning", actorLabel);
 
     const selectedPeer =
-      this.selectedTab !== AGENTS_TAB && this.selectedTab !== ALL_TAB
+      this.selectedTab !== AGENTS_TAB &&
+      this.selectedTab !== RESERVATIONS_TAB &&
+      this.selectedTab !== ALL_TAB
         ? this.selectedTab
         : null;
     const selectedPeerLabel = selectedPeer
@@ -755,6 +816,8 @@ export class MessagesOverlay implements Component, Focusable {
     let placeholder = "@name msg or @all msg";
     if (this.selectedTab === AGENTS_TAB) {
       placeholder = "Press Enter to switch focus (or type a message to broadcast)";
+    } else if (this.selectedTab === RESERVATIONS_TAB) {
+      placeholder = "Viewing reservations. Type a message to broadcast (use !! for urgent).";
     } else if (this.selectedTab !== ALL_TAB) {
       placeholder = `Message ${this.displayAgentLabel(this.selectedTab, this.resolveRole(this.selectedTab, agents))}... (use !! for urgent)`;
     } else if (this.selectedTab === ALL_TAB) {

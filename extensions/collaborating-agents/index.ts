@@ -579,6 +579,32 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     return out;
   }
 
+  const BROAD_RESERVATION_PATTERNS = new Set([".", "/", "./", "..", "../", ""]);
+
+  function validateReservationPattern(pattern: string): { valid: boolean; warning?: string } {
+    if (!pattern || pattern.trim() === "") {
+      return { valid: false };
+    }
+
+    const stripped = pattern.replace(/\/+$/, "");
+    if (BROAD_RESERVATION_PATTERNS.has(stripped) || BROAD_RESERVATION_PATTERNS.has(pattern)) {
+      return {
+        valid: true,
+        warning: `"${pattern}" is very broad and will block most file operations for other agents.`,
+      };
+    }
+
+    const segments = pattern.replace(/\/+$/, "").split("/").filter(Boolean);
+    if (segments.length === 1 && pattern.endsWith("/")) {
+      return {
+        valid: true,
+        warning: `"${pattern}" covers an entire top-level directory. Consider reserving a more specific path.`,
+      };
+    }
+
+    return { valid: true };
+  }
+
   function reservePaths(paths: string[], reason?: string): void {
     const since = new Date().toISOString();
     const normalizedReason = reason?.trim() ? reason.trim() : undefined;
@@ -1383,17 +1409,36 @@ Actions:
           };
         }
 
+        const warnings: string[] = [];
+        for (const pattern of paths) {
+          const validation = validateReservationPattern(pattern);
+          if (!validation.valid) {
+            return {
+              content: [{ type: "text", text: `Invalid reservation pattern: "${pattern}".` }],
+              isError: true,
+              details: { action, error: "invalid_pattern", pattern },
+            };
+          }
+          if (validation.warning) warnings.push(validation.warning);
+        }
+
         reservePaths(paths, params.reason);
         refreshRegistration(ctx);
         updateStatus(ctx);
 
         const reasonText = params.reason?.trim() ? ` (reason: ${params.reason.trim()})` : "";
+        const warningText =
+          warnings.length > 0
+            ? `\n\nWarnings:\n${warnings.map((warning) => `- ${warning}`).join("\n")}`
+            : "";
+
         return {
-          content: [{ type: "text", text: `Reserved ${paths.join(", ")}${reasonText}.` }],
+          content: [{ type: "text", text: `Reserved ${paths.join(", ")}${reasonText}.${warningText}` }],
           details: {
             action,
             paths,
             reason: params.reason?.trim() || undefined,
+            warnings: warnings.length > 0 ? warnings : undefined,
             reservations: state.reservations,
           },
         };
@@ -1645,6 +1690,7 @@ By default subagents use the same model as the spawning session.` ,
             focus: state.focus,
             loadAgents: () => listMessagePeers(),
             loadSwitchTargets: () => listOverlaySwitchTargets(),
+            loadReservationAgents: () => listActiveAgents(dirs),
             loadMessages: (limit) => readMessageLogTail(dirs, Math.max(limit, config.messageHistoryLimit)),
             sendDirect: (to, text, urgent) => sendDirect(dirs, state.agentName, to, text, undefined, urgent),
             sendBroadcast: (text, urgent) => sendBroadcast(dirs, state.agentName, text, urgent),

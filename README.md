@@ -31,12 +31,13 @@ pi remove https://github.com/baochunli/pi-collaborating-agents
 The `/agents` slash command opens an integrated _agents and messages_ overlay, which includes the following tabs:
 
   - `Agents` tab contains a list of all active and recently completed agents, and it allows the user to switch to the selected active session and tracks the target session in real time.
-  - One tab for each agent to show the messages sent to and from this agent
-  - `All messages` tab to show all recent messages since the last time subagents have been spawned by an orchestrator agent
+  - `File reservations` tab shows active reservation patterns and which agent currently owns each one.
+  - One tab for each agent to show the messages sent to and from this agent.
+  - `All messages` tab to show all recent messages since the last time subagents have been spawned by an orchestrator agent.
 
 Newly-started agents show up immediately; if their transcript file is not persisted yet they are marked `session pending`. Completed subagents remain visible in the `Agents` tab as `completed` until the next time an orchestrator agent spawns new subagents, which clears prior historical subagent states and their messages.
 
-The overlay also allows a user to send a message directly to an agent using `@AgentName message` (in a tab for an individual agent or in the `All messages` tab), or `@all message` to broadcast to all agents. Prefix the message body with `!!` to mark it urgent. Sending a message in the `Agents` tab broadcasts it to all agents by default.
+The overlay also allows a user to send a message directly to an agent using `@AgentName message` (in a tab for an individual agent or in the `All messages` tab), or `@all message` to broadcast to all agents. Prefix the message body with `!!` to mark it urgent. Sending a message in the `Agents` or `File reservations` tab broadcasts it to all agents by default.
 
 ## Spawning a subagent via the `/subagent` command
 
@@ -62,6 +63,8 @@ Actions:
 - `thread` – direct-message thread with one peer (`to`, `limit` optional)
 - `reserve` – reserve files/directories for write/edit coordination (`paths`, optional `reason`)
 - `release` – release reservations (`paths` optional; omit to release all)
+
+Reservation patterns are validated. Empty patterns are rejected, and broad patterns (for example `.`, `/`, `./`, `../`, or a top-level directory like `src/`) are allowed but return warnings.
 
 Examples:
 
@@ -98,12 +101,17 @@ subagent({
 })
 ```
 
-## Persistent Storage
+## How It Works
+
+Messages use Pi's delivery system: normal messages queue until the recipient finishes their current turn, urgent ones interrupt immediately. No polling is needed.
+
+Reservations are enforced by hooking Pi's edit and write tools. When an agent tries to edit a reserved file, the tool call gets blocked and the agent sees who reserved it, why, and a suggestion to coordinate via the `agent_message({ action: "send", ... })` tool. Write and edit calls are blocked when another active agent has a matching reservation. Reads remain allowed.
 
 States in this extension are stored at `~/.pi/agent/collaborating-agents/`:
 
-- `registry/` – active agent registrations (including each agent's current reservations)
-- `inbox/` – per-agent incoming message files
-- `messages.jsonl` – append-only global message log
-
-Write/edit calls are blocked when another active agent has a matching reservation. Reads remain allowed.
+```
+.pi/agent/collaborating-agents/
+├── registry/          # One JSON file per agent
+├── inbox/{name}/      # Inbound messages as JSON files, watched with fs.watch, one directory for each agent
+└── messages.jsonl     # Append-only log of all messages in the system
+```

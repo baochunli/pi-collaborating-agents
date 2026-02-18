@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import { join } from "node:path";
+import { join, normalize } from "node:path";
 import type {
   AgentRegistration,
   AgentRole,
@@ -166,10 +166,17 @@ export function getAgentByName(dirs: Dirs, name: string): AgentRegistration | un
 }
 
 export function pathMatchesReservation(filePath: string, pattern: string): boolean {
-  if (pattern.endsWith("/")) {
-    return filePath.startsWith(pattern) || `${filePath}/` === pattern;
+  const normalizedFilePath = normalize(filePath).replace(/^\.\//, "");
+  const normalizedPattern = normalize(pattern).replace(/^\.\//, "");
+
+  if (normalizedPattern.endsWith("/")) {
+    return (
+      normalizedFilePath.startsWith(normalizedPattern) ||
+      `${normalizedFilePath}/` === normalizedPattern
+    );
   }
-  return filePath === pattern;
+
+  return normalizedFilePath === normalizedPattern;
 }
 
 export function getConflictsWithOtherAgents(
