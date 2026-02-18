@@ -4,7 +4,6 @@ import { join } from "node:path";
 import type { CollaboratingAgentsConfig } from "./types.js";
 
 const DEFAULT_CONFIG: CollaboratingAgentsConfig = {
-  staleAgentSeconds: 120,
   messageHistoryLimit: 400,
 };
 
@@ -32,10 +31,6 @@ export function loadConfig(cwd: string): CollaboratingAgentsConfig {
   };
 
   return {
-    staleAgentSeconds:
-      typeof merged.staleAgentSeconds === "number" && merged.staleAgentSeconds > 0
-        ? merged.staleAgentSeconds
-        : DEFAULT_CONFIG.staleAgentSeconds,
     messageHistoryLimit:
       typeof merged.messageHistoryLimit === "number" && merged.messageHistoryLimit > 0
         ? merged.messageHistoryLimit

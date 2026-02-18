@@ -84,7 +84,6 @@ export interface ExtensionState {
 }
 
 export interface CollaboratingAgentsConfig {
-  staleAgentSeconds: number;
   messageHistoryLimit: number;
 }
 

@@ -120,18 +120,9 @@ The extension loads and merges configuration in this order:
 2. Global config: `~/.pi/agent/collaborating-agents.json`
 3. Project config: `<cwd>/.pi/collaborating-agents.json` (overrides global)
 
-Only positive numeric values and non-empty strings are accepted. Invalid values fall back to defaults.
+Only positive numeric values are accepted. Invalid values fall back to defaults.
 
 ### Config keys
-
-#### `staleAgentSeconds` (number, default: `120`)
-
-How long (in seconds) an agent registration can go without heartbeat updates before it is considered stale and excluded from active-agent views.
-
-- Lower values make stale cleanup more aggressive.
-- Higher values are more tolerant of short pauses.
-
-Use this if you see agents lingering after crashes or disappearing too quickly during heavy local load.
 
 #### `messageHistoryLimit` (number, default: `400`)
 
