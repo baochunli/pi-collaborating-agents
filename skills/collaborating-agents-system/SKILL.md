@@ -57,20 +57,59 @@ Notes:
 
 Modes:
 
-- Single: `{ task }`
-- Parallel: `{ tasks: [{ task, cwd? }, ...] }`
+- Single: `{ task }` or `{ type, task }`
+- Parallel: `{ tasks: [{ task, cwd? }, ...] }` or `{ type, tasks: [...] }`
 
-Examples:
+### Subagent Types
+
+You can specify a subagent `type` to use specialized configurations with different prompts, models, and reasoning levels:
+
+- `worker` — General-purpose development tasks (default if available)
+- `scout` — Exploration and discovery (finding files, understanding structure)
+- `documenter` — Documentation writing
+- `reviewer` — Code review and quality analysis
+- Custom types defined in `~/.pi/agent/subagents/*.toml` or project `.pi/subagents/*.toml`
+
+If no type is specified, the extension looks for a `worker` or `default` type configuration. If none exists, a built-in default is used.
+
+### Examples
 
 ```ts
+// Default subagent type
 subagent({ task: "Implement auth tags and report back via agent_message" })
 
+// With specific subagent type
+subagent({ 
+  type: "scout",
+  task: "Find all TypeScript files in src/" 
+})
+
+// Parallel subagents
 subagent({
   tasks: [
     { task: "Implement backend pieces" },
     { task: "Implement frontend pieces" }
   ]
 })
+
+// Parallel with specific type (applies to all tasks)
+subagent({
+  type: "documenter",
+  tasks: [
+    { task: "Document backend API" },
+    { task: "Document frontend components" }
+  ]
+})
+```
+
+### Slash command
+
+Users can also spawn subagents via the `/subagent` command:
+
+```
+/subagent "Implement user authentication"
+/subagent scout "Find all API endpoints"
+/subagent documenter "Write README for auth module"
 ```
 
 ## Coordinator workflow (recommended)
@@ -85,7 +124,7 @@ subagent({
 
 ## Subagent workflow (required behavior)
 
-Spawned workers use a built-in collaborating subagent prompt. At minimum they should:
+Spawned workers use a subagent prompt based on their configured `type` (defaulting to a built-in prompt if no type is specified). At minimum they should:
 
 1. At startup call:
    - `agent_message({ action: "status" })`

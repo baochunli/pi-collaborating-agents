@@ -101,3 +101,25 @@ export interface RemoteTurnResult {
   assistantText: string;
   turnIndex?: number;
 }
+
+/**
+ * Configuration for a subagent type loaded from TOML files.
+ * These define specialized subagent profiles with specific prompts,
+ * models, and reasoning levels.
+ */
+export interface SubagentTypeConfig {
+  /** Unique identifier for this subagent type (e.g., "scout", "documenter") */
+  name: string;
+  /** Human-readable description of what this subagent type does */
+  description: string;
+  /** Optional model override (e.g., "openai/gpt-4o", "anthropic/claude-sonnet-4-20250514") */
+  model?: string;
+  /** Optional reasoning level (e.g., "low", "medium", "high") */
+  reasoning?: "low" | "medium" | "high";
+  /** The system prompt for this subagent type */
+  prompt: string;
+  /** Source of the configuration */
+  source: "user" | "project";
+  /** Path to the TOML file */
+  filePath: string;
+}

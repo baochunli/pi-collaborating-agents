@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { SubagentTypeConfig } from "./types.js";
 
 export interface SpawnAgentDefinition {
   name: string;
@@ -612,4 +613,23 @@ export async function mapWithConcurrencyLimit<TIn, TOut>(
 
   await Promise.all(workers);
   return results;
+}
+
+/**
+ * Create a SpawnAgentDefinition from a SubagentTypeConfig.
+ * This converts TOML-based subagent type configurations to the format
+ * needed by the spawn system.
+ */
+export function createSpawnAgentDefinitionFromType(
+  typeConfig: SubagentTypeConfig,
+): SpawnAgentDefinition {
+  return {
+    name: typeConfig.name,
+    description: typeConfig.description,
+    model: typeConfig.model,
+    tools: [...DEFAULT_SUBAGENT_TOOLS],
+    systemPrompt: typeConfig.prompt,
+    source: typeConfig.source,
+    filePath: typeConfig.filePath,
+  };
 }

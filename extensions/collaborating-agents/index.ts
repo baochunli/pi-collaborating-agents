@@ -34,12 +34,19 @@ import type {
 } from "./types.js";
 import {
   createDefaultSpawnAgentDefinition,
+  createSpawnAgentDefinitionFromType,
   mapWithConcurrencyLimit,
   runSpawnTask,
   type SpawnAgentDefinition,
   type SpawnResult,
   type SpawnTask,
 } from "./subagent-spawn.js";
+import {
+  discoverSubagentTypes,
+  findSubagentType,
+  formatSubagentType,
+  getDefaultSubagentType,
+} from "./subagent-types.js";
 
 const STATUS_KEY = "collab";
 const WATCH_DEBOUNCE_MS = 40;
@@ -97,6 +104,7 @@ const SubagentParams = Type.Object({
   tasks: Type.Optional(Type.Array(SubagentTaskItem, { description: "Parallel-mode tasks" })),
   cwd: Type.Optional(Type.String({ description: "Default working directory for spawned subagents" })),
   sessionControl: Type.Optional(Type.Boolean({ description: "Spawn children with --session-control (default true)" })),
+  type: Type.Optional(Type.String({ description: "Subagent type to use (e.g., 'scout', 'documenter', 'reviewer'). Uses default if not specified." })),
 });
 
 const SUBAGENT_MAX_PARALLEL = 8;
@@ -735,6 +743,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       tasks?: Array<{ task: string; cwd?: string }>;
       cwd?: string;
       sessionControl?: boolean;
+      type?: string;
     },
     ctx: ExtensionContext,
     options?: {
@@ -789,13 +798,29 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       };
     }
 
+    // Discover and resolve subagent type configuration
+    const availableTypes = discoverSubagentTypes(ctx.cwd);
+    let typeConfig = getDefaultSubagentType(availableTypes);
+    let typeNotFoundWarning: string | undefined;
+
+    if (params.type) {
+      const requestedType = findSubagentType(params.type, availableTypes);
+      if (requestedType) {
+        typeConfig = requestedType;
+      } else {
+        const availableNames = availableTypes.map((t) => t.name).join(", ") || "(none found)";
+        typeNotFoundWarning = `Subagent type "${params.type}" not found. Using default (${typeConfig.name}). Available types: ${availableNames}`;
+      }
+    }
+
     markAsOrchestrator(ctx);
 
     const runId = randomUUID().slice(0, 8);
     const enableSessionControl = params.sessionControl !== false;
     const includeLaunchBlock = options?.includeLaunchBlock ?? true;
 
-    const defaultAgent = createDefaultSpawnAgentDefinition("subagent");
+    // Create runtime agent from type configuration
+    const baseAgentDef = createSpawnAgentDefinitionFromType(typeConfig);
     const resolvedModel = ctx.model
       ? resolveModelByProviderFallback({
           provider: ctx.model.provider,
@@ -804,9 +829,10 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         })
       : { model: undefined };
 
+    // Type config model takes precedence, then fallback to current session model
     const runtimeAgent: SpawnAgentDefinition = {
-      ...defaultAgent,
-      model: resolvedModel.model || defaultAgent.model,
+      ...baseAgentDef,
+      model: baseAgentDef.model || resolvedModel.model,
     };
 
     if (hasSingle) {
@@ -833,7 +859,9 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           : undefined,
       });
 
-      const resolutionLine = `Using built-in subagent profile '${profile}'.`;
+      const resolutionLine = typeNotFoundWarning
+        ? `⚠️ ${typeNotFoundWarning}\n\nUsing subagent type '${typeConfig.name}'.`
+        : `Using subagent type '${typeConfig.name}'.`;
       const modelNotice = resolvedModel.warning ? `\n\n⚠️ ${resolvedModel.warning}` : "";
       const launchBlock = formatSingleSubagentLaunchBlock(profile, result);
 
@@ -851,8 +879,10 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           runId,
           single: true,
           profile,
+          type: typeConfig.name,
           result,
           modelResolutionWarning: resolvedModel.warning,
+          typeNotFoundWarning,
         },
       };
     }
@@ -909,8 +939,9 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       return formatParallelSubagentLaunchBlock(resolved?.def.name ?? result.agent, result, idx);
     });
 
+    const typeNotice = typeNotFoundWarning ? `⚠️ ${typeNotFoundWarning}\n\n` : "";
     const resultSummaryLines = [
-      `Parallel subagents: ${successCount}/${results.length} succeeded`,
+      `${typeNotice}Parallel subagents using type '${typeConfig.name}': ${successCount}/${results.length} succeeded`,
       `Launch stagger: ${launchStaggerMs}ms between subagent starts`,
       resolvedModel.warning ? `⚠️ ${resolvedModel.warning}` : undefined,
       "",
@@ -936,9 +967,11 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         single: false,
         concurrency,
         launchStaggerMs,
-        profile: defaultAgent.name,
+        profile: typeConfig.name,
+        type: typeConfig.name,
         results,
         modelResolutionWarning: resolvedModel.warning,
+        typeNotFoundWarning,
       },
     };
   }
@@ -948,17 +981,20 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     tasks?: Array<{ task: string; cwd?: string }>;
     cwd?: string;
     sessionControl?: boolean;
+    type?: string;
   };
 
   function validateSubagentLaunchParams(
     params: SubagentLaunchParams,
-  ): { ok: true; mode: "single" | "parallel"; taskCount: number } | { ok: false; error: string } {
+  ): { ok: true; mode: "single" | "parallel"; taskCount: number; type?: string } | { ok: false; error: string } {
     const hasSingle = typeof params.task === "string" && params.task.trim().length > 0;
     const hasParallel = (params.tasks?.length ?? 0) > 0;
 
     if (Number(hasSingle) + Number(hasParallel) !== 1) {
       return { ok: false, error: "Provide exactly one mode: task or tasks[]" };
     }
+
+    const type = params.type?.trim() || undefined;
 
     if (hasParallel) {
       const count = params.tasks?.length ?? 0;
@@ -968,10 +1004,10 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           error: `Too many parallel tasks (${count}). Max is ${SUBAGENT_MAX_PARALLEL}.`,
         };
       }
-      return { ok: true, mode: "parallel", taskCount: count };
+      return { ok: true, mode: "parallel", taskCount: count, type };
     }
 
-    return { ok: true, mode: "single", taskCount: 1 };
+    return { ok: true, mode: "single", taskCount: 1, type };
   }
 
   function sendSubagentLaunchUpdate(profile: string, launch: SpawnResult): void {
@@ -1564,14 +1600,14 @@ By default subagents use the same model as the spawning session.` ,
   });
 
   pi.registerCommand("subagent", {
-    description: "Spawn a single subagent: /subagent <task>",
+    description: "Spawn a single subagent: /subagent [type] <task>",
     handler: async (args, ctx) => {
       lastContext = ctx;
       rememberSwitchSessionContext(ctx);
       const trimmed = args.trim();
 
       const notifyUsage = () => {
-        ctx.ui.notify("Usage: /subagent <task>", "warning");
+        ctx.ui.notify("Usage: /subagent [type] <task>", "warning");
       };
 
       if (!trimmed) {
@@ -1579,7 +1615,35 @@ By default subagents use the same model as the spawning session.` ,
         return;
       }
 
-      const task = trimmed;
+      // Parse the command: optional type followed by task
+      // Format: /subagent "task"  OR  /subagent scout "task"
+      let type: string | undefined;
+      let task: string;
+
+      // Check if first word is a known subagent type
+      const availableTypes = discoverSubagentTypes(ctx.cwd);
+      const firstWordMatch = trimmed.match(/^(\S+)(\s+.+)$/);
+      
+      if (firstWordMatch) {
+        const potentialType = firstWordMatch[1]!;
+        const rest = firstWordMatch[2]!.trim();
+        
+        // Check if first word is a valid type (case-insensitive)
+        const isKnownType = availableTypes.some(
+          (t) => t.name.toLowerCase() === potentialType.toLowerCase()
+        );
+        
+        if (isKnownType) {
+          type = potentialType;
+          task = rest;
+        } else {
+          // First word is not a type, treat entire input as task
+          task = trimmed;
+        }
+      } else {
+        task = trimmed;
+      }
+
       if (!task) {
         notifyUsage();
         return;
@@ -1590,9 +1654,10 @@ By default subagents use the same model as the spawning session.` ,
         return;
       }
 
-      ctx.ui.notify("Launching subagent in background...", "info");
+      const typeLabel = type ? ` (${type})` : "";
+      ctx.ui.notify(`Launching subagent${typeLabel} in background...`, "info");
 
-      launchSubagentsInBackground({ task }, ctx);
+      launchSubagentsInBackground({ task, type }, ctx);
     },
   });
 

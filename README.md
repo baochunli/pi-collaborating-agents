@@ -62,7 +62,19 @@ Examples:
 
 ## Spawning a subagent via the `/subagent` command
 
-The user can spawn a single subagent manually in the background using the `/subagent <task>` slash command. It uses a built-in collaborating subagent prompt from this extension, and the subagent defaults to the same model as the spawning session. All agents use a readable two-word callsigns (for example: `SilverHarbor`). An immediate `Spawning subagent ...` status message with runtime name and prompt will be shown immediately.
+The user can spawn a single subagent manually in the background using the `/subagent [type] <task>` slash command. It uses a built-in collaborating subagent prompt from this extension by default, but you can also specify a **subagent type** to use specialized configurations. All agents use readable two-word callsigns (for example: `SilverHarbor`). An immediate `Spawning subagent ...` status message with runtime name and prompt will be shown immediately.
+
+### Usage
+
+```bash
+# Use default subagent type
+/subagent "Implement user authentication"
+
+# Use a specific subagent type
+/subagent scout "Find all TypeScript files in the project"
+/subagent documenter "Write API documentation for the auth module"
+/subagent reviewer "Check for security issues in src/auth/"
+```
 
 The parent (orchestrator agent) sessions automatically collect final subagent outputs on completion (single and parallel), without requiring subagents to send a separate final direct message summary. All direct subagent → parent status messages are optional, but are useful for blockers/questions only. Inbox delivery uses Pi's message routing: normal messages are queued with `followUp`, and `urgent: true` messages interrupt immediately with `steer`.
 
@@ -106,19 +118,129 @@ The extension also provides a lightweight **`subagent`** tool for agents to call
 
 Modes:
 
-- Single: `{ task }`
-- Parallel: `{ tasks: [{ task, cwd? }, ...] }`
+- Single: `{ task }` or `{ type, task }`
+- Parallel: `{ tasks: [{ task, cwd? }, ...] }` or `{ type, tasks: [...] }`
+
+Parameters:
+
+- `task` (string, optional) – Task prompt for single-mode
+- `tasks` (array, optional) – Array of task objects for parallel-mode
+- `type` (string, optional) – Subagent type to use (e.g., "scout", "documenter", "reviewer")
+- `cwd` (string, optional) – Working directory for spawned subagents
+- `sessionControl` (boolean, optional) – Spawn with `--session-control` (default: true)
 
 Examples:
 
 ```ts
+// Default subagent type
 subagent({ task: "Implement auth tags and report back via agent_message" })
 
+// With specific subagent type
+subagent({ 
+  type: "scout",
+  task: "Find all TypeScript files in the project" 
+})
+
+// Parallel subagents
 subagent({
   tasks: [
     { task: "Implement backend pieces" },
     { task: "Implement frontend pieces" }
   ]
+})
+
+// Parallel with specific type (applies to all tasks)
+subagent({
+  type: "documenter",
+  tasks: [
+    { task: "Document backend API" },
+    { task: "Document frontend components" }
+  ]
+})
+```
+
+## Subagent Type Configuration
+
+You can define custom subagent types using TOML configuration files. These allow you to create specialized subagents with different prompts, models, and reasoning levels.
+
+### Configuration locations
+
+Subagent type configurations are loaded from:
+
+1. **Global types**: `~/.pi/agent/subagents/*.toml`
+2. **Project types**: `<cwd>/.pi/subagents/*.toml` (takes precedence)
+
+### TOML format
+
+Each `.toml` file defines one subagent type:
+
+```toml
+name = "scout"
+description = "Exploration specialist for finding files and patterns"
+
+# Optional: Override the model (defaults to parent session's model)
+model = "openai/gpt-4o-mini"
+
+# Optional: Set reasoning level (low, medium, high)
+reasoning = "low"
+
+# Required: The system prompt for this subagent type
+prompt = """You are a Scout subagent specialized in exploration...
+
+## Guidelines
+- Be quick and focused
+- Use bash, find, grep efficiently
+- Report findings in structured format
+"""
+```
+
+### Default subagent type
+
+When no type is specified, the extension looks for a **worker** or **default** type in your configuration:
+
+1. If `worker.toml` exists, it's used as the default
+2. If `default.toml` exists, it's used as the default
+3. Otherwise, a built-in default prompt is used
+
+To customize the default subagent behavior, create a `worker.toml` in your `~/.pi/agent/subagents/` or project's `.pi/subagents/` directory.
+
+### Example subagent types
+
+The extension includes example configurations for common use cases:
+
+| Type | Purpose | Reasoning |
+|------|---------|-----------|
+| `worker` | General-purpose development tasks | medium |
+| `scout` | Exploration and discovery | low |
+| `documenter` | Documentation writing | medium |
+| `reviewer` | Code review and analysis | high |
+
+See the `examples/subagents/` directory for complete example configurations.
+
+### Using subagent types
+
+**Via slash command:**
+```bash
+/subagent scout "Find all API endpoints in src/"
+/subagent documenter "Write README for the auth module"
+/subagent reviewer "Check src/auth.ts for security issues"
+```
+
+**Via the `subagent` tool:**
+```ts
+// Single subagent with type
+subagent({ 
+  type: "scout", 
+  task: "Find all TypeScript files" 
+})
+
+// Parallel subagents with types
+subagent({
+  tasks: [
+    { task: "Document auth module" },  // uses default/worker type
+    { task: "Review auth module" }     // uses default/worker type
+  ],
+  type: "documenter"  // applies to all tasks
 })
 ```
 
