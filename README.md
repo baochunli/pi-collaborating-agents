@@ -62,7 +62,7 @@ Examples:
 
 ## Spawning a subagent via the `/subagent` command
 
-The user can spawn a single subagent manually in the background using the `/subagent [type] <task>` slash command. It uses a built-in collaborating subagent prompt from this extension by default, but you can also specify a **subagent type** to use specialized configurations. All agents use readable two-word callsigns (for example: `SilverHarbor`). An immediate `Spawning subagent ...` status message with runtime name and prompt will be shown immediately.
+The user can spawn a single subagent manually in the background using the `/subagent [type] <task>` slash command. It uses the default subagent type (`worker`/`default`) from this extension by default, but you can also specify a **subagent type** to use specialized configurations. All agents use readable two-word callsigns (for example: `SilverHarbor`). An immediate `Spawning subagent ...` status message with runtime name and prompt will be shown immediately.
 
 ### Usage
 
@@ -181,7 +181,7 @@ description = "Exploration specialist for finding files and patterns"
 # Optional: Override the model (defaults to parent session's model)
 model = "openai/gpt-4o-mini"
 
-# Optional: Set reasoning level (low, medium, high)
+# Optional: Set reasoning level (low, medium, high, xhigh)
 reasoning = "low"
 
 # Required: The system prompt for this subagent type
@@ -200,7 +200,7 @@ When no type is specified, the extension looks for a **worker** or **default** t
 
 1. If `worker.toml` exists, it's used as the default
 2. If `default.toml` exists, it's used as the default
-3. Otherwise, a built-in default prompt is used
+3. Otherwise, the bundled `examples/subagents/worker.toml` default is used
 
 To customize the default subagent behavior, create a `worker.toml` in your `~/.pi/agent/subagents/` or project's `.pi/subagents/` directory.
 

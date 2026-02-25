@@ -114,8 +114,8 @@ export interface SubagentTypeConfig {
   description: string;
   /** Optional model override (e.g., "openai/gpt-4o", "anthropic/claude-sonnet-4-20250514") */
   model?: string;
-  /** Optional reasoning level (e.g., "low", "medium", "high") */
-  reasoning?: "low" | "medium" | "high";
+  /** Optional reasoning level (e.g., "low", "medium", "high", "xhigh") */
+  reasoning?: "low" | "medium" | "high" | "xhigh";
   /** The system prompt for this subagent type */
   prompt: string;
   /** Source of the configuration */

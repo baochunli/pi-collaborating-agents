@@ -33,7 +33,6 @@ import type {
   MessageLogEvent,
 } from "./types.js";
 import {
-  createDefaultSpawnAgentDefinition,
   createSpawnAgentDefinitionFromType,
   mapWithConcurrencyLimit,
   runSpawnTask,
@@ -1535,7 +1534,7 @@ Actions:
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: `Spawn one or more subagent pi processes using the built-in collaborating subagent prompt.
+    description: `Spawn one or more subagent pi processes using the configured subagent type (worker/default by default).
 
 Modes:
 - Single: { task }

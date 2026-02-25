@@ -1,18 +1,48 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { SubagentTypeConfig } from "./types.js";
 
+function stripInlineTomlComment(value: string): string {
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+
+    if (ch === "#" && !inSingle && !inDouble) {
+      if (i === 0 || /\s/.test(value[i - 1] ?? "")) {
+        return value.slice(0, i).trimEnd();
+      }
+    }
+  }
+
+  return value.trimEnd();
+}
+
 /**
- * Simple TOML parser that extracts the basic structure we need.
- * Handles string values (quoted and unquoted), and basic key-value pairs.
+ * Minimal TOML parser for flat key/value files.
+ * Supports quoted/unquoted scalar values and multiline triple-quoted strings.
  */
 function parseSimpleToml(content: string): Record<string, string | undefined> {
   const result: Record<string, string | undefined> = {};
   const lines = content.replace(/\r\n/g, "\n").split("\n");
 
-  for (const rawLine of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i] ?? "";
     const line = rawLine.trim();
+
     // Skip comments and empty lines
     if (!line || line.startsWith("#")) continue;
 
@@ -22,34 +52,41 @@ function parseSimpleToml(content: string): Record<string, string | undefined> {
 
     const key = line.slice(0, eqIndex).trim();
     let value = line.slice(eqIndex + 1).trim();
+    if (!key) continue;
+
+    // Handle multiline strings (triple quotes)
+    if (value.startsWith('"""') || value.startsWith("'''")) {
+      const quote = value.startsWith('"""') ? '"""' : "'''";
+      value = value.slice(3);
+
+      const chunks: string[] = [];
+      while (true) {
+        const endQuoteIndex = value.indexOf(quote);
+        if (endQuoteIndex !== -1) {
+          chunks.push(value.slice(0, endQuoteIndex));
+          break;
+        }
+
+        chunks.push(value);
+
+        i += 1;
+        if (i >= lines.length) break;
+        value = lines[i] ?? "";
+      }
+
+      result[key] = chunks.join("\n");
+      continue;
+    }
 
     // Remove inline comments
-    const commentIndex = value.search(/\s+#/);
-    if (commentIndex !== -1) {
-      value = value.slice(0, commentIndex).trim();
-    }
+    value = stripInlineTomlComment(value).trim();
 
     // Handle quoted strings
     if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
     }
 
-    // Handle multiline strings (triple quotes) - for simplicity, just take the content
-    if (value.startsWith('"""') || value.startsWith("'''")) {
-      const quote = value.slice(0, 3);
-      // Find the closing quote
-      const endQuoteIndex = value.indexOf(quote, 3);
-      if (endQuoteIndex !== -1) {
-        value = value.slice(3, endQuoteIndex);
-      } else {
-        // Multiline - take everything after the opening quote
-        value = value.slice(3);
-      }
-    }
-
-    if (key) {
-      result[key] = value;
-    }
+    result[key] = value;
   }
 
   return result;
@@ -82,7 +119,7 @@ function loadSubagentTypeFromFile(filePath: string, source: "user" | "project"):
   // Parse reasoning level
   let reasoning: SubagentTypeConfig["reasoning"] = undefined;
   const reasoningValue = parsed.reasoning?.toLowerCase().trim();
-  if (reasoningValue === "low" || reasoningValue === "medium" || reasoningValue === "high") {
+  if (reasoningValue === "low" || reasoningValue === "medium" || reasoningValue === "high" || reasoningValue === "xhigh") {
     reasoning = reasoningValue;
   }
 
@@ -139,9 +176,31 @@ function findNearestProjectSubagentsDir(cwd: string): string | null {
   }
 }
 
+const BUNDLED_WORKER_TOML_PATH = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "examples",
+  "subagents",
+  "worker.toml",
+);
+
+const EMERGENCY_DEFAULT_PROMPT = `You are a general worker subagent working under a parent agent.
+
+At startup, call:
+- agent_message({ action: "status" })
+- agent_message({ action: "list" })
+
+Reserve files before editing and release reservations when done.
+Read relevant files before editing, keep changes scoped to the task, run validation when possible, and return a concise final report.`;
+
+function loadBundledWorkerType(): SubagentTypeConfig | null {
+  return loadSubagentTypeFromFile(BUNDLED_WORKER_TOML_PATH, "project");
+}
+
 /**
  * Discover all available subagent type configurations.
- * User configs override project configs for the same type name.
+ * Project configs override user configs for the same type name.
  */
 export function discoverSubagentTypes(cwd: string): SubagentTypeConfig[] {
   const userDir = path.join(os.homedir(), ".pi", "agent", "subagents");
@@ -170,54 +229,14 @@ export function findSubagentType(
 }
 
 /**
- * The hardcoded embedded default prompt, used as fallback when no
- * worker.toml or default.toml is found.
- */
-const EMBEDDED_DEFAULT_PROMPT = `You are a spawned subagent operating under a parent agent.
-
-## Messaging protocol (required)
-
-1. At startup, call:
-   - agent_message({ action: "status" })
-   - agent_message({ action: "list" })
-
-2. If the prompt contains a parent agent name, you may send direct status updates to that parent agent when useful:
-   - "Started task: ..."
-   - blockers/questions needing parent input
-
-3. Do not send a mandatory final summary message to the parent. The parent collects your final output automatically from task completion.
-
-4. Use direct messages for blockers and questions.
-
-5. Do not broadcast progress updates unless explicitly requested by the task.
-
-## Execution protocol
-
-- Read relevant files before editing.
-- Keep changes scoped to the requested task.
-- Run validation when possible.
-- Return a concise structured final report.
-
-## Final response format
-
-## Summary
-[What was done]
-
-## Files Changed
-- file/path: what changed
-
-## Validation
-- command: result
-
-## Notes
-- blockers/follow-ups`;
-
-/**
  * Get the default subagent type configuration.
- * 
- * Looks for a "worker" or "default" type in the available types first.
- * If found, returns that configuration. Otherwise returns the embedded default.
- * 
+ *
+ * Resolution order:
+ * 1. "worker" from discovered project/user configs
+ * 2. "default" from discovered project/user configs
+ * 3. Bundled examples/subagents/worker.toml in this extension package
+ * 4. Emergency inline fallback (only if the bundled file is unavailable)
+ *
  * @param availableTypes - Optional array of discovered subagent types to search
  */
 export function getDefaultSubagentType(availableTypes?: SubagentTypeConfig[]): SubagentTypeConfig {
@@ -227,20 +246,24 @@ export function getDefaultSubagentType(availableTypes?: SubagentTypeConfig[]): S
     if (workerType) {
       return workerType;
     }
-    
+
     const defaultType = availableTypes.find((t) => t.name.toLowerCase() === "default");
     if (defaultType) {
       return defaultType;
     }
   }
-  
-  // Fall back to embedded default
+
+  const bundledWorkerType = loadBundledWorkerType();
+  if (bundledWorkerType) {
+    return bundledWorkerType;
+  }
+
   return {
-    name: "default",
-    description: "Default collaborating subagent with balanced capabilities",
-    prompt: EMBEDDED_DEFAULT_PROMPT,
+    name: "worker",
+    description: "General-purpose collaborating subagent for software development tasks",
+    prompt: EMERGENCY_DEFAULT_PROMPT,
     source: "project",
-    filePath: "<embedded>",
+    filePath: "<emergency-fallback>",
   };
 }
 

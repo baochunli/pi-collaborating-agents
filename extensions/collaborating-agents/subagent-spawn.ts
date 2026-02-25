@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { getDefaultSubagentType } from "./subagent-types.js";
 import type { SubagentTypeConfig } from "./types.js";
 
 export interface SpawnAgentDefinition {
@@ -50,56 +51,16 @@ const SUPPORTED_SUBAGENT_TOOL_NAMES = new Set(["read", "bash", "edit", "write", 
 const LOCAL_COLLABORATING_AGENTS_EXTENSION = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.ts");
 const HOME_COLLABORATING_AGENTS_EXTENSION = path.join(os.homedir(), ".pi", "agent", "extensions", "collaborating-agents", "index.ts");
 
-export const DEFAULT_SUBAGENT_SYSTEM_PROMPT = `# Collaborating Subagent
-
-You are a spawned subagent operating under a parent agent.
-
-## Messaging protocol (required)
-
-1. At startup, call:
-   - agent_message({ action: "status" })
-   - agent_message({ action: "list" })
-
-2. If the prompt contains a parent agent name, you may send direct status updates to that parent agent when useful:
-   - "Started task: ..."
-   - blockers/questions needing parent input
-
-3. Do not send a mandatory final summary message to the parent. The parent collects your final output automatically from task completion.
-
-4. Use direct messages for blockers and questions.
-
-5. Do not broadcast progress updates unless explicitly requested by the task.
-
-## Execution protocol
-
-- Read relevant files before editing.
-- Keep changes scoped to the requested task.
-- Run validation when possible.
-- Return a concise structured final report.
-
-## Final response format
-
-## Summary
-[What was done]
-
-## Files Changed
-- file/path: what changed
-
-## Validation
-- command: result
-
-## Notes
-- blockers/follow-ups
-`;
-
 export function createDefaultSpawnAgentDefinition(name = "subagent"): SpawnAgentDefinition {
+  const defaultType = getDefaultSubagentType();
+
   return {
     name,
-    description: "Built-in collaborating subagent profile",
+    description: defaultType.description,
     tools: [...DEFAULT_SUBAGENT_TOOLS],
-    systemPrompt: DEFAULT_SUBAGENT_SYSTEM_PROMPT,
-    source: "project",
-    filePath: "<embedded>",
+    systemPrompt: defaultType.prompt,
+    source: defaultType.source,
+    filePath: defaultType.filePath,
   };
 }
 

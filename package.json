@@ -16,6 +16,7 @@
   "files": [
     "extensions/collaborating-agents/**/*",
     "skills/collaborating-agents-system/**/*",
+    "examples/subagents/worker.toml",
     "README.md",
     "LICENSE"
   ],
