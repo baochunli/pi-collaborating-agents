@@ -1,5 +1,6 @@
 # Default worker subagent - used when no specific type is requested
-# Place this file in your project's .pi/subagents/ directory or in ~/.pi/agent/subagents/
+# Place this file in your project's .pi/agents/ directory or in ~/.pi/agents/
+# (legacy paths .pi/subagents/ and ~/.pi/agent/subagents/ are also supported)
 
 name = "worker"
 description = "General-purpose collaborating subagent for software development tasks"

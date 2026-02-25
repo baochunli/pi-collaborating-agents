@@ -41,6 +41,14 @@ import {
   type SpawnTask,
 } from "./subagent-spawn.js";
 import {
+  buildSubagentCompletionMessagePayload,
+  collectSpawnResults,
+  partitionPendingSubagentCompletionUpdates,
+  shouldDeferSubagentCompletionUpdate,
+  type PendingSubagentCompletionUpdate,
+  type SubagentCompletionMessagePayload,
+} from "./subagent-completion.js";
+import {
   discoverSubagentTypes,
   findSubagentType,
   formatSubagentType,
@@ -160,6 +168,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   let remoteSessionRefreshRunning = false;
   let remoteSessionRefreshScheduled = false;
   let remoteSessionSwitchContext: ExtensionCommandContext | null = null;
+
+  const pendingSubagentCompletionUpdates: PendingSubagentCompletionUpdate[] = [];
 
   registerRenderers(pi);
 
@@ -697,7 +707,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   function formatSingleSubagentLaunchBlock(profile: string, result: SpawnResult): string {
     const launchLines = [
       "## Subagent Launch Details",
-      `Spawning subagent **${formatAgentDisplayName(result.name)}** with the prompt:`,
+      `Spawning subagent **${formatAgentDisplayName(result.name)}** with task prompt:`,
       "",
       "```text",
       result.launchPrompt,
@@ -709,6 +719,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       `- **Working directory:** ${result.workingDirectory}`,
       `- **Model used:** ${result.resolvedModel ?? "(default model)"}`,
       `- **Tools enabled:** ${result.resolvedTools && result.resolvedTools.length > 0 ? result.resolvedTools.join(", ") : "(default tools)"}`,
+      `- **Type system prompt:** ${result.launchSystemPromptSource ? `${result.launchSystemPromptSource} (${result.launchSystemPromptLength ?? 0} chars)` : "(none)"}`,
       `- **Parent routing:** ${result.coordinator ? `direct updates to ${result.coordinator}` : "no parent specified"}`,
       `- **Launch delay:** ${result.launchDelayMs ?? 0}ms`,
       `- **Launch environment:** PI_AGENT_NAME=${result.launchEnv.PI_AGENT_NAME}, PI_COLLAB_SUBAGENT_DEPTH=${result.launchEnv.PI_COLLAB_SUBAGENT_DEPTH}`,
@@ -720,7 +731,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   function formatParallelSubagentLaunchBlock(profile: string, result: SpawnResult, index: number): string {
     const lines = [
       `### Launch ${index + 1}`,
-      `Spawning subagent **${formatAgentDisplayName(result.name)}** with the prompt:`,
+      `Spawning subagent **${formatAgentDisplayName(result.name)}** with task prompt:`,
       "",
       "```text",
       result.launchPrompt,
@@ -730,6 +741,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       `- Runtime subagent name: ${result.name}`,
       `- Session ID: ${result.sessionId ?? "(not reported)"}`,
       `- Working directory: ${result.workingDirectory}`,
+      `- Type system prompt: ${result.launchSystemPromptSource ? `${result.launchSystemPromptSource} (${result.launchSystemPromptLength ?? 0} chars)` : "(none)"}`,
       `- Launch delay: ${result.launchDelayMs ?? 0}ms`,
     ];
 
@@ -1041,20 +1053,6 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     );
   }
 
-  function collectSpawnResults(details: Record<string, unknown>): SpawnResult[] {
-    const singleResult =
-      typeof details.result === "object" && details.result
-        ? (details.result as SpawnResult)
-        : undefined;
-
-    const parallelResults = Array.isArray(details.results)
-      ? (details.results as SpawnResult[])
-      : undefined;
-
-    if (parallelResults && parallelResults.length > 0) return parallelResults;
-    return singleResult ? [singleResult] : [];
-  }
-
   function findSessionFileBySessionId(sessionId: string | undefined): string | undefined {
     if (!sessionId) return undefined;
 
@@ -1117,6 +1115,57 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     state.completedSubagents = snapshots.sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  function buildSubagentStatusSendOptions(ctx: ExtensionContext): { triggerTurn: true; deliverAs?: "steer" } {
+    if (!ctx.hasUI) return { triggerTurn: true };
+    return ctx.isIdle()
+      ? { triggerTurn: true }
+      : { triggerTurn: true, deliverAs: "steer" };
+  }
+
+  function trySendSubagentStatusPayload(payload: SubagentCompletionMessagePayload, ctx: ExtensionContext): boolean {
+    try {
+      pi.sendMessage(payload, buildSubagentStatusSendOptions(ctx));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function resolveSubagentCompletionTargetSessionFile(launchSessionFile: string | undefined): string | undefined {
+    return launchSessionFile ?? coordinatorSessionFile ?? localSessionFile;
+  }
+
+  function queueSubagentCompletionPayload(
+    payload: SubagentCompletionMessagePayload,
+    targetSessionFile: string | undefined,
+  ): void {
+    pendingSubagentCompletionUpdates.push({ payload, targetSessionFile });
+  }
+
+  function flushPendingSubagentCompletionUpdates(ctx: ExtensionContext): void {
+    if (pendingSubagentCompletionUpdates.length === 0) return;
+
+    const currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
+    const { deliverable, deferred } = partitionPendingSubagentCompletionUpdates(
+      pendingSubagentCompletionUpdates,
+      currentSessionFile,
+    );
+
+    pendingSubagentCompletionUpdates.length = 0;
+    pendingSubagentCompletionUpdates.push(...deferred);
+
+    const retry: PendingSubagentCompletionUpdate[] = [];
+    for (const entry of deliverable) {
+      if (!trySendSubagentStatusPayload(entry.payload, ctx)) {
+        retry.push(entry);
+      }
+    }
+
+    if (retry.length > 0) {
+      pendingSubagentCompletionUpdates.unshift(...retry);
+    }
+  }
+
   function sendSubagentCompletionUpdate(
     result: {
       content: Array<{ type: "text"; text: string }>;
@@ -1124,57 +1173,48 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       isError?: boolean;
     },
     ctx: ExtensionContext,
+    options?: { targetSessionFile?: string },
   ): void {
-    const detailsObj = result.details as Record<string, unknown>;
-    const spawnResults = collectSpawnResults(detailsObj);
+    const payload = buildSubagentCompletionMessagePayload(result);
 
-    let intro: string;
-    let body: string;
+    const activeCtx = lastContext ?? ctx;
+    const activeSessionFile = activeCtx.sessionManager.getSessionFile() ?? undefined;
+    const targetSessionFile = resolveSubagentCompletionTargetSessionFile(options?.targetSessionFile);
 
-    if (spawnResults.length > 1) {
-      const successCount = spawnResults.filter((r) => r.exitCode === 0).length;
-      intro = result.isError
-        ? `Received final results from ${spawnResults.length} subagents (${successCount} succeeded, ${spawnResults.length - successCount} failed).`
-        : `Received final results from ${spawnResults.length} subagents.`;
-
-      const sections = spawnResults.map((r, index) => {
-        const displayName = formatAgentDisplayName(r.name);
-        const status = r.exitCode === 0 ? "ok" : "failed";
-        const output = (r.output || "(no output)").trim() || "(no output)";
-        return [
-          `### ${index + 1}. ${displayName} (${status})`,
-          "",
-          output,
-        ].join("\n");
-      });
-
-      body = sections.join("\n\n");
-    } else {
-      const singleResult = spawnResults[0];
-      const runtimeLabel = singleResult?.name ? formatAgentDisplayName(singleResult.name) : "the subagent";
-      intro = result.isError
-        ? `Received an error from ${runtimeLabel}.`
-        : `Received final results from ${runtimeLabel}.`;
-
-      body = (singleResult?.output || result.content[0]?.text || "(no output)").trim() || "(no output)";
+    if (shouldDeferSubagentCompletionUpdate({ targetSessionFile, activeSessionFile })) {
+      queueSubagentCompletionPayload(payload, targetSessionFile);
+      return;
     }
 
-    const shouldAutoTurn = !ctx.hasUI;
-    const sendOptions = shouldAutoTurn
-      ? { triggerTurn: true as const }
-      : ctx.isIdle()
-        ? { triggerTurn: true as const }
-        : { triggerTurn: true as const, deliverAs: "steer" as const };
+    if (!trySendSubagentStatusPayload(payload, activeCtx)) {
+      queueSubagentCompletionPayload(payload, targetSessionFile);
+    }
+  }
 
-    pi.sendMessage(
-      {
-        customType: "collab_focus_status",
-        content: `${intro}\n\n${body}`,
-        display: true,
-        details: result.details,
-      },
-      sendOptions,
-    );
+  function sendSubagentFailureUpdate(
+    errorMessage: string,
+    ctx: ExtensionContext,
+    options?: { targetSessionFile?: string },
+  ): void {
+    const payload: SubagentCompletionMessagePayload = {
+      customType: "collab_focus_status",
+      content: `Subagent failed to run: ${errorMessage}`,
+      display: true,
+      details: { mode: "subagent", error: errorMessage },
+    };
+
+    const activeCtx = lastContext ?? ctx;
+    const activeSessionFile = activeCtx.sessionManager.getSessionFile() ?? undefined;
+    const targetSessionFile = resolveSubagentCompletionTargetSessionFile(options?.targetSessionFile);
+
+    if (shouldDeferSubagentCompletionUpdate({ targetSessionFile, activeSessionFile })) {
+      queueSubagentCompletionPayload(payload, targetSessionFile);
+      return;
+    }
+
+    if (!trySendSubagentStatusPayload(payload, activeCtx)) {
+      queueSubagentCompletionPayload(payload, targetSessionFile);
+    }
   }
 
   function markAsOrchestrator(ctx: ExtensionContext): void {
@@ -1189,6 +1229,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   }
 
   function launchSubagentsInBackground(params: SubagentLaunchParams, ctx: ExtensionContext): void {
+    const launchSessionFile = ctx.sessionManager.getSessionFile() ?? coordinatorSessionFile ?? localSessionFile;
+
     state.activeSubagentRuns += 1;
     state.completedSubagents = [];
     state.unreadCounts.clear();
@@ -1208,7 +1250,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         const detailsObj = result.details as Record<string, unknown>;
         snapshotCompletedSubagents(collectSpawnResults(detailsObj));
         updateStatus(ctx);
-        sendSubagentCompletionUpdate(result, ctx);
+        sendSubagentCompletionUpdate(result, ctx, { targetSessionFile: launchSessionFile });
 
         if (!ctx.hasUI) return;
         if (result.isError) {
@@ -1218,21 +1260,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         }
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        const sendOptions = !ctx.hasUI
-          ? { triggerTurn: true as const }
-          : ctx.isIdle()
-            ? { triggerTurn: true as const }
-            : { triggerTurn: true as const, deliverAs: "steer" as const };
-
-        pi.sendMessage(
-          {
-            customType: "collab_focus_status",
-            content: `Subagent failed to run: ${msg}`,
-            display: true,
-            details: { mode: "subagent", error: msg },
-          },
-          sendOptions,
-        );
+        sendSubagentFailureUpdate(msg, ctx, { targetSessionFile: launchSessionFile });
         if (ctx.hasUI) ctx.ui.notify("Subagent failed", "error");
       } finally {
         state.activeSubagentRuns = Math.max(0, state.activeSubagentRuns - 1);
@@ -1912,6 +1940,7 @@ By default subagents use the same model as the spawning session.` ,
     syncFocusToCurrentSession(ctx);
     startRemoteSessionAutoRefresh(ctx);
     updateStatus(ctx);
+    flushPendingSubagentCompletionUpdates(ctx);
   });
 
   pi.on("session_switch", async (_event, ctx) => {
@@ -1927,6 +1956,7 @@ By default subagents use the same model as the spawning session.` ,
     syncFocusToCurrentSession(ctx);
     startRemoteSessionAutoRefresh(ctx);
     updateStatus(ctx);
+    flushPendingSubagentCompletionUpdates(ctx);
   });
 
   pi.on("session_fork", async (_event, ctx) => {
@@ -1936,6 +1966,7 @@ By default subagents use the same model as the spawning session.` ,
     syncFocusToCurrentSession(ctx);
     startRemoteSessionAutoRefresh(ctx);
     updateStatus(ctx);
+    flushPendingSubagentCompletionUpdates(ctx);
   });
 
   pi.on("turn_end", async (_event, ctx) => {
@@ -1943,6 +1974,7 @@ By default subagents use the same model as the spawning session.` ,
     if (!state.registered) return;
     refreshRegistration(ctx);
     updateStatus(ctx);
+    flushPendingSubagentCompletionUpdates(ctx);
   });
 
   pi.on("session_shutdown", async () => {

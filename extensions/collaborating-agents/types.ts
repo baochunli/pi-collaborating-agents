@@ -119,7 +119,7 @@ export interface SubagentTypeConfig {
   /** The system prompt for this subagent type */
   prompt: string;
   /** Source of the configuration */
-  source: "user" | "project";
+  source: "bundled" | "user" | "project";
   /** Path to the TOML file */
   filePath: string;
 }

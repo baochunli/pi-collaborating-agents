@@ -12,7 +12,7 @@ export interface SpawnAgentDefinition {
   model?: string;
   tools?: string[];
   systemPrompt: string;
-  source: "user" | "project";
+  source: "bundled" | "user" | "project";
   filePath: string;
 }
 
@@ -34,6 +34,8 @@ export interface SpawnResult {
   launchArgs: string[];
   launchCommand: string;
   launchPrompt: string;
+  launchSystemPromptSource?: string;
+  launchSystemPromptLength?: number;
   launchEnv: {
     PI_AGENT_NAME: string;
     PI_COLLAB_SUBAGENT_DEPTH: string;
@@ -156,11 +158,26 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
   }
 }
 
+function resolveHomeDir(): string {
+  const envHome = process.env.HOME?.trim();
+  if (envHome) return envHome;
+
+  const envUserProfile = process.env.USERPROFILE?.trim();
+  if (envUserProfile) return envUserProfile;
+
+  return os.homedir();
+}
+
 export function discoverSpawnAgents(cwd: string): SpawnAgentDefinition[] {
-  const userDir = path.join(os.homedir(), ".pi", "agent", "agents");
+  const homeDir = resolveHomeDir();
+  const legacyUserDir = path.join(homeDir, ".pi", "agent", "agents");
+  const preferredUserDir = path.join(homeDir, ".pi", "agents");
   const projectDir = findNearestProjectAgentsDir(cwd);
 
-  const userAgents = loadAgentsFromDir(userDir, "user");
+  const userAgents = [
+    ...loadAgentsFromDir(legacyUserDir, "user"),
+    ...loadAgentsFromDir(preferredUserDir, "user"),
+  ];
   const projectAgents = projectDir ? loadAgentsFromDir(projectDir, "project") : [];
 
   const map = new Map<string, SpawnAgentDefinition>();
@@ -407,12 +424,11 @@ export async function runSpawnTask(
     }
   }
 
-  let tmpDir: string | null = null;
-  if (agentDef.systemPrompt.trim()) {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "collab-subagent-"));
-    const promptPath = path.join(tmpDir, "prompt.md");
-    fs.writeFileSync(promptPath, agentDef.systemPrompt, "utf-8");
-    args.push("--append-system-prompt", promptPath);
+  const typeSystemPrompt = agentDef.systemPrompt.trim();
+  if (typeSystemPrompt) {
+    // Pass prompt text directly so type instructions are always attached,
+    // regardless of file-path resolution behavior across pi versions.
+    args.push("--append-system-prompt", typeSystemPrompt);
   }
 
   const coordinationHeader = options.parentAgentName
@@ -436,6 +452,12 @@ export async function runSpawnTask(
   const cwd = task.cwd || options.defaultCwd || runtimeCwd;
 
   const launchArgs = [...args];
+  if (typeSystemPrompt) {
+    const promptArgIndex = launchArgs.indexOf("--append-system-prompt");
+    if (promptArgIndex >= 0 && promptArgIndex + 1 < launchArgs.length) {
+      launchArgs[promptArgIndex + 1] = `<subagent-type-prompt:${typeSystemPrompt.length} chars>`;
+    }
+  }
 
   const launchDelayMs = Math.max(0, Math.floor(options.launchDelayMs ?? 0));
 
@@ -449,6 +471,8 @@ export async function runSpawnTask(
     launchArgs,
     launchCommand: buildLaunchCommand(launchArgs),
     launchPrompt: wrappedTaskPrompt,
+    launchSystemPromptSource: typeSystemPrompt ? agentDef.filePath : undefined,
+    launchSystemPromptLength: typeSystemPrompt.length > 0 ? typeSystemPrompt.length : undefined,
     launchEnv: {
       PI_AGENT_NAME: childName,
       PI_COLLAB_SUBAGENT_DEPTH: String(options.recursionDepth + 1),
@@ -459,12 +483,11 @@ export async function runSpawnTask(
     coordinator: options.parentAgentName,
   };
 
-  try {
-    if (launchDelayMs > 0) {
-      await sleep(launchDelayMs);
-    }
+  if (launchDelayMs > 0) {
+    await sleep(launchDelayMs);
+  }
 
-    result.exitCode = await new Promise<number>((resolve) => {
+  result.exitCode = await new Promise<number>((resolve) => {
       const proc = spawn("pi", args, {
         cwd,
         env,
@@ -538,20 +561,11 @@ export async function runSpawnTask(
       });
     });
 
-    if (result.exitCode !== 0 && !result.error) {
-      result.error = result.output || "Subagent process failed";
-    }
-
-    return result;
-  } finally {
-    if (tmpDir) {
-      try {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      } catch {
-        // ignore
-      }
-    }
+  if (result.exitCode !== 0 && !result.error) {
+    result.error = result.output || "Subagent process failed";
   }
+
+  return result;
 }
 
 export async function mapWithConcurrencyLimit<TIn, TOut>(

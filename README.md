@@ -165,10 +165,17 @@ You can define custom subagent types using TOML configuration files. These allow
 
 ### Configuration locations
 
-Subagent type configurations are loaded from:
+Subagent type configurations are loaded in precedence order (later entries override earlier ones when names match):
 
-1. **Global types**: `~/.pi/agent/subagents/*.toml`
-2. **Project types**: `<cwd>/.pi/subagents/*.toml` (takes precedence)
+1. **Bundled defaults**: `examples/subagents/*.toml` (included with this extension)
+2. **Global overrides**:
+   - Preferred: `~/.pi/agents/*.toml`
+   - Legacy (still supported): `~/.pi/agent/subagents/*.toml`
+3. **Project overrides** (nearest ancestor to current cwd):
+   - Preferred: `<cwd>/.pi/agents/*.toml`
+   - Legacy (still supported): `<cwd>/.pi/subagents/*.toml`
+
+This means the extension uses bundled `examples/subagents` out of the box, while user/project configs take priority when present.
 
 ### TOML format
 
@@ -196,13 +203,15 @@ prompt = """You are a Scout subagent specialized in exploration...
 
 ### Default subagent type
 
-When no type is specified, the extension looks for a **worker** or **default** type in your configuration:
+When no type is specified, the extension resolves the default in this order:
 
-1. If `worker.toml` exists, it's used as the default
-2. If `default.toml` exists, it's used as the default
-3. Otherwise, the bundled `examples/subagents/worker.toml` default is used
+1. `worker` from user/project overrides
+2. `default` from user/project overrides
+3. bundled `worker` from `examples/subagents/*.toml`
+4. Bundled `examples/subagents/worker.toml`
+5. Emergency inline fallback (only if bundled files are unavailable)
 
-To customize the default subagent behavior, create a `worker.toml` in your `~/.pi/agent/subagents/` or project's `.pi/subagents/` directory.
+To customize the default behavior, create `worker.toml` in `~/.pi/agents/` or your project’s `.pi/agents/` directory.
 
 ### Example subagent types
 
@@ -313,4 +322,10 @@ States in this extension are stored at `~/.pi/agent/collaborating-agents/`:
 ├── registry/          # One JSON file per agent
 ├── inbox/{name}/      # Inbound messages as JSON files, watched with fs.watch, one directory for each agent
 └── messages.jsonl     # Append-only log of all messages in the system
+```
+
+To run all tests:
+
+```bash
+bun test
 ```

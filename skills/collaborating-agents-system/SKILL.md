@@ -60,17 +60,57 @@ Modes:
 - Single: `{ task }` or `{ type, task }`
 - Parallel: `{ tasks: [{ task, cwd? }, ...] }` or `{ type, tasks: [...] }`
 
-### Subagent Types
+### Subagent Types (agent-type design)
 
-You can specify a subagent `type` to use specialized configurations with different prompts, models, and reasoning levels:
+Subagents are driven by **type configs** (TOML files). A type controls:
 
-- `worker` — General-purpose development tasks (default if available)
-- `scout` — Exploration and discovery (finding files, understanding structure)
-- `documenter` — Documentation writing
-- `reviewer` — Code review and quality analysis
-- Custom types defined in `~/.pi/agent/subagents/*.toml` or project `.pi/subagents/*.toml`
+- system prompt
+- optional model override
+- optional reasoning level (`low | medium | high | xhigh`)
 
-If no type is specified, the extension looks for a `worker` or `default` type configuration. If none exists, a built-in default is used.
+You can use built-in types (from `examples/subagents`) or override/add your own.
+
+Common built-ins include:
+
+- `worker` — general-purpose implementation (default)
+- `scout` — fast discovery / codebase exploration
+- `documenter` — docs and writeups
+- `reviewer` — review / risk analysis
+- plus many additional bundled specialists in `examples/subagents/*.toml`
+
+#### Type discovery precedence
+
+Later sources override earlier ones when `name` matches:
+
+1. Bundled defaults: `examples/subagents/*.toml`
+2. User overrides:
+   - Preferred: `~/.pi/agents/*.toml`
+   - Legacy: `~/.pi/agent/subagents/*.toml`
+3. Project overrides (nearest ancestor from current cwd):
+   - Preferred: `.pi/agents/*.toml`
+   - Legacy: `.pi/subagents/*.toml`
+
+So by default, bundled `examples/subagents` are used. Any matching config in `~/.pi/agents` or project `.pi/agents` takes priority.
+
+#### Default type resolution
+
+When no `type` is passed:
+
+1. use override `worker` from user/project config if present
+2. else use override `default` from user/project config if present
+3. else use bundled `worker` from `examples/subagents/*.toml`
+4. else fallback to bundled `examples/subagents/worker.toml`
+5. else use emergency inline worker prompt (rare)
+
+#### TOML shape
+
+```toml
+name = "scout"
+description = "Exploration specialist"
+model = "openai/gpt-4o-mini"   # optional
+reasoning = "low"               # optional
+prompt = """...required system prompt..."""
+```
 
 ### Examples
 
