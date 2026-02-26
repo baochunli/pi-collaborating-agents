@@ -1,9 +1,17 @@
 {
   "name": "@baochunli/pi-collaborating-agents",
-  "version": "0.2.3",
+  "version": "0.3.1",
   "description": "Collaborative multi-agent messaging and remote focus overlay extension for Pi",
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/baochunli/pi-collaborating-agents.git"
+  },
+  "homepage": "https://github.com/baochunli/pi-collaborating-agents#readme",
+  "bugs": {
+    "url": "https://github.com/baochunli/pi-collaborating-agents/issues"
+  },
   "keywords": [
     "pi-package"
   ],
