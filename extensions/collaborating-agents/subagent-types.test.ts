@@ -7,6 +7,7 @@ import { discoverSubagentTypes, getDefaultSubagentType } from "./subagent-types.
 const tempDirs: string[] = [];
 const ORIGINAL_HOME = process.env.HOME;
 const ORIGINAL_USERPROFILE = process.env.USERPROFILE;
+const ORIGINAL_BUNDLED_SUBAGENTS_DIR = process.env.COLLABORATING_AGENTS_BUNDLED_SUBAGENTS_DIR;
 
 function makeTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
@@ -63,6 +64,12 @@ afterEach(() => {
   } else {
     delete process.env.USERPROFILE;
   }
+
+  if (typeof ORIGINAL_BUNDLED_SUBAGENTS_DIR === "string") {
+    process.env.COLLABORATING_AGENTS_BUNDLED_SUBAGENTS_DIR = ORIGINAL_BUNDLED_SUBAGENTS_DIR;
+  } else {
+    delete process.env.COLLABORATING_AGENTS_BUNDLED_SUBAGENTS_DIR;
+  }
 });
 
 describe("subagent type discovery", () => {
@@ -95,6 +102,33 @@ describe("subagent type discovery", () => {
     expect(tester).toBeDefined();
     expect(tester?.source).toBe("bundled");
     expect(tester?.filePath.endsWith(`${path.sep}examples${path.sep}subagents${path.sep}tester.toml`)).toBe(true);
+  });
+
+  test("uses COLLABORATING_AGENTS_BUNDLED_SUBAGENTS_DIR override when provided", () => {
+    const home = makeTempDir("collab-types-bundled-override-home");
+    setHome(home);
+
+    const bundledOverrideDir = makeTempDir("collab-types-bundled-override");
+    writeTypeConfig(bundledOverrideDir, "worker.toml", {
+      name: "worker",
+      description: "Bundled override worker",
+      prompt: "Bundled override prompt",
+    });
+
+    process.env.COLLABORATING_AGENTS_BUNDLED_SUBAGENTS_DIR = bundledOverrideDir;
+
+    const cwd = makeTempDir("collab-types-bundled-override-cwd");
+    const types = discoverSubagentTypes(cwd);
+    const worker = types.find((t) => t.name.toLowerCase() === "worker");
+
+    expect(worker).toBeDefined();
+    expect(worker?.source).toBe("bundled");
+    expect(worker?.description).toBe("Bundled override worker");
+    expect(worker?.filePath).toContain(bundledOverrideDir);
+
+    const resolvedDefault = getDefaultSubagentType(types);
+    expect(resolvedDefault.filePath).toContain(bundledOverrideDir);
+    expect(resolvedDefault.prompt).toBe("Bundled override prompt");
   });
 
   test("user ~/.pi/agents override takes priority over bundled type", () => {

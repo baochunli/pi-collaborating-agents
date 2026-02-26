@@ -431,16 +431,13 @@ export async function runSpawnTask(
     args.push("--append-system-prompt", typeSystemPrompt);
   }
 
-  const coordinationHeader = options.parentAgentName
-    ? [
-        `Parent agent: ${options.parentAgentName}`,
-        "Direct status messages to the parent are optional and only needed for blockers/questions.",
-        "Do not send a mandatory final summary message to the parent; completion output is collected automatically.",
-        "Do not broadcast progress updates unless the task explicitly asks for broadcast.",
-      ].join("\n")
-    : "Do not broadcast progress updates unless explicitly requested by the task.";
+  const parentContextHeader = options.parentAgentName
+    ? `Parent agent: ${options.parentAgentName}\n\n`
+    : "";
 
-  const wrappedTaskPrompt = `${coordinationHeader}\n\nTask: ${task.task}`;
+  // Keep the task prompt payload user-controlled (type instructions come from TOML
+  // via --append-system-prompt). Only add lightweight parent context metadata.
+  const wrappedTaskPrompt = `${parentContextHeader}${task.task}`;
   args.push(wrappedTaskPrompt);
 
   const env = {

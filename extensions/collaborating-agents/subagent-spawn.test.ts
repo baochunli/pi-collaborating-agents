@@ -106,6 +106,10 @@ describe("subagent spawn", () => {
     expect(appendFlagIndex).toBeGreaterThanOrEqual(0);
     expect(capturedArgs[appendFlagIndex + 1]).toBe(typePrompt);
 
+    const runtimeTaskPrompt = capturedArgs[capturedArgs.length - 1];
+    expect(runtimeTaskPrompt).toBe("Find all TypeScript files");
+    expect(runtimeTaskPrompt).not.toContain("Do not send a mandatory final summary message");
+
     const launchAppendFlagIndex = result.launchArgs.indexOf("--append-system-prompt");
     expect(launchAppendFlagIndex).toBeGreaterThanOrEqual(0);
     expect(result.launchArgs[launchAppendFlagIndex + 1]).toBe(`<subagent-type-prompt:${typePrompt.length} chars>`);

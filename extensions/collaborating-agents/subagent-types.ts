@@ -197,15 +197,56 @@ function resolveHomeDir(): string {
   return os.homedir();
 }
 
-const BUNDLED_SUBAGENTS_DIR = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "..",
-  "examples",
-  "subagents",
-);
+function isDirectory(dir: string | undefined): dir is string {
+  if (!dir) return false;
+  try {
+    return fs.statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
-const BUNDLED_WORKER_TOML_PATH = path.join(BUNDLED_SUBAGENTS_DIR, "worker.toml");
+function resolveBundledSubagentsDir(): string | null {
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const envOverride = process.env.COLLABORATING_AGENTS_BUNDLED_SUBAGENTS_DIR?.trim();
+
+  const candidateDirs: string[] = [];
+  if (envOverride) candidateDirs.push(envOverride);
+
+  // Common layouts:
+  // - source tree:   extensions/collaborating-agents/*.ts  -> ../../examples/subagents
+  // - built output:  dist/extensions/collaborating-agents   -> ../../../examples/subagents
+  candidateDirs.push(path.resolve(moduleDir, "..", "..", "examples", "subagents"));
+  candidateDirs.push(path.resolve(moduleDir, "..", "..", "..", "examples", "subagents"));
+
+  // Generic upward scan for package structures we do not explicitly model.
+  let current = moduleDir;
+  for (let i = 0; i < 8; i++) {
+    candidateDirs.push(path.join(current, "examples", "subagents"));
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  const seen = new Set<string>();
+  for (const candidate of candidateDirs) {
+    const normalized = path.resolve(candidate);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    if (isDirectory(normalized)) return normalized;
+  }
+
+  return null;
+}
+
+function getBundledSubagentsDir(): string | null {
+  return resolveBundledSubagentsDir();
+}
+
+function getBundledWorkerTomlPath(): string | null {
+  const dir = getBundledSubagentsDir();
+  return dir ? path.join(dir, "worker.toml") : null;
+}
 
 const EMERGENCY_DEFAULT_PROMPT = `You are a general worker subagent working under a parent agent.
 
@@ -217,11 +258,15 @@ Reserve files before editing and release reservations when done.
 Read relevant files before editing, keep changes scoped to the task, run validation when possible, and return a concise final report.`;
 
 function loadBundledSubagentTypes(): SubagentTypeConfig[] {
-  return loadSubagentTypesFromDir(BUNDLED_SUBAGENTS_DIR, "bundled");
+  const bundledDir = getBundledSubagentsDir();
+  if (!bundledDir) return [];
+  return loadSubagentTypesFromDir(bundledDir, "bundled");
 }
 
 function loadBundledWorkerType(): SubagentTypeConfig | null {
-  return loadSubagentTypeFromFile(BUNDLED_WORKER_TOML_PATH, "bundled");
+  const workerTomlPath = getBundledWorkerTomlPath();
+  if (!workerTomlPath) return null;
+  return loadSubagentTypeFromFile(workerTomlPath, "bundled");
 }
 
 /**
