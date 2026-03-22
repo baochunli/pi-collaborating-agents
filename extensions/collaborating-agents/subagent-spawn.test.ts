@@ -13,6 +13,7 @@ import {
 const tempDirs: string[] = [];
 const ORIGINAL_PATH = process.env.PATH;
 const ORIGINAL_TEST_ARGS_FILE = process.env.TEST_ARGS_FILE;
+const ORIGINAL_TEST_CMUX_ARGS_FILE = process.env.TEST_CMUX_ARGS_FILE;
 const ORIGINAL_HOME = process.env.HOME;
 const ORIGINAL_USERPROFILE = process.env.USERPROFILE;
 
@@ -62,20 +63,46 @@ function writeFakePiBinary(dir: string): { binPath: string; argsFile: string } {
 
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+const path = require("node:path");
 
+const args = process.argv.slice(2);
 const argsFile = process.env.TEST_ARGS_FILE;
 if (argsFile) {
-  fs.writeFileSync(argsFile, JSON.stringify(process.argv.slice(2)), "utf-8");
+  fs.writeFileSync(argsFile, JSON.stringify(args), "utf-8");
 }
 
-process.stdout.write(JSON.stringify({ type: "session", id: "fake-session" }) + "\\n");
-process.stdout.write(JSON.stringify({
-  type: "message_end",
-  message: {
-    role: "assistant",
-    content: [{ type: "text", text: "fake-ok" }],
-  },
-}) + "\\n");
+const sessionIndex = args.indexOf("--session");
+const sessionPath = sessionIndex >= 0 ? args[sessionIndex + 1] : undefined;
+
+if (args.includes("--mode") && args.includes("json")) {
+  process.stdout.write(JSON.stringify({ type: "session", id: "fake-session" }) + "\\n");
+  process.stdout.write(JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "fake-ok" }],
+    },
+  }) + "\\n");
+  process.exit(0);
+}
+
+if (sessionPath) {
+  fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+  fs.writeFileSync(sessionPath, [
+    JSON.stringify({ type: "session", id: "fake-session" }),
+    JSON.stringify({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "fake-ok" }],
+        stopReason: "stop",
+      },
+    }),
+    "",
+  ].join("\\n"), "utf-8");
+}
+
+process.stdout.write("fake-text-mode\\n");
 process.exit(0);
 `;
 
@@ -103,6 +130,69 @@ process.exit(2);
   return { binPath, argsFile };
 }
 
+function writeFakeCmuxBinary(dir: string): { binPath: string; argsFile: string } {
+  const binPath = path.join(dir, "cmux");
+  const argsFile = path.join(dir, "captured-cmux-args.jsonl");
+
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const cp = require("node:child_process");
+
+const argsFile = process.env.TEST_CMUX_ARGS_FILE;
+if (argsFile) {
+  fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\\n", "utf-8");
+}
+
+const args = process.argv.slice(2);
+if (args[0] === "identify") {
+  const surfaceIndex = args.indexOf("--surface");
+  const targetSurface = surfaceIndex >= 0 ? args[surfaceIndex + 1] : "surface:2";
+  const paneRef = targetSurface === "surface:99" ? "pane:99" : "pane:2";
+  process.stdout.write(JSON.stringify({
+    caller: {
+      workspace_ref: "workspace:77",
+      pane_ref: paneRef,
+      surface_ref: targetSurface,
+    },
+  }));
+  process.exit(0);
+}
+
+if (args[0] === "new-split") {
+  process.stdout.write("OK surface:99 workspace:77\\n");
+  process.exit(0);
+}
+
+if (args[0] === "send") {
+  const command = args[args.length - 1] || "";
+  const result = cp.spawnSync("/bin/bash", ["-lc", command], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: "inherit",
+  });
+
+  if (result.error) {
+    process.stderr.write(String(result.error));
+    process.exit(1);
+  }
+
+  process.stdout.write("OK\\n");
+  process.exit(result.status ?? 0);
+}
+
+if (args[0] === "close-surface") {
+  process.stdout.write("OK\\n");
+  process.exit(0);
+}
+
+process.stderr.write("unsupported cmux command");
+process.exit(2);
+`;
+
+  fs.writeFileSync(binPath, script, { encoding: "utf-8", mode: 0o755 });
+  return { binPath, argsFile };
+}
+
 afterEach(() => {
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
@@ -120,6 +210,12 @@ afterEach(() => {
     process.env.TEST_ARGS_FILE = ORIGINAL_TEST_ARGS_FILE;
   } else {
     delete process.env.TEST_ARGS_FILE;
+  }
+
+  if (typeof ORIGINAL_TEST_CMUX_ARGS_FILE === "string") {
+    process.env.TEST_CMUX_ARGS_FILE = ORIGINAL_TEST_CMUX_ARGS_FILE;
+  } else {
+    delete process.env.TEST_CMUX_ARGS_FILE;
   }
 
   if (typeof ORIGINAL_HOME === "string") {
@@ -271,6 +367,73 @@ describe("subagent spawn", () => {
     expect(result.exitCode).toBe(2);
     expect(result.output).toBe("subagent crashed");
     expect(result.error).toBe("subagent crashed");
+  });
+
+  test("can launch a subagent in a visible cmux pane and still collect final session output", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun4",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.launchMode).toBe("cmux-pane");
+    expect(result.cmuxWorkspaceRef).toBe("workspace:77");
+    expect(result.cmuxPaneRef).toBe("pane:99");
+    expect(result.cmuxSurfaceRef).toBe("surface:99");
+
+    const capturedCmuxArgs = fs
+      .readFileSync(cmuxArgsFile, "utf-8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send"]);
+
+    const splitArgs = capturedCmuxArgs[1]!;
+    expect(splitArgs[1]).toBe("right");
+    expect(splitArgs).toContain("--workspace");
+    expect(splitArgs).toContain("--surface");
+
+    const sendArgs = capturedCmuxArgs[3]!;
+    expect(sendArgs).toContain("--workspace");
+    expect(sendArgs).toContain("workspace:77");
+    expect(sendArgs).toContain("--surface");
+    expect(sendArgs).toContain("surface:99");
+    expect(sendArgs[sendArgs.length - 1]).toContain("pi --session");
+    expect(sendArgs[sendArgs.length - 1]).not.toContain("--mode json -p");
+
+    const capturedPiArgs = JSON.parse(fs.readFileSync(argsFile, "utf-8")) as string[];
+    expect(capturedPiArgs).toContain("--session");
+    expect(capturedPiArgs[capturedPiArgs.length - 1]).toBe("Inspect the repository");
   });
 });
 

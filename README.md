@@ -62,7 +62,9 @@ Examples:
 
 ## Spawning a subagent via the `/subagent` command
 
-The user can spawn a single subagent manually in the background using the `/subagent [type] <task>` slash command. It uses the default subagent type (`worker`/`default`) from this extension by default, but you can also specify a **subagent type** to use specialized configurations. All agents use readable two-word callsigns (for example: `SilverHarbor`). An immediate `Spawning subagent ...` status message with runtime name and prompt will be shown immediately.
+The user can spawn a single subagent manually using the `/subagent [type] <task>` slash command. By default it runs as a background child process, but you can switch it to a visible cmux pane with `subagentLaunchMode`. It uses the default subagent type (`worker`/`default`) from this extension by default, but you can also specify a **subagent type** to use specialized configurations. All agents use readable two-word callsigns (for example: `SilverHarbor`). An immediate `Spawning subagent ...` status message with runtime name and prompt will be shown immediately.
+
+If you want spawned agents to appear in a visible cmux pane instead of only running as background child processes, set `subagentLaunchMode` to `"cmux-pane"` in your collaborating-agents config. That mode uses `cmux new-split` plus `cmux send`, then launches a real `pi` session directly in the new pane so you see Pi's own terminal output there while the orchestrator still collects the final subagent response automatically. This mode must be invoked from a Pi session that is already running inside a cmux terminal surface; otherwise subagent launch fails.
 
 ### Usage
 
@@ -169,13 +171,13 @@ Subagent type configurations are loaded in precedence order (later entries overr
 
 1. **Bundled defaults**: `examples/subagents/*.toml` (included with this extension)
 2. **Global overrides**:
-   - Preferred: `~/.pi/agents/*.toml`
    - Legacy (still supported): `~/.pi/agent/subagents/*.toml`
+   - Preferred: `~/.pi/agents/*.toml`
 3. **Project overrides** (nearest ancestor to current cwd):
-   - Preferred: `<cwd>/.pi/agents/*.toml`
    - Legacy (still supported): `<cwd>/.pi/subagents/*.toml`
+   - Preferred: `<cwd>/.pi/agents/*.toml`
 
-This means the extension uses bundled `examples/subagents` out of the box, while user/project configs take priority when present.
+This means the extension uses bundled `examples/subagents` out of the box, while user/project configs take priority when present, and the preferred `.pi/agents` paths override the legacy `subagents` paths.
 
 ### TOML format
 
@@ -265,7 +267,7 @@ The extension loads and merges configuration in this order:
 2. Global config: `~/.pi/agent/collaborating-agents.json`
 3. Project config: `<cwd>/.pi/collaborating-agents.json` (overrides global)
 
-Only positive numeric values are accepted. Invalid values fall back to defaults.
+Invalid config values fall back to defaults. Numeric fields such as `messageHistoryLimit` must be positive.
 
 ### Config keys
 
@@ -277,6 +279,25 @@ Default history depth used by the overlay feed/chat loader.
 - Smaller values keep UI snappier in very high-message sessions.
 
 This is a default baseline; runtime calls may still request larger limits.
+
+#### `subagentLaunchMode` (`"process" | "cmux-pane"`, default: `"process"`)
+
+Controls how spawned subagents are launched.
+
+- `"process"` keeps the current behavior: spawn a background `pi` child process directly.
+- `"cmux-pane"` launches the subagent in a new visible cmux split pane in the current workspace by calling `cmux new-split` and then sending a real `pi` launch command into that pane.
+
+Use `"cmux-pane"` when you want every spawned agent to have a real visible terminal in cmux while still preserving automatic result collection in the parent session. The pane shows Pi's native terminal session output instead of a custom JSON renderer.
+
+`"cmux-pane"` requires the orchestrator itself to be running inside cmux so the extension can split the current workspace.
+
+Example:
+
+```json
+{
+  "subagentLaunchMode": "cmux-pane"
+}
+```
 
 ### Environment variables
 

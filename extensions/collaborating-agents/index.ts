@@ -717,6 +717,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       `- **Runtime subagent name:** ${result.name}`,
       `- **Session ID:** ${result.sessionId ?? "(not reported)"}`,
       `- **Working directory:** ${result.workingDirectory}`,
+      `- **Launch mode:** ${result.launchMode}`,
+      `- **cmux target:** ${result.cmuxWorkspaceRef ? `${result.cmuxWorkspaceRef}${result.cmuxPaneRef ? ` / ${result.cmuxPaneRef}` : ""}${result.cmuxSurfaceRef ? ` / ${result.cmuxSurfaceRef}` : ""}` : "(not using cmux)"}`,
       `- **Model used:** ${result.resolvedModel ?? "(default model)"}`,
       `- **Tools enabled:** ${result.resolvedTools && result.resolvedTools.length > 0 ? result.resolvedTools.join(", ") : "(default tools)"}`,
       `- **Type system prompt:** ${result.launchSystemPromptSource ? `${result.launchSystemPromptSource} (${result.launchSystemPromptLength ?? 0} chars)` : "(none)"}`,
@@ -741,6 +743,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       `- Runtime subagent name: ${result.name}`,
       `- Session ID: ${result.sessionId ?? "(not reported)"}`,
       `- Working directory: ${result.workingDirectory}`,
+      `- Launch mode: ${result.launchMode}`,
+      `- cmux target: ${result.cmuxWorkspaceRef ? `${result.cmuxWorkspaceRef}${result.cmuxPaneRef ? ` / ${result.cmuxPaneRef}` : ""}${result.cmuxSurfaceRef ? ` / ${result.cmuxSurfaceRef}` : ""}` : "(not using cmux)"}`,
       `- Type system prompt: ${result.launchSystemPromptSource ? `${result.launchSystemPromptSource} (${result.launchSystemPromptLength ?? 0} chars)` : "(none)"}`,
       `- Launch delay: ${result.launchDelayMs ?? 0}ms`,
     ];
@@ -769,6 +773,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     details: Record<string, unknown>;
     isError?: boolean;
   }> {
+    config = loadConfig(ctx.cwd);
+
     const hasSingle = typeof params.task === "string" && params.task.trim().length > 0;
     const hasParallel = (params.tasks?.length ?? 0) > 0;
 
@@ -861,6 +867,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         enableSessionControl,
         recursionDepth: depthState.depth,
         parentAgentName: state.agentName,
+        launchMode: config.subagentLaunchMode,
         onLaunch: options?.onLaunch
           ? (launch) =>
               options.onLaunch?.({
@@ -928,6 +935,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         recursionDepth: depthState.depth,
         parentAgentName: state.agentName,
         launchDelayMs: launchStaggerMs * index,
+        launchMode: config.subagentLaunchMode,
         onLaunch: options?.onLaunch
           ? (launch) =>
               options.onLaunch?.({
@@ -1040,6 +1048,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           "",
           `Profile: ${profile}`,
           `Working directory: ${launch.workingDirectory}`,
+          `Launch mode: ${launch.launchMode}`,
+          `cmux target: ${launch.cmuxWorkspaceRef ? `${launch.cmuxWorkspaceRef}${launch.cmuxPaneRef ? ` / ${launch.cmuxPaneRef}` : ""}${launch.cmuxSurfaceRef ? ` / ${launch.cmuxSurfaceRef}` : ""}` : "(not using cmux)"}`,
           `Type system prompt: ${launch.launchSystemPromptSource ? `${launch.launchSystemPromptSource} (${launch.launchSystemPromptLength ?? 0} chars)` : "(none)"}`,
           "(Type system prompt content is redacted in launch updates.)",
         ].join("\n"),
@@ -1102,6 +1112,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         pid: 0,
         sessionId: result.sessionId ?? live?.sessionId ?? previous?.sessionId ?? `completed-${index}-${result.name}`,
         sessionFile:
+          result.sessionFile ??
           live?.sessionFile ??
           previous?.sessionFile ??
           findSessionFileBySessionId(result.sessionId),

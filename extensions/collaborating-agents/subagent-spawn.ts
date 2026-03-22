@@ -30,12 +30,17 @@ export interface SpawnResult {
   output: string;
   error?: string;
   sessionId?: string;
+  sessionFile?: string;
+  launchMode: "process" | "cmux-pane";
   workingDirectory: string;
   launchArgs: string[];
   launchCommand: string;
   launchPrompt: string;
   launchSystemPromptSource?: string;
   launchSystemPromptLength?: number;
+  cmuxWorkspaceRef?: string;
+  cmuxPaneRef?: string;
+  cmuxSurfaceRef?: string;
   launchEnv: {
     PI_AGENT_NAME: string;
     PI_COLLAB_SUBAGENT_DEPTH: string;
@@ -378,6 +383,297 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function createPiEventProcessor(result: SpawnResult): {
+  processLine: (line: string) => void;
+  finalize: (stderr: string) => void;
+} {
+  let lastAssistant = "";
+
+  const processLine = (line: string) => {
+    if (!line.trim()) return;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      return;
+    }
+
+    if (!event || typeof event !== "object") return;
+    const e = event as Record<string, unknown>;
+
+    if (e.type === "session" && typeof e.id === "string") {
+      result.sessionId = e.id;
+      return;
+    }
+
+    if (e.type === "message_end" && typeof e.message === "object" && e.message) {
+      const msg = e.message as Record<string, unknown>;
+      if (msg.role === "assistant") {
+        const text = extractAssistantText(msg.content);
+        if (text) lastAssistant = text;
+      }
+    }
+  };
+
+  const finalize = (stderr: string) => {
+    result.output = lastAssistant || stderr.trim() || "(no output)";
+  };
+
+  return { processLine, finalize };
+}
+
+async function waitForFile(pathToWatch: string): Promise<void> {
+  while (true) {
+    try {
+      await fs.promises.access(pathToWatch, fs.constants.F_OK);
+      return;
+    } catch {
+      await sleep(100);
+    }
+  }
+}
+
+async function waitForFileWithTimeout(pathToWatch: string, timeoutMs: number): Promise<boolean> {
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      await fs.promises.access(pathToWatch, fs.constants.F_OK);
+      return true;
+    } catch {
+      if (Date.now() - startedAt >= timeoutMs) return false;
+      await sleep(100);
+    }
+  }
+}
+
+function createSubagentSessionFilePath(childName: string, runId: string): string {
+  const sessionsDir = path.join(resolveHomeDir(), ".pi", "agent", "sessions", "collaborating-agents-subagents");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return path.join(sessionsDir, `${timestamp}_${runId}_${childName}.jsonl`);
+}
+
+function buildCmuxPaneCommand(args: {
+  piArgs: string[];
+  env: Record<string, string>;
+  cwd: string;
+}): string {
+  const envAssignments = Object.entries(args.env).map(([key, value]) => `${key}=${quoteShellArg(value)}`);
+  const envPrefix = envAssignments.length > 0 ? `env ${envAssignments.join(" ")} ` : "";
+  const piCommand = buildLaunchCommand(args.piArgs);
+  const cwd = quoteShellArg(args.cwd);
+
+  return `printf '\\033c'; cd ${cwd} || exit $?; exec ${envPrefix}${piCommand}`;
+}
+
+function parseSessionMessageLine(line: string): {
+  sessionId?: string;
+  terminalAssistantText?: string;
+} {
+  let event: unknown;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return {};
+  }
+
+  if (!event || typeof event !== "object") return {};
+  const parsed = event as Record<string, unknown>;
+
+  if (parsed.type === "session" && typeof parsed.id === "string") {
+    return { sessionId: parsed.id };
+  }
+
+  if (parsed.type !== "message" || !parsed.message || typeof parsed.message !== "object") {
+    return {};
+  }
+
+  const message = parsed.message as Record<string, unknown>;
+  if (message.role !== "assistant") return {};
+
+  const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
+  if (stopReason === "toolUse") return {};
+
+  return {
+    terminalAssistantText: extractAssistantText(message.content),
+  };
+}
+
+function readSpawnSessionState(sessionFile: string): {
+  sessionId?: string;
+  terminalAssistantText?: string;
+} {
+  if (!fs.existsSync(sessionFile)) return {};
+
+  let content = "";
+  try {
+    content = fs.readFileSync(sessionFile, "utf-8");
+  } catch {
+    return {};
+  }
+
+  let sessionId: string | undefined;
+  let terminalAssistantText: string | undefined;
+
+  for (const line of content.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const parsed = parseSessionMessageLine(line);
+    if (parsed.sessionId) sessionId = parsed.sessionId;
+    if (parsed.terminalAssistantText !== undefined) {
+      terminalAssistantText = parsed.terminalAssistantText;
+    }
+  }
+
+  return { sessionId, terminalAssistantText };
+}
+
+async function waitForSessionResult(
+  sessionFile: string,
+  timeoutMs: number,
+  onUpdate?: (state: { sessionId?: string }) => void,
+): Promise<{ sessionId?: string; terminalAssistantText?: string } | null> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const state = readSpawnSessionState(sessionFile);
+    if (state.sessionId) onUpdate?.({ sessionId: state.sessionId });
+    if (state.terminalAssistantText !== undefined) return state;
+    await sleep(100);
+  }
+
+  return null;
+}
+
+async function runCmuxCommand(args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return await new Promise((resolve) => {
+    const proc = spawn("cmux", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    proc.on("close", (code) => {
+      resolve({ exitCode: code ?? 0, stdout: stdout.trim(), stderr: stderr.trim() });
+    });
+
+    proc.on("error", (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      resolve({ exitCode: 1, stdout: "", stderr: message });
+    });
+  });
+}
+
+function parseCmuxIdentify(jsonText: string): { workspaceRef: string; paneRef: string; surfaceRef: string } | null {
+  try {
+    const parsed = JSON.parse(jsonText) as {
+      caller?: { workspace_ref?: unknown; pane_ref?: unknown; surface_ref?: unknown };
+    };
+    const workspaceRef = typeof parsed.caller?.workspace_ref === "string" ? parsed.caller.workspace_ref : undefined;
+    const paneRef = typeof parsed.caller?.pane_ref === "string" ? parsed.caller.pane_ref : undefined;
+    const surfaceRef = typeof parsed.caller?.surface_ref === "string" ? parsed.caller.surface_ref : undefined;
+    if (!workspaceRef || !paneRef || !surfaceRef) return null;
+    return { workspaceRef, paneRef, surfaceRef };
+  } catch {
+    return null;
+  }
+}
+
+function parseCmuxNewSplit(stdout: string): { workspaceRef: string; surfaceRef: string } | null {
+  const workspaceMatch = stdout.match(/\b(workspace:\d+)\b/);
+  const surfaceMatch = stdout.match(/\b(surface:\d+)\b/);
+  if (!workspaceMatch || !surfaceMatch) return null;
+  return {
+    workspaceRef: workspaceMatch[1],
+    surfaceRef: surfaceMatch[1],
+  };
+}
+
+async function launchCmuxPane(args: { scriptPath: string }): Promise<
+  | {
+      ok: true;
+      workspaceRef: string;
+      paneRef: string;
+      surfaceRef: string;
+    }
+  | {
+      ok: false;
+      error: string;
+    }
+> {
+  const identify = await runCmuxCommand(["identify", "--json"]);
+  if (identify.exitCode !== 0) {
+    return { ok: false, error: identify.stderr || identify.stdout || "Failed to identify current cmux surface" };
+  }
+
+  const callerContext = parseCmuxIdentify(identify.stdout);
+  if (!callerContext) {
+    return { ok: false, error: "cmux pane launch requires running inside a cmux terminal surface" };
+  }
+
+  const split = await runCmuxCommand([
+    "new-split",
+    "right",
+    "--workspace",
+    callerContext.workspaceRef,
+    "--surface",
+    callerContext.surfaceRef,
+  ]);
+  if (split.exitCode !== 0) {
+    return { ok: false, error: split.stderr || split.stdout || "Failed to create cmux pane" };
+  }
+
+  const created = parseCmuxNewSplit(split.stdout);
+  if (!created) {
+    return { ok: false, error: `Unexpected cmux new-split output: ${split.stdout || "(empty)"}` };
+  }
+
+  const paneIdentify = await runCmuxCommand([
+    "identify",
+    "--json",
+    "--workspace",
+    created.workspaceRef,
+    "--surface",
+    created.surfaceRef,
+  ]);
+  if (paneIdentify.exitCode !== 0) {
+    return { ok: false, error: paneIdentify.stderr || paneIdentify.stdout || "Failed to identify cmux pane" };
+  }
+
+  const paneContext = parseCmuxIdentify(paneIdentify.stdout);
+  if (!paneContext) {
+    return { ok: false, error: "Failed to resolve cmux pane refs after split" };
+  }
+
+  const send = await runCmuxCommand([
+    "send",
+    "--workspace",
+    paneContext.workspaceRef,
+    "--surface",
+    paneContext.surfaceRef,
+    `${args.scriptPath}\n`,
+  ]);
+  if (send.exitCode !== 0) {
+    return { ok: false, error: send.stderr || send.stdout || "Failed to send command to cmux pane" };
+  }
+
+  return {
+    ok: true,
+    workspaceRef: paneContext.workspaceRef,
+    paneRef: paneContext.paneRef,
+    surfaceRef: paneContext.surfaceRef,
+  };
+}
+
 export async function runSpawnTask(
   runtimeCwd: string,
   task: SpawnTask,
@@ -390,6 +686,7 @@ export async function runSpawnTask(
     recursionDepth: number;
     parentAgentName?: string;
     launchDelayMs?: number;
+    launchMode?: "process" | "cmux-pane";
     onLaunch?: (launch: SpawnResult) => void | Promise<void>;
   },
 ): Promise<SpawnResult> {
@@ -397,17 +694,17 @@ export async function runSpawnTask(
   const runToken = options.runId.slice(0, 4);
   const childName = sanitizeAgentName(`${task.agent}-${runToken}-${generatedCallsign}`);
 
-  const args: string[] = ["--mode", "json", "-p"];
-  if (options.enableSessionControl !== false) args.push("--session-control");
+  const commonArgs: string[] = [];
+  if (options.enableSessionControl !== false) commonArgs.push("--session-control");
 
   const model = agentDef.model;
-  if (model) args.push("--models", model);
+  if (model) commonArgs.push("--models", model);
 
   const requestedTools = agentDef.tools ?? [];
   const supportedTools = requestedTools.filter((tool) => SUPPORTED_SUBAGENT_TOOL_NAMES.has(tool));
 
   if (supportedTools.length > 0) {
-    args.push("--tools", supportedTools.join(","));
+    commonArgs.push("--tools", supportedTools.join(","));
   }
 
   // Ensure the collaborating-agents extension is always loaded in subagents so
@@ -419,7 +716,7 @@ export async function runSpawnTask(
   ];
   for (const extensionPath of extensionPaths) {
     if (fs.existsSync(extensionPath)) {
-      args.push("--extension", extensionPath);
+      commonArgs.push("--extension", extensionPath);
       break;
     }
   }
@@ -428,7 +725,7 @@ export async function runSpawnTask(
   if (typeSystemPrompt) {
     // Pass prompt text directly so type instructions are always attached,
     // regardless of file-path resolution behavior across pi versions.
-    args.push("--append-system-prompt", typeSystemPrompt);
+    commonArgs.push("--append-system-prompt", typeSystemPrompt);
   }
 
   const parentContextHeader = options.parentAgentName
@@ -438,8 +735,6 @@ export async function runSpawnTask(
   // Keep the task prompt payload user-controlled (type instructions come from TOML
   // via --append-system-prompt). Only add lightweight parent context metadata.
   const wrappedTaskPrompt = `${parentContextHeader}${task.task}`;
-  args.push(wrappedTaskPrompt);
-
   const env = {
     ...process.env,
     PI_AGENT_NAME: childName,
@@ -447,6 +742,14 @@ export async function runSpawnTask(
   };
 
   const cwd = task.cwd || options.defaultCwd || runtimeCwd;
+
+  const launchMode = options.launchMode ?? "process";
+  const sessionFile = launchMode === "cmux-pane" ? createSubagentSessionFilePath(childName, options.runId.slice(0, 8)) : undefined;
+
+  const args: string[] =
+    launchMode === "cmux-pane"
+      ? [...commonArgs, "--session", sessionFile!, wrappedTaskPrompt]
+      : ["--mode", "json", "-p", ...commonArgs, wrappedTaskPrompt];
 
   const launchArgs = [...args];
   if (typeSystemPrompt) {
@@ -464,6 +767,8 @@ export async function runSpawnTask(
     task: task.task,
     exitCode: 1,
     output: "",
+    sessionFile,
+    launchMode,
     workingDirectory: cwd,
     launchArgs,
     launchCommand: buildLaunchCommand(launchArgs),
@@ -484,12 +789,111 @@ export async function runSpawnTask(
     await sleep(launchDelayMs);
   }
 
+  if (result.launchMode === "cmux-pane") {
+    const cmuxLaunchEnv: Record<string, string> = {
+      PI_AGENT_NAME: result.launchEnv.PI_AGENT_NAME,
+      PI_COLLAB_SUBAGENT_DEPTH: result.launchEnv.PI_COLLAB_SUBAGENT_DEPTH,
+    };
+    if (typeof process.env.PATH === "string" && process.env.PATH.length > 0) {
+      cmuxLaunchEnv.PATH = process.env.PATH;
+    }
+    if (typeof process.env.HOME === "string" && process.env.HOME.length > 0) {
+      cmuxLaunchEnv.HOME = process.env.HOME;
+    }
+    if (typeof process.env.USERPROFILE === "string" && process.env.USERPROFILE.length > 0) {
+      cmuxLaunchEnv.USERPROFILE = process.env.USERPROFILE;
+    }
+    if (typeof process.env.COLLABORATING_AGENTS_DIR === "string" && process.env.COLLABORATING_AGENTS_DIR.length > 0) {
+      cmuxLaunchEnv.COLLABORATING_AGENTS_DIR = process.env.COLLABORATING_AGENTS_DIR;
+    }
+    if (typeof process.env.PI_COLLAB_SUBAGENT_MAX_DEPTH === "string" && process.env.PI_COLLAB_SUBAGENT_MAX_DEPTH.length > 0) {
+      cmuxLaunchEnv.PI_COLLAB_SUBAGENT_MAX_DEPTH = process.env.PI_COLLAB_SUBAGENT_MAX_DEPTH;
+    }
+
+    const cmuxCommand = buildCmuxPaneCommand({
+      piArgs: args,
+      env: cmuxLaunchEnv,
+      cwd,
+    });
+
+    const cmuxLaunch = await launchCmuxPane({ scriptPath: cmuxCommand });
+
+    if (!cmuxLaunch.ok) {
+      result.exitCode = 1;
+      result.error = cmuxLaunch.error;
+      result.output = result.error;
+      return result;
+    }
+
+    result.cmuxWorkspaceRef = cmuxLaunch.workspaceRef;
+    result.cmuxPaneRef = cmuxLaunch.paneRef;
+    result.cmuxSurfaceRef = cmuxLaunch.surfaceRef;
+
+    if (options.onLaunch) {
+      const launchSnapshot: SpawnResult = {
+        ...result,
+        launchArgs: [...result.launchArgs],
+        launchEnv: { ...result.launchEnv },
+        resolvedTools: result.resolvedTools ? [...result.resolvedTools] : undefined,
+      };
+      void Promise.resolve(options.onLaunch(launchSnapshot)).catch(() => {
+        // ignore launch callback errors
+      });
+    }
+
+    const didCreateSession = await waitForFileWithTimeout(result.sessionFile!, 10000);
+    if (!didCreateSession) {
+      result.exitCode = 1;
+      const paneScreen = await runCmuxCommand([
+        "read-screen",
+        "--workspace",
+        result.cmuxWorkspaceRef!,
+        "--surface",
+        result.cmuxSurfaceRef!,
+        "--scrollback",
+        "--lines",
+        "120",
+      ]);
+      result.error = paneScreen.stdout || "Timed out waiting for subagent session file in cmux pane";
+      result.output = result.error;
+      return result;
+    }
+
+    const sessionState = await waitForSessionResult(result.sessionFile!, 600_000, (state) => {
+      if (state.sessionId) result.sessionId = state.sessionId;
+    });
+
+    if (!sessionState) {
+      const paneScreen = await runCmuxCommand([
+        "read-screen",
+        "--workspace",
+        result.cmuxWorkspaceRef!,
+        "--surface",
+        result.cmuxSurfaceRef!,
+        "--scrollback",
+        "--lines",
+        "200",
+      ]);
+      result.exitCode = 1;
+      result.error = paneScreen.stdout || "Timed out waiting for subagent response in cmux pane";
+      result.output = result.error;
+      return result;
+    }
+
+    result.sessionId = sessionState.sessionId ?? result.sessionId;
+    result.output = sessionState.terminalAssistantText || "(no output)";
+    result.exitCode = 0;
+    return result;
+  }
+
   result.exitCode = await new Promise<number>((resolve) => {
       const proc = spawn("pi", args, {
         cwd,
         env,
         stdio: ["ignore", "pipe", "pipe"],
       });
+
+      const processor = createPiEventProcessor(result);
 
       if (options.onLaunch) {
         const launchSnapshot: SpawnResult = {
@@ -505,39 +909,12 @@ export async function runSpawnTask(
 
       let stdoutBuffer = "";
       let stderr = "";
-      let lastAssistant = "";
-
-      const processLine = (line: string) => {
-        if (!line.trim()) return;
-        let event: unknown;
-        try {
-          event = JSON.parse(line);
-        } catch {
-          return;
-        }
-
-        if (!event || typeof event !== "object") return;
-        const e = event as Record<string, unknown>;
-
-        if (e.type === "session" && typeof e.id === "string") {
-          result.sessionId = e.id;
-          return;
-        }
-
-        if (e.type === "message_end" && typeof e.message === "object" && e.message) {
-          const msg = e.message as Record<string, unknown>;
-          if (msg.role === "assistant") {
-            const text = extractAssistantText(msg.content);
-            if (text) lastAssistant = text;
-          }
-        }
-      };
 
       proc.stdout.on("data", (chunk) => {
         stdoutBuffer += chunk.toString();
         const lines = stdoutBuffer.split("\n");
         stdoutBuffer = lines.pop() || "";
-        for (const line of lines) processLine(line);
+        for (const line of lines) processor.processLine(line);
       });
 
       proc.stderr.on("data", (chunk) => {
@@ -545,8 +922,8 @@ export async function runSpawnTask(
       });
 
       proc.on("close", (code) => {
-        if (stdoutBuffer.trim()) processLine(stdoutBuffer);
-        result.output = lastAssistant || stderr.trim() || "(no output)";
+        if (stdoutBuffer.trim()) processor.processLine(stdoutBuffer);
+        processor.finalize(stderr);
         if ((code ?? 0) !== 0 && stderr.trim()) result.error = stderr.trim();
         resolve(code ?? 0);
       });

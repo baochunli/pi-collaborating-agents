@@ -83,8 +83,11 @@ export interface ExtensionState {
   activeSubagentRuns: number;
 }
 
+export type SubagentLaunchMode = "process" | "cmux-pane";
+
 export interface CollaboratingAgentsConfig {
   messageHistoryLimit: number;
+  subagentLaunchMode: SubagentLaunchMode;
 }
 
 export type AgentMessageAction =
