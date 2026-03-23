@@ -6,6 +6,7 @@ import type { CollaboratingAgentsConfig, SubagentLaunchMode } from "./types.js";
 const DEFAULT_CONFIG: CollaboratingAgentsConfig = {
   messageHistoryLimit: 400,
   subagentLaunchMode: "process",
+  closeCompletedCmuxPanes: true,
 };
 
 function isSubagentLaunchMode(value: unknown): value is SubagentLaunchMode {
@@ -53,5 +54,9 @@ export function loadConfig(cwd: string): CollaboratingAgentsConfig {
     subagentLaunchMode: isSubagentLaunchMode(merged.subagentLaunchMode)
       ? merged.subagentLaunchMode
       : DEFAULT_CONFIG.subagentLaunchMode,
+    closeCompletedCmuxPanes:
+      typeof merged.closeCompletedCmuxPanes === "boolean"
+        ? merged.closeCompletedCmuxPanes
+        : DEFAULT_CONFIG.closeCompletedCmuxPanes,
   };
 }

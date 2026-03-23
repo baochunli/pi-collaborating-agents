@@ -41,7 +41,7 @@ describe("config loading", () => {
     const cwd = makeTempDir("collab-config-cwd-default");
     const config = loadConfig(cwd);
 
-    expect(config).toEqual({ messageHistoryLimit: 400, subagentLaunchMode: "process" });
+    expect(config).toEqual({ messageHistoryLimit: 400, subagentLaunchMode: "process", closeCompletedCmuxPanes: true });
   });
 
   test("merges global and project configs with project taking precedence", () => {
@@ -57,12 +57,12 @@ describe("config loading", () => {
     fs.mkdirSync(path.dirname(projectConfigPath), { recursive: true });
     fs.writeFileSync(
       projectConfigPath,
-      JSON.stringify({ messageHistoryLimit: 75, subagentLaunchMode: "cmux-pane" }),
+      JSON.stringify({ messageHistoryLimit: 75, subagentLaunchMode: "cmux-pane", closeCompletedCmuxPanes: false }),
       "utf-8",
     );
 
     const config = loadConfig(cwd);
-    expect(config).toEqual({ messageHistoryLimit: 75, subagentLaunchMode: "cmux-pane" });
+    expect(config).toEqual({ messageHistoryLimit: 75, subagentLaunchMode: "cmux-pane", closeCompletedCmuxPanes: false });
   });
 
   test("falls back to default when config content is malformed or invalid", () => {
@@ -79,7 +79,7 @@ describe("config loading", () => {
     fs.writeFileSync(projectConfigPath, JSON.stringify({ messageHistoryLimit: 0 }), "utf-8");
 
     const config = loadConfig(cwd);
-    expect(config).toEqual({ messageHistoryLimit: 400, subagentLaunchMode: "process" });
+    expect(config).toEqual({ messageHistoryLimit: 400, subagentLaunchMode: "process", closeCompletedCmuxPanes: true });
   });
 
   test("falls back to process mode when subagent launch mode is invalid", () => {
@@ -92,6 +92,6 @@ describe("config loading", () => {
     fs.writeFileSync(projectConfigPath, JSON.stringify({ subagentLaunchMode: "cmux-window" }), "utf-8");
 
     const config = loadConfig(cwd);
-    expect(config).toEqual({ messageHistoryLimit: 400, subagentLaunchMode: "process" });
+    expect(config).toEqual({ messageHistoryLimit: 400, subagentLaunchMode: "process", closeCompletedCmuxPanes: true });
   });
 });

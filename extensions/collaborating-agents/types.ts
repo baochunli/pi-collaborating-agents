@@ -88,6 +88,7 @@ export type SubagentLaunchMode = "process" | "cmux-pane";
 export interface CollaboratingAgentsConfig {
   messageHistoryLimit: number;
   subagentLaunchMode: SubagentLaunchMode;
+  closeCompletedCmuxPanes: boolean;
 }
 
 export type AgentMessageAction =

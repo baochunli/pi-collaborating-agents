@@ -49,6 +49,8 @@ export interface SpawnResult {
   resolvedModel?: string;
   resolvedTools?: string[];
   coordinator?: string;
+  cmuxPaneClosed?: boolean;
+  cmuxCloseError?: string;
 }
 
 export const DEFAULT_SUBAGENT_TOOLS = ["read", "write", "edit", "bash", "agent_message"];
@@ -57,6 +59,8 @@ const SUPPORTED_SUBAGENT_TOOL_NAMES = new Set(["read", "bash", "edit", "write", 
 
 const LOCAL_COLLABORATING_AGENTS_EXTENSION = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.ts");
 const HOME_COLLABORATING_AGENTS_EXTENSION = path.join(os.homedir(), ".pi", "agent", "extensions", "collaborating-agents", "index.ts");
+const CMUX_PANE_IDLE_GRACE_MS = 1200;
+const CMUX_PANE_IDLE_MAX_WAIT_MS = 15000;
 
 export function createDefaultSpawnAgentDefinition(name = "subagent"): SpawnAgentDefinition {
   const defaultType = getDefaultSubagentType();
@@ -454,17 +458,87 @@ function createSubagentSessionFilePath(childName: string, runId: string): string
   return path.join(sessionsDir, `${timestamp}_${runId}_${childName}.jsonl`);
 }
 
+function createSubagentExitMarkerPath(sessionFile: string): string {
+  return `${sessionFile}.exit`;
+}
+
 function buildCmuxPaneCommand(args: {
   piArgs: string[];
   env: Record<string, string>;
   cwd: string;
+  exitMarkerPath: string;
 }): string {
   const envAssignments = Object.entries(args.env).map(([key, value]) => `${key}=${quoteShellArg(value)}`);
   const envPrefix = envAssignments.length > 0 ? `env ${envAssignments.join(" ")} ` : "";
   const piCommand = buildLaunchCommand(args.piArgs);
   const cwd = quoteShellArg(args.cwd);
+  const exitMarkerPath = quoteShellArg(args.exitMarkerPath);
 
-  return `printf '\\033c'; cd ${cwd} || exit $?; exec ${envPrefix}${piCommand}`;
+  return [
+    `printf '\\033c'`,
+    `cd ${cwd} || exit $?`,
+    `${envPrefix}${piCommand}`,
+    `status=$?`,
+    `mkdir -p $(dirname ${exitMarkerPath})`,
+    `printf '%s\\n' "$status" > ${exitMarkerPath}`,
+    `exit $status`,
+  ].join('; ');
+}
+
+function readExitMarkerCode(exitMarkerPath: string): number | null {
+  if (!fs.existsSync(exitMarkerPath)) return null;
+  try {
+    const code = Number(fs.readFileSync(exitMarkerPath, "utf-8").trim());
+    return Number.isFinite(code) ? code : null;
+  } catch {
+    return null;
+  }
+}
+
+function readFileMtimeMs(filePath: string): number | null {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForSessionIdleGrace(args: {
+  sessionFile: string;
+  exitMarkerPath: string;
+  idleGraceMs?: number;
+  maxWaitMs?: number;
+}): Promise<{ idleReached: boolean; exitCode: number | null; timedOut: boolean }> {
+  const idleGraceMs = Math.max(100, Math.floor(args.idleGraceMs ?? CMUX_PANE_IDLE_GRACE_MS));
+  const maxWaitMs = Math.max(idleGraceMs, Math.floor(args.maxWaitMs ?? CMUX_PANE_IDLE_MAX_WAIT_MS));
+  const startedAt = Date.now();
+  let lastObservedMtime = readFileMtimeMs(args.sessionFile) ?? 0;
+  let lastActivityAt = Date.now();
+
+  while (Date.now() - startedAt < maxWaitMs) {
+    const currentMtime = readFileMtimeMs(args.sessionFile);
+    if (currentMtime && currentMtime > lastObservedMtime + 0.5) {
+      lastObservedMtime = currentMtime;
+      lastActivityAt = Date.now();
+    }
+
+    const exitCode = readExitMarkerCode(args.exitMarkerPath);
+    if (exitCode !== null && exitCode !== 0) {
+      return { idleReached: false, exitCode, timedOut: false };
+    }
+
+    if (Date.now() - lastActivityAt >= idleGraceMs) {
+      return { idleReached: true, exitCode, timedOut: false };
+    }
+
+    await sleep(100);
+  }
+
+  return {
+    idleReached: false,
+    exitCode: readExitMarkerCode(args.exitMarkerPath),
+    timedOut: true,
+  };
 }
 
 function parseSessionMessageLine(line: string): {
@@ -674,6 +748,14 @@ async function launchCmuxPane(args: { scriptPath: string }): Promise<
   };
 }
 
+async function closeCmuxSurface(surfaceRef: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const close = await runCmuxCommand(["close-surface", "--surface", surfaceRef]);
+  if (close.exitCode !== 0) {
+    return { ok: false, error: close.stderr || close.stdout || "Failed to close cmux surface" };
+  }
+  return { ok: true };
+}
+
 export async function runSpawnTask(
   runtimeCwd: string,
   task: SpawnTask,
@@ -687,6 +769,7 @@ export async function runSpawnTask(
     parentAgentName?: string;
     launchDelayMs?: number;
     launchMode?: "process" | "cmux-pane";
+    closeCompletedCmuxPane?: boolean;
     onLaunch?: (launch: SpawnResult) => void | Promise<void>;
   },
 ): Promise<SpawnResult> {
@@ -745,6 +828,7 @@ export async function runSpawnTask(
 
   const launchMode = options.launchMode ?? "process";
   const sessionFile = launchMode === "cmux-pane" ? createSubagentSessionFilePath(childName, options.runId.slice(0, 8)) : undefined;
+  const exitMarkerPath = sessionFile ? createSubagentExitMarkerPath(sessionFile) : undefined;
 
   const args: string[] =
     launchMode === "cmux-pane"
@@ -814,6 +898,7 @@ export async function runSpawnTask(
       piArgs: args,
       env: cmuxLaunchEnv,
       cwd,
+      exitMarkerPath: exitMarkerPath!,
     });
 
     const cmuxLaunch = await launchCmuxPane({ scriptPath: cmuxCommand });
@@ -883,6 +968,36 @@ export async function runSpawnTask(
     result.sessionId = sessionState.sessionId ?? result.sessionId;
     result.output = sessionState.terminalAssistantText || "(no output)";
     result.exitCode = 0;
+
+    if (options.closeCompletedCmuxPane === false) {
+      return result;
+    }
+
+    const idleWait = await waitForSessionIdleGrace({
+      sessionFile: result.sessionFile!,
+      exitMarkerPath: exitMarkerPath!,
+    });
+    if (!idleWait.idleReached) {
+      if (idleWait.exitCode !== null && idleWait.exitCode !== 0) {
+        result.exitCode = idleWait.exitCode;
+        result.error = result.error ?? `cmux-pane subagent exited with code ${idleWait.exitCode}`;
+      } else if (idleWait.timedOut) {
+        result.cmuxCloseError = "Timed out waiting for cmux-pane subagent to reach idle grace after final output";
+      }
+      return result;
+    }
+
+    if (idleWait.exitCode !== null && idleWait.exitCode !== 0) {
+      result.exitCode = idleWait.exitCode;
+      result.error = result.error ?? `cmux-pane subagent exited with code ${idleWait.exitCode}`;
+      return result;
+    }
+
+    if (result.cmuxSurfaceRef) {
+      const closeResult = await closeCmuxSurface(result.cmuxSurfaceRef);
+      if (closeResult.ok) result.cmuxPaneClosed = true;
+      else result.cmuxCloseError = closeResult.error;
+    }
     return result;
   }
 

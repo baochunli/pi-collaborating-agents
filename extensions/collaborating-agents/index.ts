@@ -868,6 +868,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         recursionDepth: depthState.depth,
         parentAgentName: state.agentName,
         launchMode: config.subagentLaunchMode,
+        closeCompletedCmuxPane: config.closeCompletedCmuxPanes,
         onLaunch: options?.onLaunch
           ? (launch) =>
               options.onLaunch?.({
@@ -936,6 +937,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         parentAgentName: state.agentName,
         launchDelayMs: launchStaggerMs * index,
         launchMode: config.subagentLaunchMode,
+        closeCompletedCmuxPane: config.closeCompletedCmuxPanes,
         onLaunch: options?.onLaunch
           ? (launch) =>
               options.onLaunch?.({

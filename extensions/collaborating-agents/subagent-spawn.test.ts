@@ -14,6 +14,10 @@ const tempDirs: string[] = [];
 const ORIGINAL_PATH = process.env.PATH;
 const ORIGINAL_TEST_ARGS_FILE = process.env.TEST_ARGS_FILE;
 const ORIGINAL_TEST_CMUX_ARGS_FILE = process.env.TEST_CMUX_ARGS_FILE;
+const ORIGINAL_TEST_CMUX_SEND_ASYNC = process.env.TEST_CMUX_SEND_ASYNC;
+const ORIGINAL_TEST_PI_EXIT_DELAY_MS = process.env.TEST_PI_EXIT_DELAY_MS;
+const ORIGINAL_TEST_CMUX_CLOSE_FAIL = process.env.TEST_CMUX_CLOSE_FAIL;
+const ORIGINAL_TEST_PI_EXIT_CODE = process.env.TEST_PI_EXIT_CODE;
 const ORIGINAL_HOME = process.env.HOME;
 const ORIGINAL_USERPROFILE = process.env.USERPROFILE;
 
@@ -102,8 +106,18 @@ if (sessionPath) {
   ].join("\\n"), "utf-8");
 }
 
-process.stdout.write("fake-text-mode\\n");
-process.exit(0);
+const delayMs = Number(process.env.TEST_PI_EXIT_DELAY_MS || "0");
+const exitCode = Number(process.env.TEST_PI_EXIT_CODE || "0");
+const finish = () => {
+  process.stdout.write("fake-text-mode\\n");
+  process.exit(exitCode);
+};
+
+if (delayMs > 0) {
+  setTimeout(finish, delayMs);
+} else {
+  finish();
+}
 `;
 
   fs.writeFileSync(binPath, script, { encoding: "utf-8", mode: 0o755 });
@@ -165,6 +179,18 @@ if (args[0] === "new-split") {
 
 if (args[0] === "send") {
   const command = args[args.length - 1] || "";
+  if (process.env.TEST_CMUX_SEND_ASYNC === "1") {
+    const child = cp.spawn("/bin/bash", ["-lc", command], {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+    process.stdout.write("OK\\n");
+    process.exit(0);
+  }
+
   const result = cp.spawnSync("/bin/bash", ["-lc", command], {
     cwd: process.cwd(),
     env: process.env,
@@ -181,6 +207,10 @@ if (args[0] === "send") {
 }
 
 if (args[0] === "close-surface") {
+  if (process.env.TEST_CMUX_CLOSE_FAIL === "1") {
+    process.stderr.write("close failed\\n");
+    process.exit(1);
+  }
   process.stdout.write("OK\\n");
   process.exit(0);
 }
@@ -216,6 +246,30 @@ afterEach(() => {
     process.env.TEST_CMUX_ARGS_FILE = ORIGINAL_TEST_CMUX_ARGS_FILE;
   } else {
     delete process.env.TEST_CMUX_ARGS_FILE;
+  }
+
+  if (typeof ORIGINAL_TEST_CMUX_SEND_ASYNC === "string") {
+    process.env.TEST_CMUX_SEND_ASYNC = ORIGINAL_TEST_CMUX_SEND_ASYNC;
+  } else {
+    delete process.env.TEST_CMUX_SEND_ASYNC;
+  }
+
+  if (typeof ORIGINAL_TEST_PI_EXIT_DELAY_MS === "string") {
+    process.env.TEST_PI_EXIT_DELAY_MS = ORIGINAL_TEST_PI_EXIT_DELAY_MS;
+  } else {
+    delete process.env.TEST_PI_EXIT_DELAY_MS;
+  }
+
+  if (typeof ORIGINAL_TEST_CMUX_CLOSE_FAIL === "string") {
+    process.env.TEST_CMUX_CLOSE_FAIL = ORIGINAL_TEST_CMUX_CLOSE_FAIL;
+  } else {
+    delete process.env.TEST_CMUX_CLOSE_FAIL;
+  }
+
+  if (typeof ORIGINAL_TEST_PI_EXIT_CODE === "string") {
+    process.env.TEST_PI_EXIT_CODE = ORIGINAL_TEST_PI_EXIT_CODE;
+  } else {
+    delete process.env.TEST_PI_EXIT_CODE;
   }
 
   if (typeof ORIGINAL_HOME === "string") {
@@ -409,6 +463,8 @@ describe("subagent spawn", () => {
     expect(result.cmuxWorkspaceRef).toBe("workspace:77");
     expect(result.cmuxPaneRef).toBe("pane:99");
     expect(result.cmuxSurfaceRef).toBe("surface:99");
+    expect(result.cmuxPaneClosed).toBe(true);
+    expect(result.cmuxCloseError).toBeUndefined();
 
     const capturedCmuxArgs = fs
       .readFileSync(cmuxArgsFile, "utf-8")
@@ -416,7 +472,7 @@ describe("subagent spawn", () => {
       .split("\n")
       .filter(Boolean)
       .map((line) => JSON.parse(line) as string[]);
-    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send"]);
+    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send", "close-surface"]);
 
     const splitArgs = capturedCmuxArgs[1]!;
     expect(splitArgs[1]).toBe("right");
@@ -434,6 +490,207 @@ describe("subagent spawn", () => {
     const capturedPiArgs = JSON.parse(fs.readFileSync(argsFile, "utf-8")) as string[];
     expect(capturedPiArgs).toContain("--session");
     expect(capturedPiArgs[capturedPiArgs.length - 1]).toBe("Inspect the repository");
+
+    const closeArgs = capturedCmuxArgs[4]!;
+    expect(closeArgs).toEqual(["close-surface", "--surface", "surface:99"]);
+  });
+
+  test("can keep completed cmux panes open when auto-close is disabled", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-no-close");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+    process.env.TEST_CMUX_SEND_ASYNC = "1";
+    process.env.TEST_PI_EXIT_DELAY_MS = "5000";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const startedAt = Date.now();
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun5",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+        closeCompletedCmuxPane: false,
+      },
+    );
+
+    expect(Date.now() - startedAt).toBeLessThan(2400);
+    expect(result.exitCode).toBe(0);
+    expect(result.cmuxPaneClosed).toBeUndefined();
+    expect(result.cmuxCloseError).toBeUndefined();
+
+    const capturedCmuxArgs = fs
+      .readFileSync(cmuxArgsFile, "utf-8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send"]);
+  });
+
+  test("auto-closes after turn-finished output plus idle grace even if pane process stays open longer", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-idle-grace-close");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+    process.env.TEST_CMUX_SEND_ASYNC = "1";
+    process.env.TEST_PI_EXIT_DELAY_MS = "2500";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const startedAt = Date.now();
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun6",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+      },
+    );
+
+    const elapsed = Date.now() - startedAt;
+    expect(elapsed).toBeGreaterThanOrEqual(1000);
+    expect(elapsed).toBeLessThan(2400);
+    expect(result.exitCode).toBe(0);
+    expect(result.cmuxPaneClosed).toBe(true);
+
+    const capturedCmuxArgs = fs
+      .readFileSync(cmuxArgsFile, "utf-8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send", "close-surface"]);
+  });
+
+  test("keeps pane open when process exits non-zero during idle grace after emitting final output", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-nonzero-after-output");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+    process.env.TEST_CMUX_SEND_ASYNC = "1";
+    process.env.TEST_PI_EXIT_DELAY_MS = "150";
+    process.env.TEST_PI_EXIT_CODE = "7";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun7",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+      },
+    );
+
+    expect(result.exitCode).toBe(7);
+    expect(result.cmuxPaneClosed).toBeUndefined();
+    expect(result.error).toContain("exited with code 7");
+
+    const capturedCmuxArgs = fs
+      .readFileSync(cmuxArgsFile, "utf-8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send"]);
+  });
+
+  test("reports close failure without treating the successful cmux-pane subagent as failed", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-close-fails");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+    process.env.TEST_CMUX_CLOSE_FAIL = "1";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun8",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.cmuxPaneClosed).toBeUndefined();
+    expect(result.cmuxCloseError).toContain("close failed");
+
+    const capturedCmuxArgs = fs
+      .readFileSync(cmuxArgsFile, "utf-8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send", "close-surface"]);
   });
 });
 

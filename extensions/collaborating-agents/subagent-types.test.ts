@@ -131,11 +131,11 @@ describe("subagent type discovery", () => {
     expect(resolvedDefault.prompt).toBe("Bundled override prompt");
   });
 
-  test("user ~/.pi/agents override takes priority over bundled type", () => {
+  test("user ~/.pi/subagents override takes priority over bundled type", () => {
     const home = makeTempDir("collab-types-user-home");
     setHome(home);
 
-    writeTypeConfig(path.join(home, ".pi", "agents"), "worker.toml", {
+    writeTypeConfig(path.join(home, ".pi", "subagents"), "worker.toml", {
       name: "worker",
       description: "User worker override",
       prompt: "User worker prompt",
@@ -148,43 +148,14 @@ describe("subagent type discovery", () => {
     expect(worker).toBeDefined();
     expect(worker?.source).toBe("user");
     expect(worker?.description).toBe("User worker override");
-    expect(worker?.filePath).toContain(path.join(home, ".pi", "agents"));
-  });
-
-  test("project .pi/agents override takes priority over user override", () => {
-    const home = makeTempDir("collab-types-proj-home");
-    setHome(home);
-
-    writeTypeConfig(path.join(home, ".pi", "agents"), "worker.toml", {
-      name: "worker",
-      description: "User worker override",
-      prompt: "User worker prompt",
-    });
-
-    const projectRoot = makeTempDir("collab-types-proj-root");
-    writeTypeConfig(path.join(projectRoot, ".pi", "agents"), "worker.toml", {
-      name: "worker",
-      description: "Project worker override",
-      prompt: "Project worker prompt",
-    });
-
-    const nestedCwd = path.join(projectRoot, "src", "feature");
-    fs.mkdirSync(nestedCwd, { recursive: true });
-
-    const types = discoverSubagentTypes(nestedCwd);
-    const worker = types.find((t) => t.name.toLowerCase() === "worker");
-
-    expect(worker).toBeDefined();
-    expect(worker?.source).toBe("project");
-    expect(worker?.description).toBe("Project worker override");
-    expect(worker?.filePath).toContain(path.join(projectRoot, ".pi", "agents"));
+    expect(worker?.filePath).toContain(path.join(home, ".pi", "subagents"));
   });
 
   test("default override is used when no worker override is provided", () => {
     const home = makeTempDir("collab-types-default-home");
     setHome(home);
 
-    writeTypeConfig(path.join(home, ".pi", "agents"), "default.toml", {
+    writeTypeConfig(path.join(home, ".pi", "subagents"), "default.toml", {
       name: "default",
       description: "User default override",
       prompt: "Default override prompt",
@@ -199,8 +170,8 @@ describe("subagent type discovery", () => {
     expect(resolvedDefault.description).toBe("User default override");
   });
 
-  test("preferred ~/.pi/agents path overrides legacy ~/.pi/agent/subagents", () => {
-    const home = makeTempDir("collab-types-legacy-home");
+  test("preferred and legacy user/project override directories all participate in precedence", () => {
+    const home = makeTempDir("collab-types-precedence-home");
     setHome(home);
 
     writeTypeConfig(path.join(home, ".pi", "agent", "subagents"), "worker.toml", {
@@ -209,19 +180,52 @@ describe("subagent type discovery", () => {
       prompt: "Legacy worker prompt",
     });
 
-    writeTypeConfig(path.join(home, ".pi", "agents"), "worker.toml", {
+    writeTypeConfig(path.join(home, ".pi", "subagents"), "worker.toml", {
       name: "worker",
-      description: "Preferred worker override",
-      prompt: "Preferred worker prompt",
+      description: "Current user worker override",
+      prompt: "Current user worker prompt",
     });
 
-    const cwd = makeTempDir("collab-types-legacy-cwd");
+    writeTypeConfig(path.join(home, ".pi", "agents"), "worker.toml", {
+      name: "worker",
+      description: "Preferred user worker override",
+      prompt: "Preferred user worker prompt",
+    });
+
+    writeTypeConfig(path.join(home, ".pi", "subagents"), "reviewer.toml", {
+      name: "reviewer",
+      description: "User reviewer override",
+      prompt: "User reviewer prompt",
+    });
+
+    const cwd = makeTempDir("collab-types-precedence-cwd");
+    writeTypeConfig(path.join(cwd, ".pi", "subagents"), "worker.toml", {
+      name: "worker",
+      description: "Legacy project worker override",
+      prompt: "Legacy project worker prompt",
+    });
+
+    writeTypeConfig(path.join(cwd, ".pi", "agents"), "worker.toml", {
+      name: "worker",
+      description: "Project worker override",
+      prompt: "Project worker prompt",
+    });
+
     const types = discoverSubagentTypes(cwd);
     const worker = types.find((t) => t.name.toLowerCase() === "worker");
+    const reviewer = types.find((t) => t.name.toLowerCase() === "reviewer");
 
     expect(worker).toBeDefined();
-    expect(worker?.source).toBe("user");
-    expect(worker?.description).toBe("Preferred worker override");
-    expect(worker?.filePath).toContain(path.join(home, ".pi", "agents"));
+    expect(worker?.source).toBe("project");
+    expect(worker?.description).toBe("Project worker override");
+    expect(worker?.filePath).toContain(path.join(cwd, ".pi", "agents"));
+
+    expect(reviewer).toBeDefined();
+    expect(reviewer?.source).toBe("user");
+    expect(reviewer?.filePath).toContain(path.join(home, ".pi", "subagents"));
+
+    const resolvedDefault = getDefaultSubagentType(types);
+    expect(resolvedDefault.source).toBe("project");
+    expect(resolvedDefault.description).toBe("Project worker override");
   });
 });

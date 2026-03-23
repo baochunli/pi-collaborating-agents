@@ -171,14 +171,15 @@ You can define custom subagent types using TOML configuration files. These allow
 Subagent type configurations are loaded in precedence order (later entries override earlier ones when names match):
 
 1. **Bundled defaults**: `examples/subagents/*.toml` (included with this extension)
-2. **Global overrides**:
-   - Legacy (still supported): `~/.pi/agent/subagents/*.toml`
+2. **User overrides**:
+   - Legacy: `~/.pi/agent/subagents/*.toml`
+   - Also supported: `~/.pi/subagents/*.toml`
    - Preferred: `~/.pi/agents/*.toml`
-3. **Project overrides** (nearest ancestor to current cwd):
-   - Legacy (still supported): `<cwd>/.pi/subagents/*.toml`
-   - Preferred: `<cwd>/.pi/agents/*.toml`
+3. **Project overrides** (nearest ancestor from current cwd):
+   - Legacy: `.pi/subagents/*.toml`
+   - Preferred: `.pi/agents/*.toml`
 
-This means the extension uses bundled `examples/subagents` out of the box, while user/project configs take priority when present, and the preferred `.pi/agents` paths override the legacy `subagents` paths.
+If no override directory contains a matching type, the extension falls back to the included `examples/subagents` configuration files.
 
 ### TOML format
 
@@ -208,19 +209,13 @@ prompt = """You are a Scout subagent specialized in exploration...
 
 When no type is specified, the extension resolves the default in this order:
 
-1. any non-bundled `worker` override
-2. any non-bundled `default` override
+1. the highest-precedence non-bundled `worker.toml` override found in user/project directories
+2. otherwise the highest-precedence non-bundled `default.toml` override found in user/project directories
 3. bundled discovered `worker`
 4. bundled `examples/subagents/worker.toml`
 5. Emergency inline fallback (only if bundled files are unavailable)
 
-Within the non-bundled override steps above, precedence is:
-- nearest project `.pi/agents/*.toml`
-- nearest project `.pi/subagents/*.toml` (legacy)
-- user `~/.pi/agents/*.toml`
-- user `~/.pi/agent/subagents/*.toml` (legacy)
-
-To customize the default behavior, create `worker.toml` in `~/.pi/agents/` or your project’s `.pi/agents/` directory.
+To customize the default behavior, create `worker.toml` in one of the supported user or project override directories.
 
 ### Example subagent types
 
@@ -296,15 +291,27 @@ Controls how spawned subagents are launched.
 
 Use `"cmux-pane"` when you want every spawned agent to have a real visible terminal in cmux while still preserving automatic result collection in the parent session. The pane shows Pi's native terminal session output instead of a custom JSON renderer.
 
+By default, successfully completed `"cmux-pane"` subagents are auto-closed after the orchestrator has collected their final output and the pane has stayed idle for a short grace period. If the pane reports a non-zero post-output exit during that grace period, or if close/idle detection fails, the pane is left open so you can inspect diagnostics.
+
 `"cmux-pane"` requires the orchestrator itself to be running inside cmux so the extension can split the current workspace.
 
 Example:
 
 ```json
 {
-  "subagentLaunchMode": "cmux-pane"
+  "subagentLaunchMode": "cmux-pane",
+  "closeCompletedCmuxPanes": true
 }
 ```
+
+#### `closeCompletedCmuxPanes` (boolean, default: `true`)
+
+Controls whether successfully completed `"cmux-pane"` subagents automatically close their terminal surface after the parent orchestrator has collected the final output and the pane has remained idle for a short grace period.
+
+- `true` closes successful completed panes by calling `cmux close-surface --surface <ref>` after turn-finished output plus a short idle grace.
+- `false` keeps completed panes open for manual inspection.
+
+This setting only affects `"cmux-pane"` launch mode. Failures or non-zero exits detected during the idle grace leave panes open so logs remain visible.
 
 ### Environment variables
 

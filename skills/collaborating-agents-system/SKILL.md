@@ -84,20 +84,21 @@ Later sources override earlier ones when `name` matches:
 
 1. Bundled defaults: `examples/subagents/*.toml`
 2. User overrides:
-   - Preferred: `~/.pi/agents/*.toml`
    - Legacy: `~/.pi/agent/subagents/*.toml`
+   - Also supported: `~/.pi/subagents/*.toml`
+   - Preferred: `~/.pi/agents/*.toml`
 3. Project overrides (nearest ancestor from current cwd):
-   - Preferred: `.pi/agents/*.toml`
    - Legacy: `.pi/subagents/*.toml`
+   - Preferred: `.pi/agents/*.toml`
 
-So by default, bundled `examples/subagents` are used. Any matching config in `~/.pi/agents` or project `.pi/agents` takes priority.
+So by default, bundled `examples/subagents` are used. Any matching config in the user/project override directories takes priority.
 
 #### Default type resolution
 
 When no `type` is passed:
 
-1. use override `worker` from user/project config if present
-2. else use override `default` from user/project config if present
+1. use the highest-precedence non-bundled `worker.toml` override if present
+2. else use the highest-precedence non-bundled `default.toml` override if present
 3. else use bundled `worker` from `examples/subagents/*.toml`
 4. else fallback to bundled `examples/subagents/worker.toml`
 5. else use emergency inline worker prompt (rare)

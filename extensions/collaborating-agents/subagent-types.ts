@@ -164,22 +164,6 @@ function loadSubagentTypesFromDir(dir: string, source: SubagentTypeConfig["sourc
   return types;
 }
 
-function findNearestProjectSubagentDir(cwd: string, leafName: "agents" | "subagents"): string | null {
-  let current = cwd;
-  while (true) {
-    const candidate = path.join(current, ".pi", leafName);
-    try {
-      if (fs.statSync(candidate).isDirectory()) return candidate;
-    } catch {
-      // ignore
-    }
-
-    const parent = path.dirname(current);
-    if (parent === current) return null;
-    current = parent;
-  }
-}
-
 function appendUniquePath(paths: string[], candidate: string | null): void {
   if (!candidate) return;
   if (!paths.includes(candidate)) {
@@ -203,6 +187,18 @@ function isDirectory(dir: string | undefined): dir is string {
     return fs.statSync(dir).isDirectory();
   } catch {
     return false;
+  }
+}
+
+function findNearestProjectSubagentDir(cwd: string, relativeSegments: string[]): string | null {
+  let current = cwd;
+  while (true) {
+    const candidate = path.join(current, ...relativeSegments);
+    if (isDirectory(candidate)) return candidate;
+
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
   }
 }
 
@@ -274,20 +270,21 @@ function loadBundledWorkerType(): SubagentTypeConfig | null {
  *
  * Resolution precedence (later overrides earlier for matching type names):
  * 1. Bundled defaults in examples/subagents/*.toml
- * 2. User overrides in ~/.pi/agents/*.toml (preferred) and ~/.pi/agent/subagents/*.toml (legacy)
- * 3. Project overrides in nearest .pi/agents/*.toml (preferred) and .pi/subagents/*.toml (legacy)
+ * 2. User overrides in ~/.pi/agent/subagents/*.toml (legacy), ~/.pi/subagents/*.toml, then ~/.pi/agents/*.toml (preferred)
+ * 3. Project overrides in nearest .pi/subagents/*.toml (legacy) then .pi/agents/*.toml (preferred)
  */
 export function discoverSubagentTypes(cwd: string): SubagentTypeConfig[] {
   const bundledTypes = loadBundledSubagentTypes();
 
   const homeDir = resolveHomeDir();
   const userDirs: string[] = [];
-  appendUniquePath(userDirs, path.join(homeDir, ".pi", "agent", "subagents")); // legacy
-  appendUniquePath(userDirs, path.join(homeDir, ".pi", "agents")); // preferred
+  appendUniquePath(userDirs, path.join(homeDir, ".pi", "agent", "subagents"));
+  appendUniquePath(userDirs, path.join(homeDir, ".pi", "subagents"));
+  appendUniquePath(userDirs, path.join(homeDir, ".pi", "agents"));
 
   const projectDirs: string[] = [];
-  appendUniquePath(projectDirs, findNearestProjectSubagentDir(cwd, "subagents")); // legacy
-  appendUniquePath(projectDirs, findNearestProjectSubagentDir(cwd, "agents")); // preferred
+  appendUniquePath(projectDirs, findNearestProjectSubagentDir(cwd, [".pi", "subagents"]));
+  appendUniquePath(projectDirs, findNearestProjectSubagentDir(cwd, [".pi", "agents"]));
 
   const userTypes = userDirs.flatMap((dir) => loadSubagentTypesFromDir(dir, "user"));
   const projectTypes = projectDirs.flatMap((dir) => loadSubagentTypesFromDir(dir, "project"));
@@ -336,7 +333,7 @@ export function getDefaultSubagentType(availableTypes?: SubagentTypeConfig[]): S
   const workerType = resolvedAvailableTypes.find((t) => normalizeTypeKey(t.name) === "worker");
   const defaultType = resolvedAvailableTypes.find((t) => normalizeTypeKey(t.name) === "default");
 
-  // Prefer explicit user/project overrides over bundled defaults.
+  // Prefer explicit user overrides over bundled defaults.
   if (workerType && workerType.source !== "bundled") {
     return workerType;
   }

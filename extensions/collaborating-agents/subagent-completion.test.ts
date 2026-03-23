@@ -58,6 +58,22 @@ describe("subagent completion payload helpers", () => {
     expect(payload.details).toEqual({ mode: "subagent", result: single });
   });
 
+  test("buildSubagentCompletionMessagePayload uses idle-grace wording for auto-closed cmux panes", () => {
+    const single = makeSpawnResult({
+      name: "SwiftTiger-1a2b-ClearWave",
+      launchMode: "cmux-pane",
+      cmuxPaneClosed: true,
+    });
+
+    const payload = buildSubagentCompletionMessagePayload({
+      content: [{ type: "text", text: "fallback" }],
+      details: { mode: "subagent", result: single },
+      isError: false,
+    });
+
+    expect(payload.content).toContain("cmux pane auto-closed after turn-finished output plus idle grace");
+  });
+
   test("buildSubagentCompletionMessagePayload summarizes parallel failures", () => {
     const ok = makeSpawnResult({ name: "SwiftTiger-1a2b-ClearWave", output: "ok output", exitCode: 0 });
     const failed = makeSpawnResult({

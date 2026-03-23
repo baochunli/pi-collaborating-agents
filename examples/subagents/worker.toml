@@ -1,6 +1,8 @@
 # Default worker subagent - used when no specific type is requested
-# Place this file in your project's .pi/agents/ directory or in ~/.pi/agents/
-# (legacy paths .pi/subagents/ and ~/.pi/agent/subagents/ are also supported)
+# Override locations are checked in precedence order across user and project scopes,
+# including ~/.pi/agent/subagents/, ~/.pi/subagents/, ~/.pi/agents/,
+# and nearest-ancestor project .pi/subagents/ or .pi/agents/.
+# If no override exists in any supported location, the bundled examples/subagents/*.toml files are used.
 
 name = "worker"
 description = "General-purpose collaborating subagent for software development tasks"

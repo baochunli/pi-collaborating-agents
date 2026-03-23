@@ -56,7 +56,16 @@ export function buildSubagentCompletionMessagePayload(
       const displayName = formatAgentDisplayName(r.name);
       const status = r.exitCode === 0 ? "ok" : "failed";
       const output = (r.output || "(no output)").trim() || "(no output)";
-      return [`### ${index + 1}. ${displayName} (${status})`, "", output].join("\n");
+      const cmuxNote = r.launchMode === "cmux-pane"
+        ? r.cmuxPaneClosed
+          ? "cmux pane auto-closed after turn-finished output plus idle grace"
+          : r.cmuxCloseError
+            ? `cmux pane close note: ${r.cmuxCloseError}`
+            : undefined
+        : undefined;
+      return [`### ${index + 1}. ${displayName} (${status})`, cmuxNote ? `- ${cmuxNote}` : undefined, "", output]
+        .filter((line): line is string => Boolean(line))
+        .join("\n");
     });
 
     body = sections.join("\n\n");
@@ -67,7 +76,20 @@ export function buildSubagentCompletionMessagePayload(
       ? `Received an error from ${runtimeLabel}.`
       : `Received final results from ${runtimeLabel}.`;
 
-    body = (singleResult?.output || result.content[0]?.text || "(no output)").trim() || "(no output)";
+    const cmuxNote = singleResult?.launchMode === "cmux-pane"
+      ? singleResult.cmuxPaneClosed
+        ? "cmux pane auto-closed after turn-finished output plus idle grace"
+        : singleResult.cmuxCloseError
+          ? `cmux pane close note: ${singleResult.cmuxCloseError}`
+          : undefined
+      : undefined;
+
+    body = [
+      cmuxNote ? `- ${cmuxNote}` : undefined,
+      (singleResult?.output || result.content[0]?.text || "(no output)").trim() || "(no output)",
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join("\n\n");
   }
 
   return {
