@@ -707,8 +707,32 @@ function buildCmuxPaneCommand(args: {
     `status=$?`,
     `mkdir -p $(dirname ${exitMarkerPath})`,
     `printf '%s\\n' "$status" > ${exitMarkerPath}`,
+    `rm -f -- "$0"`,
     `exit $status`,
   ].join('; ');
+}
+
+function createCmuxPaneLaunchScript(args: {
+  piArgs: string[];
+  env: Record<string, string>;
+  cwd: string;
+  exitMarkerPath: string;
+  childName: string;
+  runId: string;
+}): { scriptPath: string; command: string } {
+  const scriptsDir = path.join(resolveHomeDir(), ".pi", "agent", "tmp", "collaborating-agents-subagents");
+  fs.mkdirSync(scriptsDir, { recursive: true });
+
+  const safeChildName = args.childName.replace(/[^a-zA-Z0-9._-]+/g, "-");
+  const scriptPath = path.join(scriptsDir, `${args.runId.slice(0, 8)}_${safeChildName}.sh`);
+  const scriptBody = buildCmuxPaneCommand(args);
+  const scriptContent = `#!/usr/bin/env bash\n${scriptBody}\n`;
+  fs.writeFileSync(scriptPath, scriptContent, { encoding: "utf-8", mode: 0o700 });
+
+  return {
+    scriptPath,
+    command: `bash ${quoteShellArg(scriptPath)}`,
+  };
 }
 
 function readExitMarkerCode(exitMarkerPath: string): number | null {
@@ -1393,16 +1417,23 @@ export async function runSpawnTask(
       cmuxLaunchEnv.PI_COLLAB_SUBAGENT_MAX_DEPTH = process.env.PI_COLLAB_SUBAGENT_MAX_DEPTH;
     }
 
-    const cmuxCommand = buildCmuxPaneCommand({
+    const cmuxLaunchScript = createCmuxPaneLaunchScript({
       piArgs: args,
       env: cmuxLaunchEnv,
       cwd,
       exitMarkerPath: exitMarkerPath!,
+      childName,
+      runId: options.runId,
     });
 
-    const cmuxLaunch = await launchCmuxPane({ scriptPath: cmuxCommand });
+    const cmuxLaunch = await launchCmuxPane({ scriptPath: cmuxLaunchScript.command });
 
     if (!cmuxLaunch.ok) {
+      try {
+        fs.unlinkSync(cmuxLaunchScript.scriptPath);
+      } catch {
+        // ignore best-effort cleanup failures
+      }
       result.exitCode = 1;
       result.error = cmuxLaunch.error;
       result.output = result.error;

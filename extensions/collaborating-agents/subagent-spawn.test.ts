@@ -16,6 +16,7 @@ const ORIGINAL_PATH = process.env.PATH;
 const ORIGINAL_TEST_ARGS_FILE = process.env.TEST_ARGS_FILE;
 const ORIGINAL_TEST_CMUX_ARGS_FILE = process.env.TEST_CMUX_ARGS_FILE;
 const ORIGINAL_TEST_CMUX_SEND_ASYNC = process.env.TEST_CMUX_SEND_ASYNC;
+const ORIGINAL_TEST_CMUX_SEND_TRUNCATE_AT = process.env.TEST_CMUX_SEND_TRUNCATE_AT;
 const ORIGINAL_TEST_PI_EXIT_DELAY_MS = process.env.TEST_PI_EXIT_DELAY_MS;
 const ORIGINAL_TEST_CMUX_CLOSE_FAIL = process.env.TEST_CMUX_CLOSE_FAIL;
 const ORIGINAL_TEST_PI_EXIT_CODE = process.env.TEST_PI_EXIT_CODE;
@@ -313,7 +314,11 @@ if (args[0] === "reorder-surface") {
 }
 
 if (args[0] === "send") {
-  const command = args[args.length - 1] || "";
+  let command = args[args.length - 1] || "";
+  const truncateAt = Number(process.env.TEST_CMUX_SEND_TRUNCATE_AT || "0");
+  if (Number.isFinite(truncateAt) && truncateAt > 0 && command.length > truncateAt) {
+    command = command.slice(0, truncateAt);
+  }
   if (process.env.TEST_CMUX_SEND_ASYNC === "1") {
     const child = cp.spawn("/bin/bash", ["-lc", command], {
       cwd: process.cwd(),
@@ -434,6 +439,12 @@ afterEach(() => {
     process.env.TEST_CMUX_SEND_ASYNC = ORIGINAL_TEST_CMUX_SEND_ASYNC;
   } else {
     delete process.env.TEST_CMUX_SEND_ASYNC;
+  }
+
+  if (typeof ORIGINAL_TEST_CMUX_SEND_TRUNCATE_AT === "string") {
+    process.env.TEST_CMUX_SEND_TRUNCATE_AT = ORIGINAL_TEST_CMUX_SEND_TRUNCATE_AT;
+  } else {
+    delete process.env.TEST_CMUX_SEND_TRUNCATE_AT;
   }
 
   if (typeof ORIGINAL_TEST_PI_EXIT_DELAY_MS === "string") {
@@ -674,7 +685,7 @@ describe("subagent spawn", () => {
     expect(sendArgs).toContain("workspace:77");
     expect(sendArgs).toContain("--surface");
     expect(sendArgs).toContain("surface:99");
-    expect(sendArgs[sendArgs.length - 1]).toContain("pi --session");
+    expect(sendArgs[sendArgs.length - 1]).toContain("bash ");
     expect(sendArgs[sendArgs.length - 1]).not.toContain("--mode json -p");
 
     const capturedPiArgs = JSON.parse(fs.readFileSync(argsFile, "utf-8")) as string[];
@@ -740,6 +751,61 @@ describe("subagent spawn", () => {
       "list-pane-surfaces",
       "identify",
     ]);
+  });
+
+  test("uses a short script-backed cmux send command so long prompts survive send truncation", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-script-send");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+    process.env.TEST_CMUX_SEND_TRUNCATE_AT = "120";
+
+    const longTask = [
+      "Read this filler but ultimately reply with exactly: script-ok",
+      "",
+      "FILLER START",
+      ...new Array(40).fill("Repeat: 1234567890 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ."),
+      "FILLER END",
+    ].join("\n");
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "reviewer",
+      description: "Reviewer",
+      systemPrompt: "Return concise findings and finish with the requested exact text.",
+      source: "bundled",
+      filePath: "/tmp/reviewer.toml",
+      tools: ["read", "bash"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "reviewer",
+        task: longTask,
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-script-send",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+    const sendArgs = capturedCmuxArgs.find((entry) => getCmuxCommandName(entry) === "send");
+    expect(sendArgs).toBeDefined();
+    expect((sendArgs![sendArgs!.length - 1] ?? "").length).toBeLessThan(120);
+
+    const capturedPiArgs = JSON.parse(fs.readFileSync(argsFile, "utf-8")) as string[];
+    expect(capturedPiArgs).toContain("--session");
+    expect(capturedPiArgs[capturedPiArgs.length - 1]).toBe(longTask);
   });
 
   test("rebalances sequential cmux-pane spawns instead of always splitting the orchestrator pane", async () => {
