@@ -6,6 +6,7 @@ import type { SpawnAgentDefinition } from "./subagent-spawn.ts";
 import {
   discoverSpawnAgents,
   mapWithConcurrencyLimit,
+  resetCmuxLayoutStateForTests,
   resolveSpawnAgentDefinition,
   runSpawnTask,
 } from "./subagent-spawn.ts";
@@ -153,15 +154,61 @@ const fs = require("node:fs");
 const cp = require("node:child_process");
 
 const argsFile = process.env.TEST_CMUX_ARGS_FILE;
+const stateFile = argsFile ? argsFile + ".state.json" : null;
 if (argsFile) {
   fs.appendFileSync(argsFile, JSON.stringify(process.argv.slice(2)) + "\\n", "utf-8");
 }
 
-const args = process.argv.slice(2);
+function readState() {
+  if (!stateFile || !fs.existsSync(stateFile)) {
+    return {
+      nextRef: 99,
+      panes: {
+        "pane:2": ["surface:2"],
+      },
+      surfaceToPane: { "surface:2": "pane:2" },
+    };
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(stateFile, "utf-8"));
+  } catch {
+    return {
+      nextRef: 99,
+      panes: {
+        "pane:2": ["surface:2"],
+      },
+      surfaceToPane: { "surface:2": "pane:2" },
+    };
+  }
+}
+
+function writeState(state) {
+  if (!stateFile) return;
+  fs.writeFileSync(stateFile, JSON.stringify(state), "utf-8");
+}
+
+function removeSurfaceFromPane(state, paneRef, surfaceRef) {
+  const pane = state.panes[paneRef];
+  if (!Array.isArray(pane)) return;
+  state.panes[paneRef] = pane.filter((value) => value !== surfaceRef);
+  if (state.panes[paneRef].length === 0) delete state.panes[paneRef];
+}
+
+function addSurfaceToPane(state, paneRef, surfaceRef) {
+  const pane = Array.isArray(state.panes[paneRef]) ? state.panes[paneRef] : [];
+  state.panes[paneRef] = pane.filter((value) => value !== surfaceRef);
+  state.panes[paneRef].push(surfaceRef);
+  state.surfaceToPane[surfaceRef] = paneRef;
+}
+
+const rawArgs = process.argv.slice(2);
+const args = rawArgs[0] === "--json" ? rawArgs.slice(1) : rawArgs;
 if (args[0] === "identify") {
+  const state = readState();
   const surfaceIndex = args.indexOf("--surface");
   const targetSurface = surfaceIndex >= 0 ? args[surfaceIndex + 1] : "surface:2";
-  const paneRef = targetSurface === "surface:99" ? "pane:99" : "pane:2";
+  const paneRef = state.surfaceToPane[targetSurface] || "pane:2";
   process.stdout.write(JSON.stringify({
     caller: {
       workspace_ref: "workspace:77",
@@ -173,7 +220,95 @@ if (args[0] === "identify") {
 }
 
 if (args[0] === "new-split") {
-  process.stdout.write("OK surface:99 workspace:77\\n");
+  const state = readState();
+  const paneIndex = args.indexOf("--panel");
+  const paneRef = paneIndex >= 0 ? args[paneIndex + 1] : null;
+  const surfaceIndex = args.indexOf("--surface");
+  const surfaceRefFromArgs = surfaceIndex >= 0 ? args[surfaceIndex + 1] : null;
+  if (paneRef && !state.panes[paneRef]) {
+    process.stderr.write("unknown pane\\n");
+    process.exit(1);
+  }
+  if (surfaceRefFromArgs && !state.surfaceToPane[surfaceRefFromArgs]) {
+    process.stderr.write("unknown surface\\n");
+    process.exit(1);
+  }
+  const ref = state.nextRef || 99;
+  const paneRefOut = "pane:" + ref;
+  const surfaceRef = "surface:" + ref;
+  state.nextRef = ref + 1;
+  state.panes[paneRefOut] = [surfaceRef];
+  state.surfaceToPane[surfaceRef] = paneRefOut;
+  writeState(state);
+  process.stdout.write("OK " + surfaceRef + " workspace:77\\n");
+  process.exit(0);
+}
+
+if (args[0] === "list-panes") {
+  const state = readState();
+  const paneRefs = Object.keys(state.panes).sort((a, b) => Number(a.split(":")[1]) - Number(b.split(":")[1]));
+  process.stdout.write(JSON.stringify({ panes: paneRefs.map((paneRef) => ({ pane_ref: paneRef })) }));
+  process.exit(0);
+}
+
+if (args[0] === "list-pane-surfaces") {
+  const state = readState();
+  const paneIndex = args.indexOf("--pane");
+  const paneRef = paneIndex >= 0 ? args[paneIndex + 1] : "pane:2";
+  const surfaceRefs = Array.isArray(state.panes[paneRef]) ? state.panes[paneRef] : [];
+  process.stdout.write(JSON.stringify({ surfaces: surfaceRefs.map((surfaceRef) => ({ surface_ref: surfaceRef })) }));
+  process.exit(0);
+}
+
+if (args[0] === "move-surface") {
+  const state = readState();
+  const surfaceIndex = args.indexOf("--surface");
+  const targetSurface = surfaceIndex >= 0 ? args[surfaceIndex + 1] : null;
+  const paneIndex = args.indexOf("--pane");
+  const targetPane = paneIndex >= 0 ? args[paneIndex + 1] : null;
+
+  if (!targetSurface || !targetPane) {
+    process.stderr.write("missing move target\\n");
+    process.exit(1);
+  }
+
+  const currentPane = state.surfaceToPane[targetSurface];
+  if (currentPane) removeSurfaceFromPane(state, currentPane, targetSurface);
+  addSurfaceToPane(state, targetPane, targetSurface);
+  writeState(state);
+  process.stdout.write("OK\\n");
+  process.exit(0);
+}
+
+if (args[0] === "reorder-surface") {
+  const state = readState();
+  const surfaceIndex = args.indexOf("--surface");
+  const targetSurface = surfaceIndex >= 0 ? args[surfaceIndex + 1] : null;
+  const beforeIndex = args.indexOf("--before");
+  const beforeSurface = beforeIndex >= 0 ? args[beforeIndex + 1] : null;
+
+  if (!targetSurface || !beforeSurface) {
+    process.stderr.write("missing reorder target\\n");
+    process.exit(1);
+  }
+
+  const paneRef = state.surfaceToPane[targetSurface];
+  const beforePaneRef = state.surfaceToPane[beforeSurface];
+  if (!paneRef || !beforePaneRef || paneRef !== beforePaneRef) {
+    process.stderr.write("surfaces not colocated\\n");
+    process.exit(1);
+  }
+
+  const pane = Array.isArray(state.panes[paneRef]) ? state.panes[paneRef].filter((value) => value !== targetSurface) : [];
+  const beforePos = pane.indexOf(beforeSurface);
+  if (beforePos < 0) {
+    pane.push(targetSurface);
+  } else {
+    pane.splice(beforePos, 0, targetSurface);
+  }
+  state.panes[paneRef] = pane;
+  writeState(state);
+  process.stdout.write("OK\\n");
   process.exit(0);
 }
 
@@ -207,10 +342,19 @@ if (args[0] === "send") {
 }
 
 if (args[0] === "close-surface") {
+  const state = readState();
+  const surfaceIndex = args.indexOf("--surface");
+  const targetSurface = surfaceIndex >= 0 ? args[surfaceIndex + 1] : null;
   if (process.env.TEST_CMUX_CLOSE_FAIL === "1") {
     process.stderr.write("close failed\\n");
     process.exit(1);
   }
+  if (targetSurface) {
+    const paneRef = state.surfaceToPane[targetSurface];
+    if (paneRef) removeSurfaceFromPane(state, paneRef, targetSurface);
+    delete state.surfaceToPane[targetSurface];
+  }
+  writeState(state);
   process.stdout.write("OK\\n");
   process.exit(0);
 }
@@ -223,7 +367,45 @@ process.exit(2);
   return { binPath, argsFile };
 }
 
+function readFakeCmuxState(argsFile: string): {
+  nextRef: number;
+  panes: Record<string, string[]>;
+  surfaceToPane: Record<string, string>;
+} {
+  return JSON.parse(fs.readFileSync(`${argsFile}.state.json`, "utf-8"));
+}
+
+function writeFakeCmuxState(
+  argsFile: string,
+  state: {
+    nextRef: number;
+    panes: Record<string, string[]>;
+    surfaceToPane: Record<string, string>;
+  },
+): void {
+  fs.writeFileSync(`${argsFile}.state.json`, JSON.stringify(state), "utf-8");
+}
+
+function getCapturedCmuxArgs(argsFile: string): string[][] {
+  return fs
+    .readFileSync(argsFile, "utf-8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as string[]);
+}
+
+function getCmuxCommandName(entry: string[]): string {
+  return entry[0] === "--json" ? entry[1] ?? "--json" : entry[0] ?? "";
+}
+
+function getCmuxCommandNames(entries: string[][]): string[] {
+  return entries.map(getCmuxCommandName);
+}
+
 afterEach(() => {
+  resetCmuxLayoutStateForTests();
+
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
     if (!dir) continue;
@@ -466,20 +648,28 @@ describe("subagent spawn", () => {
     expect(result.cmuxPaneClosed).toBe(true);
     expect(result.cmuxCloseError).toBeUndefined();
 
-    const capturedCmuxArgs = fs
-      .readFileSync(cmuxArgsFile, "utf-8")
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as string[]);
-    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send", "close-surface"]);
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+    expect(getCmuxCommandNames(capturedCmuxArgs)).toEqual([
+      "identify",
+      "list-panes",
+      "list-pane-surfaces",
+      "new-split",
+      "identify",
+      "send",
+      "list-panes",
+      "list-pane-surfaces",
+      "list-pane-surfaces",
+      "identify",
+      "close-surface",
+    ]);
 
-    const splitArgs = capturedCmuxArgs[1]!;
+    const splitArgs = capturedCmuxArgs[3]!;
     expect(splitArgs[1]).toBe("right");
     expect(splitArgs).toContain("--workspace");
-    expect(splitArgs).toContain("--surface");
+    expect(splitArgs).toContain("--panel");
+    expect(splitArgs).toContain("pane:2");
 
-    const sendArgs = capturedCmuxArgs[3]!;
+    const sendArgs = capturedCmuxArgs[5]!;
     expect(sendArgs).toContain("--workspace");
     expect(sendArgs).toContain("workspace:77");
     expect(sendArgs).toContain("--surface");
@@ -491,7 +681,7 @@ describe("subagent spawn", () => {
     expect(capturedPiArgs).toContain("--session");
     expect(capturedPiArgs[capturedPiArgs.length - 1]).toBe("Inspect the repository");
 
-    const closeArgs = capturedCmuxArgs[4]!;
+    const closeArgs = capturedCmuxArgs[10]!;
     expect(closeArgs).toEqual(["close-surface", "--surface", "surface:99"]);
   });
 
@@ -537,13 +727,257 @@ describe("subagent spawn", () => {
     expect(result.cmuxPaneClosed).toBeUndefined();
     expect(result.cmuxCloseError).toBeUndefined();
 
-    const capturedCmuxArgs = fs
-      .readFileSync(cmuxArgsFile, "utf-8")
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as string[]);
-    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send"]);
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+    expect(getCmuxCommandNames(capturedCmuxArgs)).toEqual([
+      "identify",
+      "list-panes",
+      "list-pane-surfaces",
+      "new-split",
+      "identify",
+      "send",
+      "list-panes",
+      "list-pane-surfaces",
+      "list-pane-surfaces",
+      "identify",
+    ]);
+  });
+
+  test("rebalances sequential cmux-pane spawns instead of always splitting the orchestrator pane", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-layout");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    for (let index = 0; index < 3; index += 1) {
+      const result = await runSpawnTask(
+        tempDir,
+        {
+          agent: "worker",
+          task: `Inspect repository ${index}`,
+        },
+        agentDef,
+        {
+          index,
+          runId: `testrun-layout-${index}`,
+          recursionDepth: 0,
+          launchMode: "cmux-pane",
+          closeCompletedCmuxPane: false,
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+    }
+
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+
+    const splitTargets = capturedCmuxArgs
+      .filter((entry) => entry[0] === "new-split")
+      .map((entry) => entry[entry.indexOf("--panel") + 1]);
+
+    expect(splitTargets).toEqual(["pane:2", "pane:99", "pane:2"]);
+  });
+
+  test("removes auto-closed cmux panes from the layout planner before the next spawn", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-layout-close");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    for (let index = 0; index < 2; index += 1) {
+      const result = await runSpawnTask(
+        tempDir,
+        {
+          agent: "worker",
+          task: `Inspect repository ${index}`,
+        },
+        agentDef,
+        {
+          index,
+          runId: `testrun-layout-close-${index}`,
+          recursionDepth: 0,
+          launchMode: "cmux-pane",
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.cmuxPaneClosed).toBe(true);
+    }
+
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+
+    const splitTargets = capturedCmuxArgs
+      .filter((entry) => entry[0] === "new-split")
+      .map((entry) => entry[entry.indexOf("--panel") + 1]);
+
+    expect(splitTargets).toEqual(["pane:2", "pane:2"]);
+  });
+
+  test("true rebalance moves swapped managed surfaces back into their planned panes", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-true-rebalance");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const first = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect repository 0",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-true-rebalance-0",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+        closeCompletedCmuxPane: false,
+      },
+    );
+    expect(first.exitCode).toBe(0);
+
+    const state = readFakeCmuxState(cmuxArgsFile);
+    state.panes = {
+      "pane:2": ["surface:99"],
+      "pane:99": ["surface:2"],
+    };
+    state.surfaceToPane = {
+      "surface:2": "pane:99",
+      "surface:99": "pane:2",
+    };
+    writeFakeCmuxState(cmuxArgsFile, state);
+
+    const second = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect repository 1",
+      },
+      agentDef,
+      {
+        index: 1,
+        runId: "testrun-true-rebalance-1",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+        closeCompletedCmuxPane: false,
+      },
+    );
+    expect(second.exitCode).toBe(0);
+
+    const finalState = readFakeCmuxState(cmuxArgsFile);
+    expect(finalState.surfaceToPane["surface:2"]).toBe("pane:2");
+    expect(finalState.surfaceToPane["surface:99"]).toBe("pane:99");
+
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+    const commandNames = getCmuxCommandNames(capturedCmuxArgs);
+    expect(commandNames).toContain("move-surface");
+    expect(commandNames).toContain("reorder-surface");
+
+    const moveCommands = capturedCmuxArgs.filter((entry) => getCmuxCommandName(entry) === "move-surface");
+    expect(moveCommands).toEqual([
+      ["move-surface", "--workspace", "workspace:77", "--surface", "surface:2", "--pane", "pane:2"],
+      ["move-surface", "--workspace", "workspace:77", "--surface", "surface:99", "--pane", "pane:99"],
+    ]);
+  });
+
+  test("snapshot sync drops manually closed panes before choosing the next split target", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-snapshot-sync");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const first = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect repository 0",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-snapshot-sync-0",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+        closeCompletedCmuxPane: false,
+      },
+    );
+    expect(first.exitCode).toBe(0);
+
+    const state = readFakeCmuxState(cmuxArgsFile);
+    delete state.panes["pane:99"];
+    delete state.surfaceToPane["surface:99"];
+    writeFakeCmuxState(cmuxArgsFile, state);
+
+    const second = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect repository 1",
+      },
+      agentDef,
+      {
+        index: 1,
+        runId: "testrun-snapshot-sync-1",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+        closeCompletedCmuxPane: false,
+      },
+    );
+    expect(second.exitCode).toBe(0);
+
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+    const splitTargets = capturedCmuxArgs
+      .filter((entry) => getCmuxCommandName(entry) === "new-split")
+      .map((entry) => entry[entry.indexOf("--panel") + 1]);
+
+    expect(splitTargets).toEqual(["pane:2", "pane:2"]);
   });
 
   test("auto-closes after turn-finished output plus idle grace even if pane process stays open longer", async () => {
@@ -588,13 +1022,20 @@ describe("subagent spawn", () => {
     expect(result.exitCode).toBe(0);
     expect(result.cmuxPaneClosed).toBe(true);
 
-    const capturedCmuxArgs = fs
-      .readFileSync(cmuxArgsFile, "utf-8")
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as string[]);
-    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send", "close-surface"]);
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+    expect(getCmuxCommandNames(capturedCmuxArgs)).toEqual([
+      "identify",
+      "list-panes",
+      "list-pane-surfaces",
+      "new-split",
+      "identify",
+      "send",
+      "list-panes",
+      "list-pane-surfaces",
+      "list-pane-surfaces",
+      "identify",
+      "close-surface",
+    ]);
   });
 
   test("keeps pane open when process exits non-zero during idle grace after emitting final output", async () => {
@@ -637,13 +1078,19 @@ describe("subagent spawn", () => {
     expect(result.cmuxPaneClosed).toBeUndefined();
     expect(result.error).toContain("exited with code 7");
 
-    const capturedCmuxArgs = fs
-      .readFileSync(cmuxArgsFile, "utf-8")
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as string[]);
-    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send"]);
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+    expect(getCmuxCommandNames(capturedCmuxArgs)).toEqual([
+      "identify",
+      "list-panes",
+      "list-pane-surfaces",
+      "new-split",
+      "identify",
+      "send",
+      "list-panes",
+      "list-pane-surfaces",
+      "list-pane-surfaces",
+      "identify",
+    ]);
   });
 
   test("reports close failure without treating the successful cmux-pane subagent as failed", async () => {
@@ -684,13 +1131,20 @@ describe("subagent spawn", () => {
     expect(result.cmuxPaneClosed).toBeUndefined();
     expect(result.cmuxCloseError).toContain("close failed");
 
-    const capturedCmuxArgs = fs
-      .readFileSync(cmuxArgsFile, "utf-8")
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as string[]);
-    expect(capturedCmuxArgs.map((entry) => entry[0])).toEqual(["identify", "new-split", "identify", "send", "close-surface"]);
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+    expect(getCmuxCommandNames(capturedCmuxArgs)).toEqual([
+      "identify",
+      "list-panes",
+      "list-pane-surfaces",
+      "new-split",
+      "identify",
+      "send",
+      "list-panes",
+      "list-pane-surfaces",
+      "list-pane-surfaces",
+      "identify",
+      "close-surface",
+    ]);
   });
 });
 

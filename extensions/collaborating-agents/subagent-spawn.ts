@@ -62,6 +62,232 @@ const HOME_COLLABORATING_AGENTS_EXTENSION = path.join(os.homedir(), ".pi", "agen
 const CMUX_PANE_IDLE_GRACE_MS = 1200;
 const CMUX_PANE_IDLE_MAX_WAIT_MS = 15000;
 
+type CmuxLayoutRole = "orchestrator" | "subagent";
+
+interface CmuxLayoutLeafNode {
+  kind: "leaf";
+  id: string;
+  paneRef: string;
+  surfaceRef: string;
+  role: CmuxLayoutRole;
+  order: number;
+}
+
+interface CmuxLayoutBranchNode {
+  kind: "branch";
+  id: string;
+  left: CmuxLayoutNode;
+  right: CmuxLayoutNode;
+}
+
+type CmuxLayoutNode = CmuxLayoutLeafNode | CmuxLayoutBranchNode;
+
+interface CmuxLayoutLeafCandidate extends CmuxLayoutLeafNode {
+  depth: number;
+}
+
+interface CmuxWorkspaceLayoutState {
+  workspaceRef: string;
+  orchestratorPaneRef: string;
+  orchestratorSurfaceRef: string;
+  root: CmuxLayoutNode;
+  nextNodeId: number;
+  nextOrder: number;
+}
+
+// Tracks the orchestrator + live subagent panes per workspace so we can keep
+// splitting the largest managed pane instead of repeatedly shrinking the
+// orchestrator pane.
+const cmuxWorkspaceLayouts = new Map<string, CmuxWorkspaceLayoutState>();
+let cmuxLayoutLock: Promise<void> = Promise.resolve();
+
+function createCmuxWorkspaceLayoutState(args: {
+  workspaceRef: string;
+  paneRef: string;
+  surfaceRef: string;
+}): CmuxWorkspaceLayoutState {
+  return {
+    workspaceRef: args.workspaceRef,
+    orchestratorPaneRef: args.paneRef,
+    orchestratorSurfaceRef: args.surfaceRef,
+    root: {
+      kind: "leaf",
+      id: "n0",
+      paneRef: args.paneRef,
+      surfaceRef: args.surfaceRef,
+      role: "orchestrator",
+      order: 0,
+    },
+    nextNodeId: 1,
+    nextOrder: 1,
+  };
+}
+
+function nextCmuxLayoutNodeId(state: CmuxWorkspaceLayoutState): string {
+  const id = `n${state.nextNodeId}`;
+  state.nextNodeId += 1;
+  return id;
+}
+
+function collectCmuxLayoutLeaves(node: CmuxLayoutNode, depth = 0, leaves: CmuxLayoutLeafCandidate[] = []): CmuxLayoutLeafCandidate[] {
+  if (node.kind === "leaf") {
+    leaves.push({ ...node, depth });
+    return leaves;
+  }
+
+  collectCmuxLayoutLeaves(node.left, depth + 1, leaves);
+  collectCmuxLayoutLeaves(node.right, depth + 1, leaves);
+  return leaves;
+}
+
+function findCmuxLayoutLeaf(node: CmuxLayoutNode, predicate: (leaf: CmuxLayoutLeafNode) => boolean): CmuxLayoutLeafNode | null {
+  if (node.kind === "leaf") {
+    return predicate(node) ? node : null;
+  }
+
+  return findCmuxLayoutLeaf(node.left, predicate) ?? findCmuxLayoutLeaf(node.right, predicate);
+}
+
+function replaceCmuxLayoutLeaf(node: CmuxLayoutNode, targetLeafId: string, replacement: CmuxLayoutNode): CmuxLayoutNode {
+  if (node.kind === "leaf") {
+    return node.id === targetLeafId ? replacement : node;
+  }
+
+  return {
+    ...node,
+    left: replaceCmuxLayoutLeaf(node.left, targetLeafId, replacement),
+    right: replaceCmuxLayoutLeaf(node.right, targetLeafId, replacement),
+  };
+}
+
+function removeCmuxLayoutLeaf(node: CmuxLayoutNode, predicate: (leaf: CmuxLayoutLeafNode) => boolean): CmuxLayoutNode | null {
+  if (node.kind === "leaf") {
+    return predicate(node) ? null : node;
+  }
+
+  const left = removeCmuxLayoutLeaf(node.left, predicate);
+  const right = removeCmuxLayoutLeaf(node.right, predicate);
+
+  if (!left && !right) return null;
+  if (!left) return right;
+  if (!right) return left;
+
+  return {
+    ...node,
+    left,
+    right,
+  };
+}
+
+function getOrCreateCmuxWorkspaceLayout(args: {
+  workspaceRef: string;
+  paneRef: string;
+  surfaceRef: string;
+}): CmuxWorkspaceLayoutState {
+  const existing = cmuxWorkspaceLayouts.get(args.workspaceRef);
+  if (!existing) {
+    const created = createCmuxWorkspaceLayoutState(args);
+    cmuxWorkspaceLayouts.set(args.workspaceRef, created);
+    return created;
+  }
+
+  const orchestratorLeaf = findCmuxLayoutLeaf(existing.root, (leaf) => leaf.role === "orchestrator");
+  if (!orchestratorLeaf || orchestratorLeaf.surfaceRef !== args.surfaceRef) {
+    const reset = createCmuxWorkspaceLayoutState(args);
+    cmuxWorkspaceLayouts.set(args.workspaceRef, reset);
+    return reset;
+  }
+
+  orchestratorLeaf.surfaceRef = args.surfaceRef;
+  existing.orchestratorSurfaceRef = args.surfaceRef;
+  return existing;
+}
+
+function chooseCmuxSplitLeaf(state: CmuxWorkspaceLayoutState): CmuxLayoutLeafCandidate {
+  // The shallowest leaf approximates the largest visible pane in the current
+  // split tree. On ties, prefer splitting subagent panes so the orchestrator
+  // stays larger for longer.
+  const leaves = collectCmuxLayoutLeaves(state.root);
+  const [selected] = leaves.sort((a, b) => {
+    if (a.depth !== b.depth) return a.depth - b.depth;
+    if (a.role !== b.role) return a.role === "subagent" ? -1 : 1;
+    if (a.order !== b.order) return a.order - b.order;
+    return a.id.localeCompare(b.id);
+  });
+
+  return selected;
+}
+
+function applyCmuxSplitToLayout(
+  state: CmuxWorkspaceLayoutState,
+  splitLeaf: CmuxLayoutLeafCandidate,
+  createdPaneRef: string,
+  createdSurfaceRef: string,
+): void {
+  const newPaneLeaf: CmuxLayoutLeafNode = {
+    kind: "leaf",
+    id: nextCmuxLayoutNodeId(state),
+    paneRef: createdPaneRef,
+    surfaceRef: createdSurfaceRef,
+    role: "subagent",
+    order: state.nextOrder,
+  };
+  state.nextOrder += 1;
+
+  state.root = replaceCmuxLayoutLeaf(state.root, splitLeaf.id, {
+    kind: "branch",
+    id: nextCmuxLayoutNodeId(state),
+    left: {
+      kind: "leaf",
+      id: splitLeaf.id,
+      paneRef: splitLeaf.paneRef,
+      surfaceRef: splitLeaf.surfaceRef,
+      role: splitLeaf.role,
+      order: splitLeaf.order,
+    },
+    right: newPaneLeaf,
+  });
+}
+
+function removeCmuxPaneFromLayout(workspaceRef: string, args: { paneRef?: string; surfaceRef?: string }): void {
+  const state = cmuxWorkspaceLayouts.get(workspaceRef);
+  if (!state) return;
+
+  const nextRoot = removeCmuxLayoutLeaf(state.root, (leaf) => {
+    if (leaf.role === "orchestrator") return false;
+    if (args.surfaceRef && leaf.surfaceRef === args.surfaceRef) return true;
+    if (args.paneRef && leaf.paneRef === args.paneRef) return true;
+    return false;
+  });
+
+  if (!nextRoot) {
+    cmuxWorkspaceLayouts.delete(workspaceRef);
+    return;
+  }
+
+  state.root = nextRoot;
+}
+
+async function withCmuxLayoutLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = cmuxLayoutLock;
+  let release!: () => void;
+  cmuxLayoutLock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+export function resetCmuxLayoutStateForTests(): void {
+  cmuxWorkspaceLayouts.clear();
+  cmuxLayoutLock = Promise.resolve();
+}
+
 export function createDefaultSpawnAgentDefinition(name = "subagent"): SpawnAgentDefinition {
   const defaultType = getDefaultSubagentType();
 
@@ -672,6 +898,239 @@ function parseCmuxNewSplit(stdout: string): { workspaceRef: string; surfaceRef: 
   };
 }
 
+function extractCmuxRef(value: unknown, prefix: string): string | undefined {
+  return typeof value === "string" && value.startsWith(`${prefix}:`) ? value : undefined;
+}
+
+function extractCmuxRefsFromCollection(value: unknown, prefix: string, out: string[] = []): string[] {
+  if (typeof value === "string") {
+    const match = value.match(new RegExp(`\\b(${prefix}:\\d+)\\b`, "g"));
+    if (match) out.push(...match);
+    return out;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) extractCmuxRefsFromCollection(item, prefix, out);
+    return out;
+  }
+
+  if (!value || typeof value !== "object") return out;
+
+  const record = value as Record<string, unknown>;
+  const directKeys = ["ref", `${prefix}_ref`, `${prefix}Ref`, "id", `${prefix}_id`, `${prefix}Id`];
+  for (const key of directKeys) {
+    const ref = extractCmuxRef(record[key], prefix);
+    if (ref) out.push(ref);
+  }
+
+  for (const nestedValue of Object.values(record)) {
+    extractCmuxRefsFromCollection(nestedValue, prefix, out);
+  }
+
+  return out;
+}
+
+function uniqueCmuxRefs(refs: string[]): string[] {
+  return [...new Set(refs)];
+}
+
+async function listCmuxPaneRefs(workspaceRef: string): Promise<string[] | null> {
+  const listed = await runCmuxCommand(["--json", "list-panes", "--workspace", workspaceRef]);
+  if (listed.exitCode !== 0) return null;
+
+  const refs = uniqueCmuxRefs(extractCmuxRefsFromCollection(listed.stdout, "pane"));
+  if (refs.length > 0) return refs;
+
+  const matches = listed.stdout.match(/\bpane:\d+\b/g);
+  return matches ? uniqueCmuxRefs(matches) : [];
+}
+
+async function listCmuxPaneSurfaceRefs(workspaceRef: string, paneRef: string): Promise<string[] | null> {
+  const listed = await runCmuxCommand(["--json", "list-pane-surfaces", "--workspace", workspaceRef, "--pane", paneRef]);
+  if (listed.exitCode !== 0) return null;
+
+  const refs = uniqueCmuxRefs(extractCmuxRefsFromCollection(listed.stdout, "surface"));
+  if (refs.length > 0) return refs;
+
+  const matches = listed.stdout.match(/\bsurface:\d+\b/g);
+  return matches ? uniqueCmuxRefs(matches) : [];
+}
+
+async function snapshotCmuxWorkspace(workspaceRef: string): Promise<Map<string, string[]>> {
+  const paneRefs = await listCmuxPaneRefs(workspaceRef);
+  if (!paneRefs || paneRefs.length === 0) return new Map();
+
+  const snapshot = new Map<string, string[]>();
+  for (const paneRef of paneRefs) {
+    const surfaceRefs = await listCmuxPaneSurfaceRefs(workspaceRef, paneRef);
+    if (!surfaceRefs) continue;
+    snapshot.set(paneRef, [...surfaceRefs]);
+  }
+
+  return snapshot;
+}
+
+function findSurfacePaneRef(snapshot: Map<string, string[]>, surfaceRef: string): string | undefined {
+  for (const [paneRef, surfaceRefs] of snapshot.entries()) {
+    if (surfaceRefs.includes(surfaceRef)) return paneRef;
+  }
+  return undefined;
+}
+
+function syncCmuxLayoutStateWithSnapshot(state: CmuxWorkspaceLayoutState, snapshot: Map<string, string[]>): void {
+  const paneRefs = new Set(snapshot.keys());
+
+  const leaves = collectCmuxLayoutLeaves(state.root);
+  for (const leaf of leaves) {
+    const actualPaneRef = findSurfacePaneRef(snapshot, leaf.surfaceRef);
+    if (actualPaneRef) {
+      if (!paneRefs.has(leaf.paneRef)) {
+        leaf.paneRef = actualPaneRef;
+      }
+      continue;
+    }
+
+    if (leaf.role === "subagent") {
+      removeCmuxPaneFromLayout(state.workspaceRef, {
+        paneRef: leaf.paneRef,
+        surfaceRef: leaf.surfaceRef,
+      });
+    }
+  }
+
+  const orchestratorLeaf = findCmuxLayoutLeaf(state.root, (leaf) => leaf.role === "orchestrator");
+  const actualOrchestratorPane = orchestratorLeaf ? findSurfacePaneRef(snapshot, orchestratorLeaf.surfaceRef) : undefined;
+  if (orchestratorLeaf && actualOrchestratorPane && !paneRefs.has(orchestratorLeaf.paneRef)) {
+    orchestratorLeaf.paneRef = actualOrchestratorPane;
+    state.orchestratorPaneRef = actualOrchestratorPane;
+  }
+}
+
+async function moveCmuxSurfaceToPane(args: {
+  workspaceRef: string;
+  surfaceRef: string;
+  targetPaneRef: string;
+}): Promise<boolean> {
+  const moved = await runCmuxCommand([
+    "move-surface",
+    "--workspace",
+    args.workspaceRef,
+    "--surface",
+    args.surfaceRef,
+    "--pane",
+    args.targetPaneRef,
+  ]);
+  return moved.exitCode === 0;
+}
+
+async function reorderCmuxSurfaceBefore(args: {
+  workspaceRef: string;
+  surfaceRef: string;
+  beforeSurfaceRef: string;
+}): Promise<boolean> {
+  const reordered = await runCmuxCommand([
+    "reorder-surface",
+    "--workspace",
+    args.workspaceRef,
+    "--surface",
+    args.surfaceRef,
+    "--before",
+    args.beforeSurfaceRef,
+  ]);
+  return reordered.exitCode === 0;
+}
+
+async function rebalanceCmuxWorkspaceSurfaces(state: CmuxWorkspaceLayoutState): Promise<void> {
+  // Phase 2: after choosing a balanced split target, reconcile the live cmux
+  // workspace back to the planned pane assignment using move/reorder operations.
+  const snapshot = await snapshotCmuxWorkspace(state.workspaceRef);
+  if (snapshot.size === 0) return;
+
+  const desiredLeaves = collectCmuxLayoutLeaves(state.root);
+  const surfaceToPane = new Map<string, string>();
+  for (const [paneRef, surfaceRefs] of snapshot.entries()) {
+    for (const surfaceRef of surfaceRefs) {
+      surfaceToPane.set(surfaceRef, paneRef);
+    }
+  }
+
+  for (const leaf of desiredLeaves) {
+    const currentPaneRef = surfaceToPane.get(leaf.surfaceRef);
+    if (!currentPaneRef || currentPaneRef === leaf.paneRef) continue;
+    if (!snapshot.has(leaf.paneRef)) continue;
+
+    const targetPaneSurfaces = snapshot.get(leaf.paneRef) ?? [];
+    const orderAnchor = targetPaneSurfaces.find((surfaceRef) => surfaceRef !== leaf.surfaceRef);
+
+    const moved = await moveCmuxSurfaceToPane({
+      workspaceRef: state.workspaceRef,
+      surfaceRef: leaf.surfaceRef,
+      targetPaneRef: leaf.paneRef,
+    });
+    if (!moved) continue;
+
+    const sourcePaneSurfaces = snapshot.get(currentPaneRef);
+    if (sourcePaneSurfaces) {
+      snapshot.set(
+        currentPaneRef,
+        sourcePaneSurfaces.filter((surfaceRef) => surfaceRef !== leaf.surfaceRef),
+      );
+    }
+    snapshot.set(leaf.paneRef, [...targetPaneSurfaces.filter((surfaceRef) => surfaceRef !== leaf.surfaceRef), leaf.surfaceRef]);
+    surfaceToPane.set(leaf.surfaceRef, leaf.paneRef);
+
+    if (orderAnchor) {
+      const reordered = await reorderCmuxSurfaceBefore({
+        workspaceRef: state.workspaceRef,
+        surfaceRef: leaf.surfaceRef,
+        beforeSurfaceRef: orderAnchor,
+      });
+      if (reordered) {
+        const updatedTargetPaneSurfaces = snapshot.get(leaf.paneRef) ?? [];
+        snapshot.set(leaf.paneRef, [leaf.surfaceRef, ...updatedTargetPaneSurfaces.filter((surfaceRef) => surfaceRef !== leaf.surfaceRef)]);
+      }
+    }
+  }
+}
+
+async function createCmuxSplit(args: {
+  workspaceRef: string;
+  targetPaneRef: string;
+  targetSurfaceRef: string;
+}): Promise<
+  | {
+      ok: true;
+      stdout: string;
+    }
+  | {
+      ok: false;
+      error: string;
+    }
+> {
+  const attempts: string[][] = [
+    ["new-split", "right", "--workspace", args.workspaceRef, "--panel", args.targetPaneRef],
+    ["new-split", "right", "--workspace", args.workspaceRef, "--surface", args.targetSurfaceRef],
+  ];
+
+  const seen = new Set<string>();
+  const errors: string[] = [];
+
+  for (const commandArgs of attempts) {
+    const key = commandArgs.join("\u0000");
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const result = await runCmuxCommand(commandArgs);
+    if (result.exitCode === 0) {
+      return { ok: true, stdout: result.stdout };
+    }
+
+    errors.push(result.stderr || result.stdout || `cmux ${commandArgs[0]} failed`);
+  }
+
+  return { ok: false, error: errors.filter(Boolean).join(" | ") || "Failed to create cmux pane" };
+}
+
 async function launchCmuxPane(args: { scriptPath: string }): Promise<
   | {
       ok: true;
@@ -684,68 +1143,108 @@ async function launchCmuxPane(args: { scriptPath: string }): Promise<
       error: string;
     }
 > {
-  const identify = await runCmuxCommand(["identify", "--json"]);
-  if (identify.exitCode !== 0) {
-    return { ok: false, error: identify.stderr || identify.stdout || "Failed to identify current cmux surface" };
-  }
+  return await withCmuxLayoutLock(async () => {
+    const identify = await runCmuxCommand(["identify", "--json"]);
+    if (identify.exitCode !== 0) {
+      return { ok: false, error: identify.stderr || identify.stdout || "Failed to identify current cmux surface" };
+    }
 
-  const callerContext = parseCmuxIdentify(identify.stdout);
-  if (!callerContext) {
-    return { ok: false, error: "cmux pane launch requires running inside a cmux terminal surface" };
-  }
+    const callerContext = parseCmuxIdentify(identify.stdout);
+    if (!callerContext) {
+      return { ok: false, error: "cmux pane launch requires running inside a cmux terminal surface" };
+    }
 
-  const split = await runCmuxCommand([
-    "new-split",
-    "right",
-    "--workspace",
-    callerContext.workspaceRef,
-    "--surface",
-    callerContext.surfaceRef,
-  ]);
-  if (split.exitCode !== 0) {
-    return { ok: false, error: split.stderr || split.stdout || "Failed to create cmux pane" };
-  }
+    const layoutState = getOrCreateCmuxWorkspaceLayout(callerContext);
+    const beforeSnapshot = await snapshotCmuxWorkspace(callerContext.workspaceRef);
+    if (beforeSnapshot.size > 0) {
+      syncCmuxLayoutStateWithSnapshot(layoutState, beforeSnapshot);
+    }
+    let splitTarget = chooseCmuxSplitLeaf(layoutState);
 
-  const created = parseCmuxNewSplit(split.stdout);
-  if (!created) {
-    return { ok: false, error: `Unexpected cmux new-split output: ${split.stdout || "(empty)"}` };
-  }
+    let split = await createCmuxSplit({
+      workspaceRef: callerContext.workspaceRef,
+      targetPaneRef: splitTarget.paneRef,
+      targetSurfaceRef: splitTarget.surfaceRef,
+    });
 
-  const paneIdentify = await runCmuxCommand([
-    "identify",
-    "--json",
-    "--workspace",
-    created.workspaceRef,
-    "--surface",
-    created.surfaceRef,
-  ]);
-  if (paneIdentify.exitCode !== 0) {
-    return { ok: false, error: paneIdentify.stderr || paneIdentify.stdout || "Failed to identify cmux pane" };
-  }
+    if (!split.ok && splitTarget.role !== "orchestrator") {
+      removeCmuxPaneFromLayout(callerContext.workspaceRef, {
+        paneRef: splitTarget.paneRef,
+        surfaceRef: splitTarget.surfaceRef,
+      });
+      splitTarget = chooseCmuxSplitLeaf(layoutState);
+      split = await createCmuxSplit({
+        workspaceRef: callerContext.workspaceRef,
+        targetPaneRef: splitTarget.paneRef,
+        targetSurfaceRef: splitTarget.surfaceRef,
+      });
+    }
 
-  const paneContext = parseCmuxIdentify(paneIdentify.stdout);
-  if (!paneContext) {
-    return { ok: false, error: "Failed to resolve cmux pane refs after split" };
-  }
+    if (!split.ok) {
+      return { ok: false, error: split.error };
+    }
 
-  const send = await runCmuxCommand([
-    "send",
-    "--workspace",
-    paneContext.workspaceRef,
-    "--surface",
-    paneContext.surfaceRef,
-    `${args.scriptPath}\n`,
-  ]);
-  if (send.exitCode !== 0) {
-    return { ok: false, error: send.stderr || send.stdout || "Failed to send command to cmux pane" };
-  }
+    const created = parseCmuxNewSplit(split.stdout);
+    if (!created) {
+      return { ok: false, error: `Unexpected cmux new-split output: ${split.stdout || "(empty)"}` };
+    }
 
-  return {
-    ok: true,
-    workspaceRef: paneContext.workspaceRef,
-    paneRef: paneContext.paneRef,
-    surfaceRef: paneContext.surfaceRef,
-  };
+    const paneIdentify = await runCmuxCommand([
+      "identify",
+      "--json",
+      "--workspace",
+      created.workspaceRef,
+      "--surface",
+      created.surfaceRef,
+    ]);
+    if (paneIdentify.exitCode !== 0) {
+      return { ok: false, error: paneIdentify.stderr || paneIdentify.stdout || "Failed to identify cmux pane" };
+    }
+
+    const paneContext = parseCmuxIdentify(paneIdentify.stdout);
+    if (!paneContext) {
+      return { ok: false, error: "Failed to resolve cmux pane refs after split" };
+    }
+
+    applyCmuxSplitToLayout(layoutState, splitTarget, paneContext.paneRef, paneContext.surfaceRef);
+
+    const send = await runCmuxCommand([
+      "send",
+      "--workspace",
+      paneContext.workspaceRef,
+      "--surface",
+      paneContext.surfaceRef,
+      `${args.scriptPath}\n`,
+    ]);
+    if (send.exitCode !== 0) {
+      return { ok: false, error: send.stderr || send.stdout || "Failed to send command to cmux pane" };
+    }
+
+    await rebalanceCmuxWorkspaceSurfaces(layoutState);
+
+    const postRebalanceIdentify = await runCmuxCommand([
+      "identify",
+      "--json",
+      "--workspace",
+      paneContext.workspaceRef,
+      "--surface",
+      paneContext.surfaceRef,
+    ]);
+    const postRebalanceContext =
+      postRebalanceIdentify.exitCode === 0 ? parseCmuxIdentify(postRebalanceIdentify.stdout) : null;
+    if (postRebalanceContext) {
+      const newPaneLeaf = findCmuxLayoutLeaf(layoutState.root, (leaf) => leaf.surfaceRef === paneContext.surfaceRef);
+      if (newPaneLeaf) newPaneLeaf.paneRef = postRebalanceContext.paneRef;
+      paneContext.paneRef = postRebalanceContext.paneRef;
+    }
+
+    return {
+      ok: true,
+      workspaceRef: paneContext.workspaceRef,
+      paneRef: paneContext.paneRef,
+      surfaceRef: paneContext.surfaceRef,
+    };
+  });
 }
 
 async function closeCmuxSurface(surfaceRef: string): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -995,7 +1494,17 @@ export async function runSpawnTask(
 
     if (result.cmuxSurfaceRef) {
       const closeResult = await closeCmuxSurface(result.cmuxSurfaceRef);
-      if (closeResult.ok) result.cmuxPaneClosed = true;
+      if (closeResult.ok) {
+        result.cmuxPaneClosed = true;
+        if (result.cmuxWorkspaceRef) {
+          await withCmuxLayoutLock(async () => {
+            removeCmuxPaneFromLayout(result.cmuxWorkspaceRef!, {
+              paneRef: result.cmuxPaneRef,
+              surfaceRef: result.cmuxSurfaceRef,
+            });
+          });
+        }
+      }
       else result.cmuxCloseError = closeResult.error;
     }
     return result;
