@@ -916,7 +916,7 @@ describe("subagent spawn", () => {
     expect(capturedPiArgs[capturedPiArgs.length - 1]).toBe(longTask);
   });
 
-  test("rebalances sequential cmux-pane spawns instead of always splitting the orchestrator pane", async () => {
+  test("rebalances sequential cmux-pane spawns and alternates split directions toward a grid", async () => {
     const tempDir = makeTempDir("collab-subagent-cmux-pane-layout");
     const { argsFile } = writeFakePiBinary(tempDir);
     const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
@@ -956,11 +956,12 @@ describe("subagent spawn", () => {
 
     const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
 
-    const splitTargets = capturedCmuxArgs
-      .filter((entry) => entry[0] === "new-split")
-      .map((entry) => entry[entry.indexOf("--panel") + 1]);
+    const splitCommands = capturedCmuxArgs.filter((entry) => entry[0] === "new-split");
+    const splitTargets = splitCommands.map((entry) => entry[entry.indexOf("--panel") + 1]);
+    const splitDirections = splitCommands.map((entry) => entry[1]);
 
     expect(splitTargets).toEqual(["pane:2", "pane:99", "pane:2"]);
+    expect(splitDirections).toEqual(["right", "down", "down"]);
   });
 
   test("removes auto-closed cmux panes from the layout planner before the next spawn", async () => {

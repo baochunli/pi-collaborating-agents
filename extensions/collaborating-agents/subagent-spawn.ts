@@ -62,6 +62,7 @@ const HOME_COLLABORATING_AGENTS_EXTENSION = path.join(os.homedir(), ".pi", "agen
 const CMUX_PANE_IDLE_GRACE_MS = 1200;
 
 type CmuxLayoutRole = "orchestrator" | "subagent";
+type CmuxSplitDirection = "right" | "down";
 
 interface CmuxLayoutLeafNode {
   kind: "leaf";
@@ -215,6 +216,12 @@ function chooseCmuxSplitLeaf(state: CmuxWorkspaceLayoutState): CmuxLayoutLeafCan
   });
 
   return selected;
+}
+
+function chooseCmuxSplitDirection(splitLeaf: CmuxLayoutLeafCandidate): CmuxSplitDirection {
+  // Alternate horizontal and vertical splits by tree depth so the managed pane
+  // layout grows toward a grid instead of endlessly slicing columns.
+  return splitLeaf.depth % 2 === 0 ? "right" : "down";
 }
 
 function applyCmuxSplitToLayout(
@@ -1129,6 +1136,7 @@ async function createCmuxSplit(args: {
   workspaceRef: string;
   targetPaneRef: string;
   targetSurfaceRef: string;
+  direction: CmuxSplitDirection;
 }): Promise<
   | {
       ok: true;
@@ -1140,8 +1148,8 @@ async function createCmuxSplit(args: {
     }
 > {
   const attempts: string[][] = [
-    ["new-split", "right", "--workspace", args.workspaceRef, "--panel", args.targetPaneRef],
-    ["new-split", "right", "--workspace", args.workspaceRef, "--surface", args.targetSurfaceRef],
+    ["new-split", args.direction, "--workspace", args.workspaceRef, "--panel", args.targetPaneRef],
+    ["new-split", args.direction, "--workspace", args.workspaceRef, "--surface", args.targetSurfaceRef],
   ];
 
   const seen = new Set<string>();
@@ -1192,11 +1200,13 @@ async function launchCmuxPane(args: { scriptPath: string }): Promise<
       syncCmuxLayoutStateWithSnapshot(layoutState, beforeSnapshot);
     }
     let splitTarget = chooseCmuxSplitLeaf(layoutState);
+    let splitDirection = chooseCmuxSplitDirection(splitTarget);
 
     let split = await createCmuxSplit({
       workspaceRef: callerContext.workspaceRef,
       targetPaneRef: splitTarget.paneRef,
       targetSurfaceRef: splitTarget.surfaceRef,
+      direction: splitDirection,
     });
 
     if (!split.ok && splitTarget.role !== "orchestrator") {
@@ -1205,10 +1215,12 @@ async function launchCmuxPane(args: { scriptPath: string }): Promise<
         surfaceRef: splitTarget.surfaceRef,
       });
       splitTarget = chooseCmuxSplitLeaf(layoutState);
+      splitDirection = chooseCmuxSplitDirection(splitTarget);
       split = await createCmuxSplit({
         workspaceRef: callerContext.workspaceRef,
         targetPaneRef: splitTarget.paneRef,
         targetSurfaceRef: splitTarget.surfaceRef,
+        direction: splitDirection,
       });
     }
 

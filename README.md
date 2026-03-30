@@ -288,7 +288,7 @@ Controls how spawned subagents are launched.
 
 - `"process"` keeps the current behavior: spawn a background `pi` child process directly.
 - `"cmux-pane"` launches the subagent in a new visible cmux split pane in the current workspace by calling `cmux new-split` and then sending a real `pi` launch command into that pane.
-- In `"cmux-pane"` mode, the extension tracks the orchestrator pane plus visible subagent panes in the workspace and picks the shallowest managed pane for the next split (preferring subagent panes over the orchestrator on ties). That keeps the overall pane tree balanced instead of repeatedly shrinking the orchestrator pane.
+- In `"cmux-pane"` mode, the extension tracks the orchestrator pane plus visible subagent panes in the workspace and picks the shallowest managed pane for the next split (preferring subagent panes over the orchestrator on ties). It alternates horizontal and vertical split directions by tree depth so the layout trends toward a balanced grid instead of repeatedly slicing columns off the orchestrator pane.
 - After each new pane is created, the extension also snapshots live cmux panes/surfaces and performs a best-effort rebalance pass. If managed surfaces drifted because of manual pane moves or closes, it uses `move-surface`/`reorder-surface` to restore the planned arrangement before continuing.
 
 Use `"cmux-pane"` when you want every spawned agent to have a real visible terminal in cmux while still preserving automatic result collection in the parent session. The pane shows Pi's native terminal session output instead of a custom JSON renderer.
