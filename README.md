@@ -40,6 +40,31 @@ or (if you installed using git URL):
 pi remove https://github.com/baochunli/pi-collaborating-agents
 ```
 
+
+## Setting up `AGENTS.md`
+
+Use `pi config` to activate both the `pi-collaborating-agents` extension and the `collaborating-agents-system` skill, and (optionally) add the following to `AGENTS.md` for more specific instructions.
+
+```text
+Before handling the task, first learn the `collaborating-agents-system` skill. Use it to understand the available collaboration capabilities, including:
+
+- spawning and coordinating subagents
+- parallelizing suitable tasks
+- sending direct and broadcast messages between agents
+- reserving and releasing files/directories before edits
+
+Then execute the task under these rules:
+
+1. Prefer parallelism for read-heavy exploration and review tasks.
+2. Reserve files/directories before any write.
+3. Keep process logging single-writer when possible.
+4. Use direct messages for blockers and decisions.
+5. Use broadcasts for shared status updates.
+6. Prefer low-coupling task decomposition; avoid conflicting parallel edits.
+
+Choose an appropriate split of work, coordinate subagents carefully, and keep the execution process organized and auditable.
+```
+
 ## Opening the _Agents and Messages_ Overlay with the `/agents` Command
 
 The `/agents` slash command opens an integrated _agents and messages_ overlay with four tabs:
@@ -139,9 +164,9 @@ Examples:
 subagent({ task: "Implement auth tags and report back via agent_message" })
 
 // With specific subagent type
-subagent({ 
+subagent({
   type: "scout",
-  task: "Find all TypeScript files in the project" 
+  task: "Find all TypeScript files in the project"
 })
 
 // Parallel subagents
@@ -242,9 +267,9 @@ See the `examples/subagents/` directory for complete example configurations.
 **Via the `subagent` tool:**
 ```ts
 // Single subagent with type
-subagent({ 
-  type: "scout", 
-  task: "Find all TypeScript files" 
+subagent({
+  type: "scout",
+  task: "Find all TypeScript files"
 })
 
 // Parallel subagents with types
