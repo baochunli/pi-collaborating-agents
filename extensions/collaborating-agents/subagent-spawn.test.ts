@@ -20,6 +20,7 @@ const ORIGINAL_TEST_CMUX_SEND_TRUNCATE_AT = process.env.TEST_CMUX_SEND_TRUNCATE_
 const ORIGINAL_TEST_PI_EXIT_DELAY_MS = process.env.TEST_PI_EXIT_DELAY_MS;
 const ORIGINAL_TEST_CMUX_CLOSE_FAIL = process.env.TEST_CMUX_CLOSE_FAIL;
 const ORIGINAL_TEST_PI_EXIT_CODE = process.env.TEST_PI_EXIT_CODE;
+const ORIGINAL_TEST_PI_MULTI_TURN = process.env.TEST_PI_MULTI_TURN;
 const ORIGINAL_HOME = process.env.HOME;
 const ORIGINAL_USERPROFILE = process.env.USERPROFILE;
 
@@ -94,18 +95,63 @@ if (args.includes("--mode") && args.includes("json")) {
 
 if (sessionPath) {
   fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
-  fs.writeFileSync(sessionPath, [
-    JSON.stringify({ type: "session", id: "fake-session" }),
-    JSON.stringify({
+  fs.writeFileSync(sessionPath, JSON.stringify({ type: "session", id: "fake-session" }) + "\\n", "utf-8");
+
+  if (process.env.TEST_PI_MULTI_TURN === "1") {
+    setTimeout(() => {
+      fs.appendFileSync(sessionPath, JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "fake-intermediate" }],
+          stopReason: "stop",
+        },
+      }) + "\\n", "utf-8");
+    }, 20);
+
+    setTimeout(() => {
+      fs.appendFileSync(sessionPath, JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "README.md" } }],
+          stopReason: "toolUse",
+        },
+      }) + "\\n", "utf-8");
+    }, 220);
+
+    setTimeout(() => {
+      fs.appendFileSync(sessionPath, JSON.stringify({
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "tool-1",
+          toolName: "read",
+          content: [{ type: "text", text: "ok" }],
+        },
+      }) + "\\n", "utf-8");
+    }, 420);
+
+    setTimeout(() => {
+      fs.appendFileSync(sessionPath, JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "fake-final" }],
+          stopReason: "stop",
+        },
+      }) + "\\n", "utf-8");
+    }, 620);
+  } else {
+    fs.appendFileSync(sessionPath, JSON.stringify({
       type: "message",
       message: {
         role: "assistant",
         content: [{ type: "text", text: "fake-ok" }],
         stopReason: "stop",
       },
-    }),
-    "",
-  ].join("\\n"), "utf-8");
+    }) + "\\n", "utf-8");
+  }
 }
 
 const delayMs = Number(process.env.TEST_PI_EXIT_DELAY_MS || "0");
@@ -465,6 +511,12 @@ afterEach(() => {
     delete process.env.TEST_PI_EXIT_CODE;
   }
 
+  if (typeof ORIGINAL_TEST_PI_MULTI_TURN === "string") {
+    process.env.TEST_PI_MULTI_TURN = ORIGINAL_TEST_PI_MULTI_TURN;
+  } else {
+    delete process.env.TEST_PI_MULTI_TURN;
+  }
+
   if (typeof ORIGINAL_HOME === "string") {
     process.env.HOME = ORIGINAL_HOME;
   } else {
@@ -694,6 +746,62 @@ describe("subagent spawn", () => {
 
     const closeArgs = capturedCmuxArgs[10]!;
     expect(closeArgs).toEqual(["close-surface", "--surface", "surface:99"]);
+  });
+
+  test("waits for the latest settled assistant message before closing a cmux pane", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-settled-output");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+    process.env.TEST_CMUX_SEND_ASYNC = "1";
+    process.env.TEST_PI_EXIT_DELAY_MS = "5000";
+    process.env.TEST_PI_MULTI_TURN = "1";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun4-settled",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-final");
+    expect(result.cmuxPaneClosed).toBe(true);
+
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+    expect(getCmuxCommandNames(capturedCmuxArgs)).toEqual([
+      "identify",
+      "list-panes",
+      "list-pane-surfaces",
+      "new-split",
+      "identify",
+      "send",
+      "list-panes",
+      "list-pane-surfaces",
+      "list-pane-surfaces",
+      "identify",
+      "close-surface",
+    ]);
   });
 
   test("can keep completed cmux panes open when auto-close is disabled", async () => {

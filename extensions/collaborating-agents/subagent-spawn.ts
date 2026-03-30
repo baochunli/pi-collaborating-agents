@@ -60,7 +60,6 @@ const SUPPORTED_SUBAGENT_TOOL_NAMES = new Set(["read", "bash", "edit", "write", 
 const LOCAL_COLLABORATING_AGENTS_EXTENSION = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.ts");
 const HOME_COLLABORATING_AGENTS_EXTENSION = path.join(os.homedir(), ".pi", "agent", "extensions", "collaborating-agents", "index.ts");
 const CMUX_PANE_IDLE_GRACE_MS = 1200;
-const CMUX_PANE_IDLE_MAX_WAIT_MS = 15000;
 
 type CmuxLayoutRole = "orchestrator" | "subagent";
 
@@ -753,44 +752,6 @@ function readFileMtimeMs(filePath: string): number | null {
   }
 }
 
-async function waitForSessionIdleGrace(args: {
-  sessionFile: string;
-  exitMarkerPath: string;
-  idleGraceMs?: number;
-  maxWaitMs?: number;
-}): Promise<{ idleReached: boolean; exitCode: number | null; timedOut: boolean }> {
-  const idleGraceMs = Math.max(100, Math.floor(args.idleGraceMs ?? CMUX_PANE_IDLE_GRACE_MS));
-  const maxWaitMs = Math.max(idleGraceMs, Math.floor(args.maxWaitMs ?? CMUX_PANE_IDLE_MAX_WAIT_MS));
-  const startedAt = Date.now();
-  let lastObservedMtime = readFileMtimeMs(args.sessionFile) ?? 0;
-  let lastActivityAt = Date.now();
-
-  while (Date.now() - startedAt < maxWaitMs) {
-    const currentMtime = readFileMtimeMs(args.sessionFile);
-    if (currentMtime && currentMtime > lastObservedMtime + 0.5) {
-      lastObservedMtime = currentMtime;
-      lastActivityAt = Date.now();
-    }
-
-    const exitCode = readExitMarkerCode(args.exitMarkerPath);
-    if (exitCode !== null && exitCode !== 0) {
-      return { idleReached: false, exitCode, timedOut: false };
-    }
-
-    if (Date.now() - lastActivityAt >= idleGraceMs) {
-      return { idleReached: true, exitCode, timedOut: false };
-    }
-
-    await sleep(100);
-  }
-
-  return {
-    idleReached: false,
-    exitCode: readExitMarkerCode(args.exitMarkerPath),
-    timedOut: true,
-  };
-}
-
 function parseSessionMessageLine(line: string): {
   sessionId?: string;
   terminalAssistantText?: string;
@@ -852,21 +813,68 @@ function readSpawnSessionState(sessionFile: string): {
   return { sessionId, terminalAssistantText };
 }
 
-async function waitForSessionResult(
-  sessionFile: string,
-  timeoutMs: number,
-  onUpdate?: (state: { sessionId?: string }) => void,
-): Promise<{ sessionId?: string; terminalAssistantText?: string } | null> {
+// A cmux-pane subagent session can emit multiple assistant messages before it is
+// truly done (for example, an interrupted partial response followed by more tool
+// work and a later final answer). Wait for the latest assistant output to remain
+// idle for a short grace period instead of returning the first non-toolUse
+// message we see.
+async function waitForSettledSessionResult(args: {
+  sessionFile: string;
+  exitMarkerPath: string;
+  timeoutMs: number;
+  idleGraceMs?: number;
+  onUpdate?: (state: { sessionId?: string }) => void;
+}): Promise<{
+  sessionId?: string;
+  terminalAssistantText?: string;
+  exitCode: number | null;
+  timedOut: boolean;
+}> {
+  const idleGraceMs = Math.max(100, Math.floor(args.idleGraceMs ?? CMUX_PANE_IDLE_GRACE_MS));
   const startedAt = Date.now();
+  let lastObservedMtime = readFileMtimeMs(args.sessionFile) ?? 0;
+  let lastParsedMtime = -1;
+  let lastActivityAt = Date.now();
+  let sessionId: string | undefined;
+  let terminalAssistantText: string | undefined;
 
-  while (Date.now() - startedAt < timeoutMs) {
-    const state = readSpawnSessionState(sessionFile);
-    if (state.sessionId) onUpdate?.({ sessionId: state.sessionId });
-    if (state.terminalAssistantText !== undefined) return state;
+  while (Date.now() - startedAt < args.timeoutMs) {
+    const currentMtime = readFileMtimeMs(args.sessionFile) ?? 0;
+    if (currentMtime > lastObservedMtime + 0.5) {
+      lastObservedMtime = currentMtime;
+      lastActivityAt = Date.now();
+    }
+
+    if (lastParsedMtime < 0 || currentMtime > lastParsedMtime + 0.5) {
+      const state = readSpawnSessionState(args.sessionFile);
+      if (state.sessionId) {
+        sessionId = state.sessionId;
+        args.onUpdate?.({ sessionId });
+      }
+      if (state.terminalAssistantText !== undefined) {
+        terminalAssistantText = state.terminalAssistantText;
+      }
+      lastParsedMtime = currentMtime;
+    }
+
+    const exitCode = readExitMarkerCode(args.exitMarkerPath);
+    if (exitCode !== null && exitCode !== 0) {
+      return { sessionId, terminalAssistantText, exitCode, timedOut: false };
+    }
+
+    if (terminalAssistantText !== undefined && Date.now() - lastActivityAt >= idleGraceMs) {
+      return { sessionId, terminalAssistantText, exitCode, timedOut: false };
+    }
+
     await sleep(100);
   }
 
-  return null;
+  return {
+    sessionId,
+    terminalAssistantText,
+    exitCode: readExitMarkerCode(args.exitMarkerPath),
+    timedOut: true,
+  };
 }
 
 async function runCmuxCommand(args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -1474,11 +1482,42 @@ export async function runSpawnTask(
       return result;
     }
 
-    const sessionState = await waitForSessionResult(result.sessionFile!, 600_000, (state) => {
-      if (state.sessionId) result.sessionId = state.sessionId;
+    const sessionState = await waitForSettledSessionResult({
+      sessionFile: result.sessionFile!,
+      exitMarkerPath: exitMarkerPath!,
+      timeoutMs: 600_000,
+      onUpdate: (state) => {
+        if (state.sessionId) result.sessionId = state.sessionId;
+      },
     });
 
-    if (!sessionState) {
+    if (sessionState.exitCode !== null && sessionState.exitCode !== 0) {
+      result.sessionId = sessionState.sessionId ?? result.sessionId;
+      result.output = sessionState.terminalAssistantText || "(no output)";
+      result.exitCode = sessionState.exitCode;
+
+      if (sessionState.terminalAssistantText === undefined) {
+        const paneScreen = await runCmuxCommand([
+          "read-screen",
+          "--workspace",
+          result.cmuxWorkspaceRef!,
+          "--surface",
+          result.cmuxSurfaceRef!,
+          "--scrollback",
+          "--lines",
+          "200",
+        ]);
+        if (paneScreen.stdout) {
+          result.output = paneScreen.stdout;
+          result.error = paneScreen.stdout;
+        }
+      }
+
+      result.error = result.error ?? `cmux-pane subagent exited with code ${sessionState.exitCode}`;
+      return result;
+    }
+
+    if (sessionState.terminalAssistantText === undefined || sessionState.timedOut) {
       const paneScreen = await runCmuxCommand([
         "read-screen",
         "--workspace",
@@ -1490,36 +1529,21 @@ export async function runSpawnTask(
         "200",
       ]);
       result.exitCode = 1;
-      result.error = paneScreen.stdout || "Timed out waiting for subagent response in cmux pane";
+      result.error = paneScreen.stdout || "Timed out waiting for settled subagent response in cmux pane";
       result.output = result.error;
       return result;
     }
 
     result.sessionId = sessionState.sessionId ?? result.sessionId;
     result.output = sessionState.terminalAssistantText || "(no output)";
-    result.exitCode = 0;
+    result.exitCode = sessionState.exitCode ?? 0;
+
+    if (result.exitCode !== 0) {
+      result.error = result.error ?? `cmux-pane subagent exited with code ${result.exitCode}`;
+      return result;
+    }
 
     if (options.closeCompletedCmuxPane === false) {
-      return result;
-    }
-
-    const idleWait = await waitForSessionIdleGrace({
-      sessionFile: result.sessionFile!,
-      exitMarkerPath: exitMarkerPath!,
-    });
-    if (!idleWait.idleReached) {
-      if (idleWait.exitCode !== null && idleWait.exitCode !== 0) {
-        result.exitCode = idleWait.exitCode;
-        result.error = result.error ?? `cmux-pane subagent exited with code ${idleWait.exitCode}`;
-      } else if (idleWait.timedOut) {
-        result.cmuxCloseError = "Timed out waiting for cmux-pane subagent to reach idle grace after final output";
-      }
-      return result;
-    }
-
-    if (idleWait.exitCode !== null && idleWait.exitCode !== 0) {
-      result.exitCode = idleWait.exitCode;
-      result.error = result.error ?? `cmux-pane subagent exited with code ${idleWait.exitCode}`;
       return result;
     }
 
