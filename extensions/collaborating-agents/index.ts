@@ -1958,10 +1958,16 @@ By default subagents use the same model as the spawning session.` ,
     return { block: true, reason: lines.join("\n") };
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     lastContext = ctx;
     config = loadConfig(ctx.cwd);
-    startedAt = new Date().toISOString();
+
+    // Pi 0.65+ removed session_switch/session_fork and now reloads the
+    // extension runtime for session replacement, then re-enters here with
+    // event.reason set to startup/reload/new/resume/fork.
+    if (event.reason !== "reload") {
+      startedAt = new Date().toISOString();
+    }
     localSessionFile = ctx.sessionManager.getSessionFile() ?? localSessionFile;
 
     if (!process.env.PI_AGENT_NAME) {
@@ -1970,32 +1976,6 @@ By default subagents use the same model as the spawning session.` ,
 
     if (!ensureRegistered(ctx)) return;
     startWatcher(ctx);
-    refreshRegistration(ctx);
-    syncFocusToCurrentSession(ctx);
-    startRemoteSessionAutoRefresh(ctx);
-    updateStatus(ctx);
-    flushPendingSubagentCompletionUpdates(ctx);
-  });
-
-  pi.on("session_switch", async (_event, ctx) => {
-    lastContext = ctx;
-    config = loadConfig(ctx.cwd);
-    localSessionFile = localSessionFile ?? ctx.sessionManager.getSessionFile() ?? localSessionFile;
-
-    if (!state.registered) {
-      if (!ensureRegistered(ctx)) return;
-    }
-    if (!state.watcher) startWatcher(ctx);
-    refreshRegistration(ctx);
-    syncFocusToCurrentSession(ctx);
-    startRemoteSessionAutoRefresh(ctx);
-    updateStatus(ctx);
-    flushPendingSubagentCompletionUpdates(ctx);
-  });
-
-  pi.on("session_fork", async (_event, ctx) => {
-    lastContext = ctx;
-    if (!state.registered) return;
     refreshRegistration(ctx);
     syncFocusToCurrentSession(ctx);
     startRemoteSessionAutoRefresh(ctx);
