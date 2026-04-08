@@ -898,8 +898,19 @@ async function waitForSettledSessionResult(args: {
     }
 
     const exitCode = readExitMarkerCode(args.exitMarkerPath);
-    if (exitCode !== null && exitCode !== 0) {
-      return { sessionId, terminalAssistantText, exitCode, timedOut: false };
+    if (exitCode !== null) {
+      if (exitCode !== 0) {
+        return { sessionId, terminalAssistantText, exitCode, timedOut: false };
+      }
+
+      // If the pane process has already exited cleanly, the session file is no
+      // longer changing. Once we have a terminal assistant message, return
+      // immediately instead of burning the full idle-grace budget. This keeps
+      // sequential synchronous cmux spawns fast while preserving the grace
+      // period for still-running panes that may emit more output.
+      if (terminalAssistantText !== undefined) {
+        return { sessionId, terminalAssistantText, exitCode, timedOut: false };
+      }
     }
 
     if (terminalAssistantText !== undefined && Date.now() - lastActivityAt >= idleGraceMs) {
