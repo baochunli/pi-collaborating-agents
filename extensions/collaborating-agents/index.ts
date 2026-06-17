@@ -63,6 +63,11 @@ import {
   getDefaultSubagentType,
 } from "./subagent-types.js";
 import { formatSessionTail, readSessionTail } from "./session-tail.js";
+import {
+  formatSubagentRunResolutionError,
+  formatSubagentSession,
+  formatSubagentSessions,
+} from "./session-actions.js";
 
 const STATUS_KEY = "collab";
 const WATCH_DEBOUNCE_MS = 40;
@@ -1252,6 +1257,32 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     setTimeout(poll, 500);
   }
 
+  function listRunsForCurrentAgent(limit: number, includeCompleted: boolean): SubagentRunRecord[] {
+    const currentAgentRuns = listSubagentRunRecords(dirs, {
+      parentAgent: state.agentName,
+      includeCompleted,
+      limit,
+    });
+    if (currentAgentRuns.length > 0) return currentAgentRuns;
+    return listSubagentRunRecords(dirs, { includeCompleted, limit });
+  }
+
+  function resolveRunRecordForTool(params: { to?: string; runId?: string; includeCompleted?: boolean }): ReturnType<typeof resolveSubagentRunRecord> {
+    const selector = params.runId?.trim() || params.to?.trim() || "latest";
+    return resolveSubagentRunRecord(dirs, selector, {
+      parentAgent: state.agentName,
+      includeCompleted: params.includeCompleted !== false,
+    });
+  }
+
+  function resolveSessionFileLazily(record: SubagentRunRecord): SubagentRunRecord {
+    if (record.sessionFile || !record.sessionId) return record;
+    const sessionFile = findSessionFileBySessionId(record.sessionId);
+    if (!sessionFile) return record;
+    updateRunRecordBestEffort(record.runId, record.name, { sessionFile });
+    return { ...record, sessionFile };
+  }
+
   function completeRunRecordBestEffort(runId: string, result: SpawnResult): void {
     const live = getAgentByName(dirs, result.name);
     const sessionId = result.sessionId ?? live?.sessionId;
@@ -1534,6 +1565,37 @@ Actions:
         return {
           content: [{ type: "text", text: `Active agents:\n${lines.join("\n")}` }],
           details: { action, agents: peers },
+        };
+      }
+
+      if (action === "sessions") {
+        const limit = normalizeLimit(params.limit, 20, 100);
+        const includeCompleted = params.includeCompleted !== false;
+        const records = listRunsForCurrentAgent(limit, includeCompleted);
+        return {
+          content: [{ type: "text", text: formatSubagentSessions(records) }],
+          details: { action, records, includeCompleted, limit },
+        };
+      }
+
+      if (action === "session") {
+        const resolved = resolveRunRecordForTool(params);
+        if (!resolved.ok) {
+          return {
+            content: [{ type: "text", text: formatSubagentRunResolutionError(resolved) }],
+            isError: true,
+            details: { action, error: resolved.reason, selector: resolved.selector, candidates: resolved.candidates },
+          };
+        }
+
+        const record = resolveSessionFileLazily(resolved.record);
+        const missingSessionFile = !record.sessionFile;
+        const suffix = missingSessionFile
+          ? "\n\nSession file is not available yet; try again after the subagent registers or emits output."
+          : "";
+        return {
+          content: [{ type: "text", text: `${formatSubagentSession(record)}${suffix}` }],
+          details: { action, record, missingSessionFile },
         };
       }
 

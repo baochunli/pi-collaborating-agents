@@ -137,7 +137,10 @@ export type AgentMessageAction =
   | "feed"
   | "thread"
   | "reserve"
-  | "release";
+  | "release"
+  | "sessions"
+  | "session"
+  | "tail";
 
 export interface RemoteTurnResult {
   assistantText: string;
