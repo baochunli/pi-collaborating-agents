@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, extname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Text, matchesKey, type TUI } from "@mariozechner/pi-tui";
@@ -70,6 +70,7 @@ import {
   formatSubagentType,
   getDefaultSubagentType,
 } from "./subagent-types.js";
+import { formatSessionTail, readSessionTail } from "./session-tail.js";
 
 const STATUS_KEY = "collab";
 const WATCH_DEBOUNCE_MS = 40;
@@ -104,6 +105,7 @@ const AGENT_MESSAGE_ACTIONS = [
   "list",
   "sessions",
   "session",
+  "tail",
   "send",
   "broadcast",
   "feed",
@@ -114,10 +116,10 @@ const AGENT_MESSAGE_ACTIONS = [
 
 const AgentMessageParams = Type.Object({
   action: StringEnum(AGENT_MESSAGE_ACTIONS, {
-    description: "Action: status | list | sessions | session | send | broadcast | feed | thread | reserve | release",
+    description: "Action: status | list | sessions | session | tail | send | broadcast | feed | thread | reserve | release",
   }),
-  to: Type.Optional(Type.String({ description: "Target agent name (send/thread) or subagent run selector (session)" })),
-  runId: Type.Optional(Type.String({ description: "Subagent run id selector for session action; takes precedence over to" })),
+  to: Type.Optional(Type.String({ description: "Target agent name (send/thread) or subagent run selector (session/tail)" })),
+  runId: Type.Optional(Type.String({ description: "Subagent run id selector for session/tail actions; takes precedence over to" })),
   message: Type.Optional(Type.String({ description: "Message text (required for send/broadcast)" })),
   replyTo: Type.Optional(Type.String({ description: "Reply message id (optional, for send)" })),
   urgent: Type.Optional(
@@ -127,6 +129,7 @@ const AgentMessageParams = Type.Object({
   ),
   limit: Type.Optional(Type.Number({ description: "Max messages or subagent runs to return, default 20" })),
   includeCompleted: Type.Optional(Type.Boolean({ description: "Include completed/failed subagent runs in sessions output" })),
+  raw: Type.Optional(Type.Boolean({ description: "For tail, include structured parsed entries in details" })),
   paths: Type.Optional(Type.Array(Type.String(), { description: "Reservation path patterns (reserve/release)" })),
   reason: Type.Optional(Type.String({ description: "Optional reservation reason (reserve)" })),
 });
@@ -158,10 +161,12 @@ interface AgentMessageSubagentRunParams {
   runId?: string;
   limit?: number;
   includeCompleted?: boolean;
+  raw?: boolean;
 }
 
 interface AgentMessageSubagentRunContext extends SubagentRunResolutionContext {
   now?: Date | string | number;
+  completedSubagents?: AgentRegistration[];
 }
 
 interface AgentMessageToolResponse {
@@ -475,6 +480,231 @@ export function handleAgentMessageSession(
       requestedTo: params.to,
       sessionFileResolved,
       record,
+    },
+  };
+}
+
+function looksLikeFilePath(selector: string | undefined): boolean {
+  if (!selector) return false;
+  return isAbsolute(selector) || selector.includes("/") || selector.includes("\\");
+}
+
+function tailError(args: {
+  error: string;
+  message: string;
+  requestedSelector: string;
+  params: AgentMessageSubagentRunParams;
+  record?: SubagentRunListRecord;
+  sessionFile?: string;
+  extraDetails?: Record<string, unknown>;
+}): AgentMessageToolResponse {
+  return {
+    content: [{ type: "text", text: args.message }],
+    isError: true,
+    details: {
+      action: "tail",
+      requestedSelector: args.requestedSelector,
+      requestedRunId: args.params.runId,
+      requestedTo: args.params.to,
+      error: args.error,
+      message: args.message,
+      record: args.record,
+      sessionFile: args.sessionFile,
+      ...args.extraDetails,
+    },
+  };
+}
+
+function completedRegistrationForRecord(
+  record: SubagentRunListRecord,
+  completedSubagents: AgentRegistration[] | undefined,
+): AgentRegistration | undefined {
+  if (!record.name || !completedSubagents?.length) return undefined;
+  return completedSubagents.find((agent) => agent.name === record.name);
+}
+
+function resolveTailSessionFile(
+  dirs: Dirs,
+  record: SubagentRunListRecord,
+  context: AgentMessageSubagentRunContext,
+): { sessionFile?: string; source?: string; resolved: boolean; record: SubagentRunListRecord } {
+  if (record.sessionFile) {
+    return { sessionFile: record.sessionFile, source: "run_record", resolved: false, record };
+  }
+
+  const registration = record.name ? readAgentRegistration(dirs, record.name) : undefined;
+  const completedRegistration = completedRegistrationForRecord(record, context.completedSubagents);
+  const sessionFile =
+    registration?.sessionFile ??
+    completedRegistration?.sessionFile ??
+    findSessionFileBySessionId(record.sessionId);
+  const source =
+    registration?.sessionFile
+      ? "registration"
+      : completedRegistration?.sessionFile
+        ? "completed_registration"
+        : sessionFile
+          ? "session_id"
+          : undefined;
+
+  if (!sessionFile) {
+    return { record, resolved: false };
+  }
+
+  const updated = updateSubagentRunRecordWith(dirs, record.recordId, (existing) => ({
+    sessionFile: existing.sessionFile ?? sessionFile,
+    sessionFileUnavailableReason: null,
+  }));
+  if (!updated) {
+    return { sessionFile, source, resolved: false, record: { ...record, sessionFile, sessionFileUnavailableReason: undefined } };
+  }
+
+  const refreshed = resolveScopedSubagentRunRecord(dirs, record.recordId, context);
+  return {
+    sessionFile,
+    source,
+    resolved: true,
+    record: refreshed.status === "ok" ? refreshed.record : { ...record, sessionFile, sessionFileUnavailableReason: undefined },
+  };
+}
+
+function validateSessionFilePath(sessionFile: string): { ok: true } | { ok: false; error: string; message: string } {
+  if (extname(sessionFile) !== ".jsonl") {
+    return {
+      ok: false,
+      error: "invalid_session_file",
+      message: `Resolved session file is not a Pi session JSONL file: ${sessionFile}`,
+    };
+  }
+
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(sessionFile);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    return {
+      ok: false,
+      error: err.code === "ENOENT" ? "session_file_missing" : "session_file_unreadable",
+      message: `Resolved session file is not readable: ${sessionFile}`,
+    };
+  }
+
+  if (!stats.isFile()) {
+    return {
+      ok: false,
+      error: "session_file_not_file",
+      message: `Resolved session path is not a file: ${sessionFile}`,
+    };
+  }
+
+  return { ok: true };
+}
+
+export function handleAgentMessageTail(
+  dirs: Dirs,
+  params: AgentMessageSubagentRunParams,
+  context: AgentMessageSubagentRunContext,
+): AgentMessageToolResponse {
+  const requestedSelector = params.runId?.trim() || params.to?.trim() || "latest";
+  if (!params.runId?.trim() && looksLikeFilePath(params.to?.trim())) {
+    return tailError({
+      error: "invalid_selector",
+      message: "agent_message tail does not accept file paths. Use a subagent run id, name, session id, or latest.",
+      requestedSelector,
+      params,
+    });
+  }
+
+  const resolved = params.runId?.trim()
+    ? resolveSubagentRunId(dirs, params.runId, context)
+    : resolveScopedSubagentRunRecord(dirs, requestedSelector, context);
+
+  if (resolved.status !== "ok") {
+    const error = resolved.status === "ambiguous" ? "ambiguous_selector" : "not_found";
+    const message = `${resolved.message}\n\nCandidates:\n${formatRunCandidateList(resolved.candidates)}`;
+    return tailError({
+      error,
+      message,
+      requestedSelector,
+      params,
+      extraDetails: { candidates: resolved.candidates },
+    });
+  }
+
+  const session = resolveTailSessionFile(dirs, resolved.record, context);
+  const record = session.record;
+  const sessionFile = session.sessionFile;
+  if (!sessionFile) {
+    const reason = record.sessionFileUnavailableReason ?? "No session file is available for this subagent run yet.";
+    return tailError({
+      error: "session_file_unavailable",
+      message: `Session file is unavailable for ${record.recordId}: ${reason}`,
+      requestedSelector,
+      params,
+      record,
+    });
+  }
+
+  const validation = validateSessionFilePath(sessionFile);
+  if (!validation.ok) {
+    return tailError({
+      error: validation.error,
+      message: validation.message,
+      requestedSelector,
+      params,
+      record,
+      sessionFile,
+    });
+  }
+
+  const limit = normalizeSubagentSessionLimit(params.limit);
+  let tail;
+  try {
+    tail = readSessionTail(sessionFile, { maxLines: limit });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return tailError({
+      error: "session_file_unreadable",
+      message: `Failed to read session file for ${record.recordId}: ${message}`,
+      requestedSelector,
+      params,
+      record,
+      sessionFile,
+    });
+  }
+
+  const formatted = formatSessionTail(tail.entries, { runStatus: record.status });
+  const malformed = tail.malformedLineCount > 0 ? `\nMalformed JSONL lines skipped: ${tail.malformedLineCount}` : "";
+  const truncated = tail.truncatedStart ? "\nStart of file was truncated before parsing." : "";
+  const rawNote = params.raw === true ? "\nStructured entries are available in details." : "";
+  return {
+    content: [
+      {
+        type: "text",
+        text: [
+          `Subagent tail ${record.recordId} (${formatRunName(record)})`,
+          `Session file: ${sessionFile}`,
+          "",
+          formatted || "(no parsed session events)",
+          `${malformed}${truncated}${rawNote}`,
+        ].filter((line) => line.length > 0).join("\n"),
+      },
+    ],
+    details: {
+      action: "tail",
+      requestedSelector,
+      requestedRunId: params.runId,
+      requestedTo: params.to,
+      raw: params.raw === true,
+      limit,
+      record,
+      sessionFile,
+      sessionFileResolved: session.resolved,
+      sessionFileSource: session.source,
+      entries: tail.entries,
+      malformedLineCount: tail.malformedLineCount,
+      bytesRead: tail.bytesRead,
+      truncatedStart: tail.truncatedStart,
     },
   };
 }
@@ -1846,6 +2076,7 @@ Actions:
 - list: List active agents
 - sessions: List scoped subagent run/session records
 - session: Resolve one subagent run/session record
+- tail: Read a concise transcript tail for one subagent run/session
 - send: Send direct message to one active agent (set urgent: true to interrupt immediately)
 - broadcast: Send message to all active peers (set urgent: true to interrupt immediately)
 - feed: Read recent global messages
@@ -1934,6 +2165,15 @@ Actions:
           parentAgent: state.agentName,
           parentSessionId: ctx.sessionManager.getSessionId(),
           parentPid: process.pid,
+        });
+      }
+
+      if (action === "tail") {
+        return handleAgentMessageTail(dirs, params, {
+          parentAgent: state.agentName,
+          parentSessionId: ctx.sessionManager.getSessionId(),
+          parentPid: process.pid,
+          completedSubagents: state.completedSubagents,
         });
       }
 

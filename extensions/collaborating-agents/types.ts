@@ -158,6 +158,7 @@ export type AgentMessageAction =
   | "list"
   | "sessions"
   | "session"
+  | "tail"
   | "send"
   | "broadcast"
   | "feed"

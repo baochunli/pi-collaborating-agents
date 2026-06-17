@@ -11,8 +11,9 @@ import type {
 import collaboratingAgentsExtension, {
   handleAgentMessageSession,
   handleAgentMessageSessions,
+  handleAgentMessageTail,
 } from "./index.ts";
-import { listSubagentRunRecords, updateSubagentRunRecord, writeSubagentRunRecord } from "./store.ts";
+import { listSubagentRunRecords, registerSelf, updateSubagentRunRecord, writeSubagentRunRecord } from "./store.ts";
 import type { Dirs, SubagentRunListRecord, SubagentRunRecord } from "./types.ts";
 
 const tempDirs: string[] = [];
@@ -162,6 +163,15 @@ function makeRunRecord(overrides: Partial<SubagentRunRecord> = {}): SubagentRunR
 
 function listRecords(stateDir: string): SubagentRunListRecord[] {
   return listSubagentRunRecords(makeDirs(stateDir));
+}
+
+function writeSessionJsonl(filePath: string, events: unknown[]): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(
+    filePath,
+    `${events.map((event) => typeof event === "string" ? event : JSON.stringify(event)).join("\n")}\n`,
+    "utf-8",
+  );
 }
 
 async function waitFor<T>(fn: () => T | undefined | false, timeoutMs = 3000): Promise<T> {
@@ -548,7 +558,249 @@ describe("agent_message subagent sessions", () => {
     expect(JSON.stringify((byName.details as { candidates?: unknown }).candidates)).not.toContain("other-worker");
   });
 
-  test("agent_message accepts sessions and session actions", async () => {
+  test("tail returns formatted output and raw details from a scoped run record", () => {
+    const tempDir = makeTempDir("collab-index-tail-formatted");
+    const stateDir = path.join(tempDir, "state");
+    const dirs = makeDirs(stateDir);
+    const sessionFile = path.join(tempDir, "worker-session.jsonl");
+    writeSessionJsonl(sessionFile, [
+      { type: "session", id: "tail-session", timestamp: "2026-01-04T00:00:00.000Z" },
+      "{bad",
+      {
+        type: "message",
+        timestamp: "2026-01-04T00:00:01.000Z",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I will inspect the file" },
+            { type: "toolCall", id: "tool-1", name: "read", arguments: { path: "README.md" } },
+          ],
+          stopReason: "toolUse",
+        },
+      },
+      {
+        type: "message_end",
+        timestamp: "2026-01-04T00:00:02.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+      },
+    ]);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "tail-run",
+      batchRunId: "tail-batch",
+      name: "worker-tail",
+      displayName: "Worker Tail",
+      status: "completed",
+      sessionId: "tail-session",
+      sessionFile,
+      completedAt: "2026-01-04T00:00:03.000Z",
+      lastSeenAt: "2026-01-04T00:00:03.000Z",
+    }))).toBe(true);
+
+    const result = handleAgentMessageTail(dirs, { runId: "tail-run", raw: true, limit: 10 }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:04.000Z",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]?.text).toContain("Subagent tail tail-run");
+    expect(result.content[0]?.text).toContain("assistant: I will inspect the file");
+    expect(result.content[0]?.text).toContain("assistant final: done");
+    expect(result.content[0]?.text).not.toContain("assistant final: I will inspect the file");
+    expect(result.details).toMatchObject({
+      action: "tail",
+      raw: true,
+      limit: 10,
+      malformedLineCount: 1,
+      truncatedStart: false,
+      record: { recordId: "tail-run" },
+      sessionFile,
+      entries: [
+        { kind: "session", sessionId: "tail-session" },
+        { kind: "assistant_text", text: "I will inspect the file" },
+        { kind: "assistant_tool_call", toolName: "read" },
+        { kind: "stop", stopReason: "toolUse" },
+        { kind: "assistant_text", text: "done" },
+      ],
+    });
+  });
+
+  test("tail uses runId precedence, normalizes limit, and refuses arbitrary paths", () => {
+    const tempDir = makeTempDir("collab-index-tail-precedence");
+    const stateDir = path.join(tempDir, "state");
+    const dirs = makeDirs(stateDir);
+    const targetSessionFile = path.join(tempDir, "target.jsonl");
+    const selectorSessionFile = path.join(tempDir, "selector.jsonl");
+    writeSessionJsonl(targetSessionFile, [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "target done" }] } },
+    ]);
+    writeSessionJsonl(selectorSessionFile, [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "selector done" }] } },
+    ]);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "target-run",
+      batchRunId: "batch-target",
+      name: "target-worker",
+      displayName: "Target Worker",
+      status: "completed",
+      sessionFile: targetSessionFile,
+      lastSeenAt: "2026-01-04T00:00:00.000Z",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "selector-run",
+      batchRunId: "batch-selector",
+      name: "selector-worker",
+      displayName: "Selector Worker",
+      status: "completed",
+      sessionFile: selectorSessionFile,
+      lastSeenAt: "2026-01-05T00:00:00.000Z",
+    }))).toBe(true);
+
+    const byRunId = handleAgentMessageTail(dirs, { runId: "target-run", to: "selector-worker", limit: 1000 }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-05T00:00:00.000Z",
+    });
+    expect(byRunId.details).toMatchObject({
+      action: "tail",
+      limit: 100,
+      record: { recordId: "target-run" },
+    });
+    expect(byRunId.content[0]?.text).toContain("target done");
+    expect(byRunId.content[0]?.text).not.toContain("selector done");
+
+    const pathAttempt = handleAgentMessageTail(dirs, { to: targetSessionFile }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-05T00:00:00.000Z",
+    });
+    expect(pathAttempt.isError).toBe(true);
+    expect(pathAttempt.details).toMatchObject({ action: "tail", error: "invalid_selector" });
+    expect(pathAttempt.content[0]?.text).toContain("does not accept file paths");
+  });
+
+  test("tail resolves session files from active registration metadata", () => {
+    const tempDir = makeTempDir("collab-index-tail-registration");
+    const stateDir = path.join(tempDir, "state");
+    const dirs = makeDirs(stateDir);
+    const sessionFile = path.join(tempDir, "registered-session.jsonl");
+    writeSessionJsonl(sessionFile, [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "registered done" }] } },
+    ]);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "registered-run",
+      batchRunId: "batch-registered",
+      name: "worker-registered",
+      displayName: "Worker Registered",
+      sessionId: "registered-session",
+      sessionFileUnavailableReason: "waiting for registration",
+    }))).toBe(true);
+    expect(registerSelf(dirs, {
+      name: "worker-registered",
+      pid: process.pid,
+      sessionId: "registered-session",
+      sessionFile,
+      cwd: tempDir,
+      model: "fake/model",
+      startedAt: "2026-01-04T00:00:00.000Z",
+      lastSeenAt: "2026-01-04T00:00:00.000Z",
+      role: "subagent",
+    })).toBe(true);
+
+    const result = handleAgentMessageTail(dirs, { runId: "registered-run" }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:00.000Z",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]?.text).toContain("registered done");
+    expect(result.details).toMatchObject({
+      action: "tail",
+      sessionFile,
+      sessionFileResolved: true,
+      sessionFileSource: "registration",
+      record: { recordId: "registered-run", sessionFile },
+    });
+    expect(listRecords(stateDir).find((record) => record.recordId === "registered-run")?.sessionFile).toBe(sessionFile);
+  });
+
+  test("tail returns helpful errors for unavailable, deleted, and invalid session files", () => {
+    const tempDir = makeTempDir("collab-index-tail-errors");
+    const stateDir = path.join(tempDir, "state");
+    const dirs = makeDirs(stateDir);
+    const missingFile = path.join(tempDir, "missing.jsonl");
+    const invalidFile = path.join(tempDir, "not-session.txt");
+    fs.writeFileSync(invalidFile, "not jsonl", "utf-8");
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "unavailable-run",
+      batchRunId: "batch-unavailable",
+      name: "worker-unavailable",
+      sessionId: "unavailable-session",
+      sessionFileUnavailableReason: "process mode has not reported a session file",
+      lastSeenAt: "2026-01-04T00:00:00.000Z",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "missing-run",
+      batchRunId: "batch-missing",
+      name: "worker-missing",
+      sessionId: "missing-session",
+      sessionFile: missingFile,
+      lastSeenAt: "2026-01-03T00:00:00.000Z",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "invalid-run",
+      batchRunId: "batch-invalid",
+      name: "worker-invalid",
+      sessionId: "invalid-session",
+      sessionFile: invalidFile,
+      lastSeenAt: "2026-01-02T00:00:00.000Z",
+    }))).toBe(true);
+
+    const context = {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:00.000Z",
+    };
+
+    const unavailable = handleAgentMessageTail(dirs, { runId: "unavailable-run" }, context);
+    expect(unavailable.isError).toBe(true);
+    expect(unavailable.details).toMatchObject({
+      action: "tail",
+      error: "session_file_unavailable",
+      record: { recordId: "unavailable-run" },
+    });
+    expect(unavailable.content[0]?.text).toContain("process mode has not reported a session file");
+
+    const missing = handleAgentMessageTail(dirs, { runId: "missing-run" }, context);
+    expect(missing.isError).toBe(true);
+    expect(missing.details).toMatchObject({
+      action: "tail",
+      error: "session_file_missing",
+      sessionFile: missingFile,
+      record: { recordId: "missing-run" },
+    });
+
+    const invalid = handleAgentMessageTail(dirs, { runId: "invalid-run" }, context);
+    expect(invalid.isError).toBe(true);
+    expect(invalid.details).toMatchObject({
+      action: "tail",
+      error: "invalid_session_file",
+      sessionFile: invalidFile,
+      record: { recordId: "invalid-run" },
+    });
+  });
+
+  test("agent_message accepts sessions, session, and tail actions", async () => {
     const tempDir = makeTempDir("collab-index-session-tool");
     process.env.HOME = tempDir;
     process.env.USERPROFILE = tempDir;
@@ -567,6 +819,10 @@ describe("agent_message subagent sessions", () => {
     const session = await agentMessageTool.execute("tool-call-session", { action: "session" }, undefined, undefined, ctx);
     expect(session.isError).toBe(true);
     expect(session.details).toMatchObject({ action: "session", error: "not_found" });
+
+    const tail = await agentMessageTool.execute("tool-call-tail", { action: "tail" }, undefined, undefined, ctx);
+    expect(tail.isError).toBe(true);
+    expect(tail.details).toMatchObject({ action: "tail", error: "not_found" });
 
     await Promise.all((harness.handlers.get("session_shutdown") ?? []).map((handler) => handler(undefined, ctx)));
   });
