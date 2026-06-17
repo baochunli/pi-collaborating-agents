@@ -67,7 +67,45 @@ export interface Dirs {
   registry: string;
   inbox: string;
   messageLog: string;
+  runs: string;
 }
+
+export type SubagentRunStatus = "launching" | "running" | "completed" | "failed";
+
+export interface SubagentRunRecord {
+  runId: string;
+  parentAgent: string;
+  name: string;
+  type: string;
+  task: string;
+  status: SubagentRunStatus;
+  sessionId?: string;
+  sessionFile?: string;
+  cwd: string;
+  model?: string;
+  launchMode: SubagentLaunchMode;
+  startedAt: string;
+  lastSeenAt: string;
+  completedAt?: string;
+  exitCode?: number;
+  outputPreview?: string;
+}
+
+export interface ListSubagentRunRecordsOptions {
+  parentAgent?: string;
+  includeCompleted?: boolean;
+  limit?: number;
+}
+
+export type ResolveSubagentRunRecordResult =
+  | { ok: true; record: SubagentRunRecord }
+  | {
+      ok: false;
+      reason: "not_found" | "ambiguous";
+      selector: string;
+      message: string;
+      candidates: SubagentRunRecord[];
+    };
 
 export interface ExtensionState {
   agentName: string;

@@ -6,19 +6,23 @@ import {
   formatAgentDisplayName,
   getConflictsWithOtherAgents,
   listActiveAgents,
+  listSubagentRunRecords,
   pathMatchesReservation,
   processInbox,
   readMessageLog,
   readMessageLogTail,
   registerSelf,
   resolveActiveAgentName,
+  resolveSubagentRunRecord,
   resolveThreadPeerName,
   sendBroadcast,
   sendDirect,
   unregisterSelf,
   updateSelfHeartbeat,
+  updateSubagentRunRecord,
+  writeSubagentRunRecord,
 } from "./store.ts";
-import type { AgentRegistration, Dirs, InboxMessage, MessageLogEvent } from "./types.ts";
+import type { AgentRegistration, Dirs, InboxMessage, MessageLogEvent, SubagentRunRecord } from "./types.ts";
 
 const DEAD_PID = 99_999_999;
 
@@ -40,6 +44,7 @@ function makeDirs(prefix: string): Dirs {
     registry: path.join(base, "registry"),
     inbox: path.join(base, "inbox"),
     messageLog: path.join(base, "messages.jsonl"),
+    runs: path.join(base, "runs"),
   };
 }
 
@@ -68,6 +73,23 @@ function writeInboxMessageFile(dirs: Dirs, agentName: string, fileName: string, 
   const fullPath = path.join(dir, fileName);
   fs.writeFileSync(fullPath, JSON.stringify(payload, null, 2), "utf-8");
   return fullPath;
+}
+
+function makeRunRecord(overrides: Partial<SubagentRunRecord> & Pick<SubagentRunRecord, "runId" | "name">): SubagentRunRecord {
+  const now = new Date().toISOString();
+  return {
+    runId: overrides.runId,
+    parentAgent: "Coordinator",
+    name: overrides.name,
+    type: "worker",
+    task: "Test task",
+    status: "running",
+    cwd: process.cwd(),
+    launchMode: "process",
+    startedAt: now,
+    lastSeenAt: now,
+    ...overrides,
+  };
 }
 
 describe("store reservation matching", () => {
@@ -159,6 +181,162 @@ describe("store registration ownership", () => {
     const listed = listActiveAgents(dirs);
     expect(listed.map((a) => a.name)).toEqual(["AliveAgent"]);
     expect(fs.existsSync(path.join(dirs.registry, "DeadAgent.json"))).toBe(false);
+  });
+});
+
+describe("store subagent run registry", () => {
+  test("writes, updates, lists newest first, and safely ignores corrupted run files", () => {
+    const dirs = makeDirs("collab-store-runs-list");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          runId: "run-alpha-1234",
+          name: "reviewer-abcd-SunnyBreeze",
+          sessionId: "session-alpha-123",
+          task: "Review the auth flow",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          lastSeenAt: "2026-01-01T00:01:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+
+    fs.writeFileSync(path.join(dirs.runs, "not-json.json"), "{this is not json", "utf-8");
+    fs.writeFileSync(path.join(dirs.runs, "invalid-shape.json"), JSON.stringify({ runId: "bad" }), "utf-8");
+
+    expect(
+      updateSubagentRunRecord(dirs, "run-alpha-1234", "reviewer-abcd-SunnyBreeze", {
+        status: "completed",
+        completedAt: "2026-01-01T00:02:00.000Z",
+        outputPreview: "Looks good",
+      }),
+    ).toBe(true);
+
+    const records = listSubagentRunRecords(dirs);
+    expect(records.map((record) => record.runId)).toEqual(["run-alpha-1234"]);
+    expect(records[0]).toMatchObject({
+      runId: "run-alpha-1234",
+      name: "reviewer-abcd-SunnyBreeze",
+      status: "completed",
+      task: "Review the auth flow",
+      sessionId: "session-alpha-123",
+      completedAt: "2026-01-01T00:02:00.000Z",
+      outputPreview: "Looks good",
+    });
+    expect(records[0]!.lastSeenAt).not.toBe("2026-01-01T00:01:00.000Z");
+  });
+
+  test("resolves runs by latest, exact name, name prefix, session id prefix, and run id prefix", () => {
+    const dirs = makeDirs("collab-store-runs-resolve");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          runId: "run-older-1111",
+          name: "worker-abcd-NorthStar",
+          sessionId: "session-old-000",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          lastSeenAt: "2026-01-01T00:05:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          runId: "run-newer-2222",
+          name: "reviewer-efgh-SunnyBreeze",
+          sessionId: "session-new-999",
+          startedAt: "2026-01-01T00:10:00.000Z",
+          lastSeenAt: "2026-01-01T00:15:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+
+    expect(resolveSubagentRunRecord(dirs, "latest")).toMatchObject({ ok: true, record: { runId: "run-newer-2222" } });
+    expect(resolveSubagentRunRecord(dirs, "worker-abcd-NorthStar")).toMatchObject({ ok: true, record: { runId: "run-older-1111" } });
+    expect(resolveSubagentRunRecord(dirs, "reviewer-ef")).toMatchObject({ ok: true, record: { runId: "run-newer-2222" } });
+    expect(resolveSubagentRunRecord(dirs, "session-new")).toMatchObject({ ok: true, record: { runId: "run-newer-2222" } });
+    expect(resolveSubagentRunRecord(dirs, "run-old")).toMatchObject({ ok: true, record: { runId: "run-older-1111" } });
+  });
+
+  test("latest prefers the requested parent agent and falls back to newest overall", () => {
+    const dirs = makeDirs("collab-store-runs-latest-parent");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          runId: "run-parent-a",
+          parentAgent: "CoordinatorA",
+          name: "worker-a",
+          startedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          runId: "run-parent-b",
+          parentAgent: "CoordinatorB",
+          name: "worker-b",
+          startedAt: "2026-01-01T00:10:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+
+    expect(resolveSubagentRunRecord(dirs, "latest", { parentAgent: "CoordinatorA" })).toMatchObject({
+      ok: true,
+      record: { runId: "run-parent-a" },
+    });
+    expect(resolveSubagentRunRecord(dirs, "latest", { parentAgent: "Missing" })).toMatchObject({
+      ok: true,
+      record: { runId: "run-parent-b" },
+    });
+  });
+
+  test("returns candidate records for ambiguous and unknown run selectors", () => {
+    const dirs = makeDirs("collab-store-runs-ambiguous");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          runId: "run-alpha-1111",
+          name: "worker-alpha-SunnyBreeze",
+          sessionId: "session-alpha-111",
+          startedAt: "2026-01-01T00:05:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          runId: "run-beta-2222",
+          name: "worker-beta-SunnyBreeze",
+          sessionId: "session-beta-222",
+          startedAt: "2026-01-01T00:10:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+
+    const ambiguous = resolveSubagentRunRecord(dirs, "worker");
+    expect(ambiguous.ok).toBe(false);
+    if (ambiguous.ok) throw new Error("expected ambiguous selector to fail");
+    expect(ambiguous.reason).toBe("ambiguous");
+    expect(ambiguous.message).toContain("ambiguous");
+    expect(ambiguous.candidates.map((record) => record.runId)).toEqual(["run-beta-2222", "run-alpha-1111"]);
+
+    const unknown = resolveSubagentRunRecord(dirs, "missing");
+    expect(unknown.ok).toBe(false);
+    if (unknown.ok) throw new Error("expected unknown selector to fail");
+    expect(unknown.reason).toBe("not_found");
+    expect(unknown.message).toContain("No subagent run found");
+    expect(unknown.candidates.map((record) => record.runId)).toEqual(["run-beta-2222", "run-alpha-1111"]);
   });
 });
 

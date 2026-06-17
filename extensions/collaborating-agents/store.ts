@@ -7,8 +7,11 @@ import type {
   Dirs,
   FileReservation,
   InboxMessage,
+  ListSubagentRunRecordsOptions,
   MessageLogEvent,
   ReservationConflict,
+  ResolveSubagentRunRecordResult,
+  SubagentRunRecord,
 } from "./types.js";
 
 const LOCK_RETRY_MS = 25;
@@ -79,6 +82,33 @@ function isValidRegistration(reg: unknown): reg is AgentRegistration {
   );
 }
 
+function isValidSubagentRunRecord(record: unknown): record is SubagentRunRecord {
+  if (!record || typeof record !== "object") return false;
+  const r = record as Record<string, unknown>;
+  const statusValid =
+    r.status === "launching" || r.status === "running" || r.status === "completed" || r.status === "failed";
+  const launchModeValid = r.launchMode === "process" || r.launchMode === "cmux-pane";
+
+  return (
+    typeof r.runId === "string" &&
+    typeof r.parentAgent === "string" &&
+    typeof r.name === "string" &&
+    typeof r.type === "string" &&
+    typeof r.task === "string" &&
+    statusValid &&
+    (typeof r.sessionId === "undefined" || typeof r.sessionId === "string") &&
+    (typeof r.sessionFile === "undefined" || typeof r.sessionFile === "string") &&
+    typeof r.cwd === "string" &&
+    (typeof r.model === "undefined" || typeof r.model === "string") &&
+    launchModeValid &&
+    typeof r.startedAt === "string" &&
+    typeof r.lastSeenAt === "string" &&
+    (typeof r.completedAt === "undefined" || typeof r.completedAt === "string") &&
+    (typeof r.exitCode === "undefined" || typeof r.exitCode === "number") &&
+    (typeof r.outputPreview === "undefined" || typeof r.outputPreview === "string")
+  );
+}
+
 function isValidInboxMessage(msg: unknown): msg is InboxMessage {
   if (!msg || typeof msg !== "object") return false;
   const m = msg as Record<string, unknown>;
@@ -112,6 +142,18 @@ function registrationLockPath(dirs: Dirs, agentName: string): string {
 
 function inboxDir(dirs: Dirs, agentName: string): string {
   return join(dirs.inbox, agentName);
+}
+
+function safeRunFilePart(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 120) || "unknown";
+}
+
+function runRecordPath(dirs: Dirs, runId: string, agentName: string): string {
+  return join(dirs.runs, `${safeRunFilePart(runId)}-${safeRunFilePart(agentName)}.json`);
+}
+
+function runRecordLockPath(dirs: Dirs, runId: string, agentName: string): string {
+  return `${runRecordPath(dirs, runId, agentName)}.lock`;
 }
 
 function readLockOwner(lockDir: string): { pid?: number; acquiredAt?: number } | null {
@@ -216,6 +258,27 @@ function writeFileAtomic(path: string, content: string): boolean {
   }
 }
 
+function runRecordTimestamp(record: SubagentRunRecord): number {
+  const started = Date.parse(record.startedAt);
+  if (Number.isFinite(started)) return started;
+  const lastSeen = Date.parse(record.lastSeenAt);
+  return Number.isFinite(lastSeen) ? lastSeen : 0;
+}
+
+function sortRunRecordsNewestFirst(records: SubagentRunRecord[]): SubagentRunRecord[] {
+  return [...records].sort((a, b) => {
+    const byTime = runRecordTimestamp(b) - runRecordTimestamp(a);
+    if (byTime !== 0) return byTime;
+    const bySeen = Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt);
+    if (Number.isFinite(bySeen) && bySeen !== 0) return bySeen;
+    return `${b.runId}:${b.name}`.localeCompare(`${a.runId}:${a.name}`);
+  });
+}
+
+function truncateCandidates(records: SubagentRunRecord[], limit = 10): SubagentRunRecord[] {
+  return records.slice(0, Math.max(1, limit));
+}
+
 function removeRegistrationIfStillDead(filePath: string, expected: AgentRegistration): void {
   const release = acquireLockSync(`${filePath}.lock`, 250);
   if (!release) return;
@@ -235,6 +298,177 @@ function removeRegistrationIfStillDead(filePath: string, expected: AgentRegistra
   } finally {
     release();
   }
+}
+
+export function writeSubagentRunRecord(dirs: Dirs, record: SubagentRunRecord): boolean {
+  ensureDirSync(dirs.base);
+  ensureDirSync(dirs.runs);
+
+  const path = runRecordPath(dirs, record.runId, record.name);
+  const release = acquireLockSync(runRecordLockPath(dirs, record.runId, record.name));
+  if (!release) return false;
+
+  try {
+    return writeFileAtomic(path, JSON.stringify(record, null, 2));
+  } finally {
+    release();
+  }
+}
+
+export function updateSubagentRunRecord(
+  dirs: Dirs,
+  runId: string,
+  name: string,
+  patch: Partial<SubagentRunRecord>,
+): boolean {
+  ensureDirSync(dirs.base);
+  ensureDirSync(dirs.runs);
+
+  const path = runRecordPath(dirs, runId, name);
+  const release = acquireLockSync(runRecordLockPath(dirs, runId, name));
+  if (!release) return false;
+
+  try {
+    const existing = readJsonFile<unknown>(path);
+    if (!existing || !isValidSubagentRunRecord(existing)) return false;
+
+    const updated: SubagentRunRecord = {
+      ...existing,
+      ...patch,
+      runId: patch.runId ?? existing.runId,
+      name: patch.name ?? existing.name,
+      lastSeenAt: patch.lastSeenAt ?? new Date().toISOString(),
+    };
+
+    if (!isValidSubagentRunRecord(updated)) return false;
+
+    const nextPath = runRecordPath(dirs, updated.runId, updated.name);
+    const wrote = writeFileAtomic(nextPath, JSON.stringify(updated, null, 2));
+    if (wrote && nextPath !== path) {
+      try {
+        fs.unlinkSync(path);
+      } catch {
+        // best effort
+      }
+    }
+    return wrote;
+  } finally {
+    release();
+  }
+}
+
+export function listSubagentRunRecords(
+  dirs: Dirs,
+  options: ListSubagentRunRecordsOptions = {},
+): SubagentRunRecord[] {
+  ensureDirSync(dirs.runs);
+
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(dirs.runs);
+  } catch {
+    return [];
+  }
+
+  const includeCompleted = options.includeCompleted !== false;
+  const records: SubagentRunRecord[] = [];
+
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    const parsed = readJsonFile<unknown>(join(dirs.runs, entry));
+    if (!parsed || !isValidSubagentRunRecord(parsed)) continue;
+    if (options.parentAgent && parsed.parentAgent !== options.parentAgent) continue;
+    if (!includeCompleted && (parsed.status === "completed" || parsed.status === "failed")) continue;
+    records.push(parsed);
+  }
+
+  const sorted = sortRunRecordsNewestFirst(records);
+  if (typeof options.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
+    return sorted.slice(0, Math.floor(options.limit));
+  }
+  return sorted;
+}
+
+export function resolveSubagentRunRecord(
+  dirs: Dirs,
+  selector: string,
+  options: ListSubagentRunRecordsOptions = {},
+): ResolveSubagentRunRecordResult {
+  const normalizedSelector = selector.trim();
+  const allRecords = listSubagentRunRecords(dirs, {
+    includeCompleted: options.includeCompleted ?? true,
+    limit: options.limit,
+  });
+
+  const recordsForLatest = options.parentAgent
+    ? listSubagentRunRecords(dirs, { ...options, parentAgent: options.parentAgent, includeCompleted: options.includeCompleted ?? true })
+    : allRecords;
+
+  if (normalizedSelector === "latest") {
+    const preferred = recordsForLatest[0] ?? allRecords[0];
+    if (preferred) return { ok: true, record: preferred };
+    return {
+      ok: false,
+      reason: "not_found",
+      selector: normalizedSelector,
+      message: "No subagent run records found.",
+      candidates: [],
+    };
+  }
+
+  if (!normalizedSelector) {
+    return {
+      ok: false,
+      reason: "not_found",
+      selector: normalizedSelector,
+      message: "No subagent run selector provided.",
+      candidates: truncateCandidates(allRecords),
+    };
+  }
+
+  const exactMatches = allRecords.filter(
+    (record) =>
+      record.name === normalizedSelector ||
+      record.runId === normalizedSelector ||
+      record.sessionId === normalizedSelector,
+  );
+
+  if (exactMatches.length === 1) return { ok: true, record: exactMatches[0]! };
+  if (exactMatches.length > 1) {
+    return {
+      ok: false,
+      reason: "ambiguous",
+      selector: normalizedSelector,
+      message: `Selector '${normalizedSelector}' matches multiple subagent runs. Use a longer name, run id, or session id prefix.`,
+      candidates: exactMatches,
+    };
+  }
+
+  const prefixMatches = allRecords.filter(
+    (record) =>
+      record.name.startsWith(normalizedSelector) ||
+      record.runId.startsWith(normalizedSelector) ||
+      (record.sessionId?.startsWith(normalizedSelector) ?? false),
+  );
+
+  if (prefixMatches.length === 1) return { ok: true, record: prefixMatches[0]! };
+  if (prefixMatches.length > 1) {
+    return {
+      ok: false,
+      reason: "ambiguous",
+      selector: normalizedSelector,
+      message: `Selector '${normalizedSelector}' is ambiguous. Use a longer name, run id, or session id prefix.`,
+      candidates: prefixMatches,
+    };
+  }
+
+  return {
+    ok: false,
+    reason: "not_found",
+    selector: normalizedSelector,
+    message: `No subagent run found for '${normalizedSelector}'.`,
+    candidates: truncateCandidates(allRecords),
+  };
 }
 
 export function registerSelf(dirs: Dirs, registration: AgentRegistration): boolean {
