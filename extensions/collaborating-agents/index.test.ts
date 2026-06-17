@@ -732,12 +732,64 @@ describe("agent_message subagent sessions", () => {
     expect(listRecords(stateDir).find((record) => record.recordId === "registered-run")?.sessionFile).toBe(sessionFile);
   });
 
-  test("tail returns helpful errors for unavailable, deleted, and invalid session files", () => {
+  test("tail ignores registration session files that do not match the run session id", () => {
+    const tempDir = makeTempDir("collab-index-tail-registration-mismatch");
+    const stateDir = path.join(tempDir, "state");
+    const dirs = makeDirs(stateDir);
+    const wrongSessionFile = path.join(tempDir, "wrong-session.jsonl");
+    writeSessionJsonl(wrongSessionFile, [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "wrong transcript" }] } },
+    ]);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "mismatch-run",
+      batchRunId: "batch-mismatch",
+      name: "worker-mismatch",
+      displayName: "Worker Mismatch",
+      sessionId: "expected-session",
+      sessionFileUnavailableReason: "waiting for matching registration",
+    }))).toBe(true);
+    expect(registerSelf(dirs, {
+      name: "worker-mismatch",
+      pid: process.pid,
+      sessionId: "wrong-session",
+      sessionFile: wrongSessionFile,
+      cwd: tempDir,
+      model: "fake/model",
+      startedAt: "2026-01-04T00:00:00.000Z",
+      lastSeenAt: "2026-01-04T00:00:00.000Z",
+      role: "subagent",
+    })).toBe(true);
+
+    const result = handleAgentMessageTail(dirs, { runId: "mismatch-run" }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:00.000Z",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("waiting for matching registration");
+    expect(result.content[0]?.text).not.toContain("wrong transcript");
+    expect(result.details).toMatchObject({
+      action: "tail",
+      error: "session_file_unavailable",
+      record: { recordId: "mismatch-run" },
+    });
+    expect(listRecords(stateDir).find((record) => record.recordId === "mismatch-run")?.sessionFile).toBeUndefined();
+  });
+
+  test("tail returns helpful errors for unavailable, deleted, unreadable, and invalid session files", () => {
     const tempDir = makeTempDir("collab-index-tail-errors");
     const stateDir = path.join(tempDir, "state");
     const dirs = makeDirs(stateDir);
     const missingFile = path.join(tempDir, "missing.jsonl");
+    const unreadableFile = path.join(tempDir, "unreadable.jsonl");
     const invalidFile = path.join(tempDir, "not-session.txt");
+    writeSessionJsonl(unreadableFile, [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "unreadable" }] } },
+    ]);
+    fs.chmodSync(unreadableFile, 0o000);
     fs.writeFileSync(invalidFile, "not jsonl", "utf-8");
 
     expect(writeSubagentRunRecord(dirs, makeRunRecord({
@@ -763,6 +815,14 @@ describe("agent_message subagent sessions", () => {
       sessionId: "invalid-session",
       sessionFile: invalidFile,
       lastSeenAt: "2026-01-02T00:00:00.000Z",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "unreadable-run",
+      batchRunId: "batch-unreadable",
+      name: "worker-unreadable",
+      sessionId: "unreadable-session",
+      sessionFile: unreadableFile,
+      lastSeenAt: "2026-01-01T00:00:00.000Z",
     }))).toBe(true);
 
     const context = {
@@ -797,6 +857,16 @@ describe("agent_message subagent sessions", () => {
       error: "invalid_session_file",
       sessionFile: invalidFile,
       record: { recordId: "invalid-run" },
+    });
+
+    const unreadable = handleAgentMessageTail(dirs, { runId: "unreadable-run" }, context);
+    fs.chmodSync(unreadableFile, 0o600);
+    expect(unreadable.isError).toBe(true);
+    expect(unreadable.details).toMatchObject({
+      action: "tail",
+      error: "session_file_unreadable",
+      sessionFile: unreadableFile,
+      record: { recordId: "unreadable-run" },
     });
   });
 

@@ -168,4 +168,15 @@ describe("session tail reading and formatting", () => {
       ].join("\n"),
     );
   });
+
+  test("does not label running assistant text as final", () => {
+    const output = formatSessionTail(
+      [
+        { kind: "assistant_text", text: "work in progress" },
+      ],
+      { runStatus: "running" },
+    );
+
+    expect(output).toBe("assistant: work in progress");
+  });
 });

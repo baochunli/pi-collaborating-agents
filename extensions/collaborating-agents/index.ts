@@ -520,7 +520,17 @@ function completedRegistrationForRecord(
   completedSubagents: AgentRegistration[] | undefined,
 ): AgentRegistration | undefined {
   if (!record.name || !completedSubagents?.length) return undefined;
-  return completedSubagents.find((agent) => agent.name === record.name);
+  return completedSubagents.find((agent) => agent.name === record.name && registrationMatchesRun(record, agent));
+}
+
+function registrationMatchesRun(record: SubagentRunListRecord, registration: AgentRegistration): boolean {
+  if (record.sessionId && registration.sessionId !== record.sessionId) return false;
+  return true;
+}
+
+function activeRegistrationForRecord(dirs: Dirs, record: SubagentRunListRecord): AgentRegistration | undefined {
+  if (!record.name) return undefined;
+  return listActiveAgents(dirs).find((agent) => agent.name === record.name && registrationMatchesRun(record, agent));
 }
 
 function resolveTailSessionFile(
@@ -532,7 +542,7 @@ function resolveTailSessionFile(
     return { sessionFile: record.sessionFile, source: "run_record", resolved: false, record };
   }
 
-  const registration = record.name ? readAgentRegistration(dirs, record.name) : undefined;
+  const registration = activeRegistrationForRecord(dirs, record);
   const completedRegistration = completedRegistrationForRecord(record, context.completedSubagents);
   const sessionFile =
     registration?.sessionFile ??
