@@ -22,6 +22,9 @@ const ORIGINAL_TEST_CMUX_CLOSE_FAIL = process.env.TEST_CMUX_CLOSE_FAIL;
 const ORIGINAL_TEST_PI_EXIT_CODE = process.env.TEST_PI_EXIT_CODE;
 const ORIGINAL_TEST_PI_MULTI_TURN = process.env.TEST_PI_MULTI_TURN;
 const ORIGINAL_TEST_PI_SAME_MTIME_FINAL_ONLY = process.env.TEST_PI_SAME_MTIME_FINAL_ONLY;
+const ORIGINAL_TEST_PI_REGISTER_SELF = process.env.TEST_PI_REGISTER_SELF;
+const ORIGINAL_TEST_PI_REGISTER_SESSION_FILE = process.env.TEST_PI_REGISTER_SESSION_FILE;
+const ORIGINAL_COLLABORATING_AGENTS_DIR = process.env.COLLABORATING_AGENTS_DIR;
 const ORIGINAL_HOME = process.env.HOME;
 const ORIGINAL_USERPROFILE = process.env.USERPROFILE;
 
@@ -81,6 +84,23 @@ if (argsFile) {
 
 const sessionIndex = args.indexOf("--session");
 const sessionPath = sessionIndex >= 0 ? args[sessionIndex + 1] : undefined;
+
+if (process.env.TEST_PI_REGISTER_SELF === "1" && process.env.COLLABORATING_AGENTS_DIR && process.env.PI_AGENT_NAME) {
+  const registryDir = path.join(process.env.COLLABORATING_AGENTS_DIR, "registry");
+  fs.mkdirSync(registryDir, { recursive: true });
+  const now = new Date().toISOString();
+  fs.writeFileSync(path.join(registryDir, process.env.PI_AGENT_NAME + ".json"), JSON.stringify({
+    name: process.env.PI_AGENT_NAME,
+    pid: process.pid,
+    sessionId: "fake-session",
+    sessionFile: process.env.TEST_PI_REGISTER_SESSION_FILE,
+    cwd: process.cwd(),
+    model: "fake/model",
+    startedAt: now,
+    lastSeenAt: now,
+    role: "subagent",
+  }), "utf-8");
+}
 
 if (args.includes("--mode") && args.includes("json")) {
   process.stdout.write(JSON.stringify({ type: "session", id: "fake-session" }) + "\\n");
@@ -543,6 +563,24 @@ afterEach(() => {
     delete process.env.TEST_PI_SAME_MTIME_FINAL_ONLY;
   }
 
+  if (typeof ORIGINAL_TEST_PI_REGISTER_SELF === "string") {
+    process.env.TEST_PI_REGISTER_SELF = ORIGINAL_TEST_PI_REGISTER_SELF;
+  } else {
+    delete process.env.TEST_PI_REGISTER_SELF;
+  }
+
+  if (typeof ORIGINAL_TEST_PI_REGISTER_SESSION_FILE === "string") {
+    process.env.TEST_PI_REGISTER_SESSION_FILE = ORIGINAL_TEST_PI_REGISTER_SESSION_FILE;
+  } else {
+    delete process.env.TEST_PI_REGISTER_SESSION_FILE;
+  }
+
+  if (typeof ORIGINAL_COLLABORATING_AGENTS_DIR === "string") {
+    process.env.COLLABORATING_AGENTS_DIR = ORIGINAL_COLLABORATING_AGENTS_DIR;
+  } else {
+    delete process.env.COLLABORATING_AGENTS_DIR;
+  }
+
   if (typeof ORIGINAL_HOME === "string") {
     process.env.HOME = ORIGINAL_HOME;
   } else {
@@ -699,6 +737,58 @@ describe("subagent spawn", () => {
     expect(result.output).toBe("fake-ok");
     expect(result.sessionId).toBe("fake-session");
     expect(result.warnings).toContain("Session metadata callback failed: metadata failed");
+  });
+
+  test("includes self-registered session file in process-mode session metadata", async () => {
+    const tempDir = makeTempDir("collab-subagent-process-session-metadata-registration");
+    writeFakePiBinary(tempDir);
+
+    const stateDir = path.join(tempDir, "state");
+    const sessionFile = path.join(tempDir, "self-registered-session.jsonl");
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.COLLABORATING_AGENTS_DIR = stateDir;
+    process.env.TEST_PI_REGISTER_SELF = "1";
+    process.env.TEST_PI_REGISTER_SESSION_FILE = sessionFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "scout",
+      description: "Scout",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/scout.toml",
+      tools: ["read"],
+    };
+    const observedMetadata: Array<{ name: string; sessionId?: string; sessionFile?: string }> = [];
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "scout",
+        task: "Find all TypeScript files",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-process-registration",
+        recursionDepth: 0,
+        enableSessionControl: false,
+        onSessionMetadata: (metadata) => {
+          observedMetadata.push(metadata);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.sessionFile).toBe(sessionFile);
+    expect(observedMetadata).toEqual([
+      {
+        name: result.name,
+        sessionId: "fake-session",
+        sessionFile,
+      },
+    ]);
   });
 
   test("omits append-system-prompt for blank type prompt and wraps task with parent context", async () => {

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDefaultSubagentType } from "./subagent-types.js";
+import { resolveDirs } from "./paths.js";
 import type { SubagentTypeConfig } from "./types.js";
 
 export interface SpawnAgentDefinition {
@@ -687,6 +688,21 @@ function createSessionMetadataNotifier(
   };
 }
 
+function readSelfRegisteredSessionFile(agentName: string, sessionId: string): string | undefined {
+  const registrationPath = path.join(resolveDirs().registry, `${agentName}.json`);
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(registrationPath, "utf-8")) as Record<string, unknown>;
+    if (parsed.name !== agentName) return undefined;
+    if (parsed.sessionId !== sessionId) return undefined;
+    return typeof parsed.sessionFile === "string" && parsed.sessionFile.length > 0
+      ? parsed.sessionFile
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function createPiEventProcessor(
   result: SpawnResult,
   onSessionMetadata?: (metadata: { sessionId?: string; sessionFile?: string }) => void,
@@ -710,6 +726,7 @@ function createPiEventProcessor(
 
     if (e.type === "session" && typeof e.id === "string") {
       result.sessionId = e.id;
+      result.sessionFile ??= readSelfRegisteredSessionFile(result.name, e.id);
       onSessionMetadata?.({ sessionId: e.id, sessionFile: result.sessionFile });
       return;
     }
