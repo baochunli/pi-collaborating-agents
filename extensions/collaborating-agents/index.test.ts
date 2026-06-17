@@ -1198,6 +1198,46 @@ describe("subagent launch identity", () => {
     await Promise.all((harness.handlers.get("session_shutdown") ?? []).map((handler) => handler(undefined, ctx)));
   });
 
+  test("queues background subagent status messages until the coordinator is idle", async () => {
+    const tempDir = makeTempDir("collab-index-busy-status-queue");
+    writeFakePiBinary(tempDir);
+    const stateDir = path.join(tempDir, "state");
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.HOME = tempDir;
+    process.env.USERPROFILE = tempDir;
+    process.env.COLLABORATING_AGENTS_DIR = stateDir;
+
+    const harness = makeHarness();
+    collaboratingAgentsExtension(harness.pi);
+    const subagentTool = harness.tools.get("subagent");
+    if (!subagentTool) throw new Error("subagent tool was not registered");
+
+    let idle = false;
+    const ctx = {
+      ...makeContext(tempDir),
+      isIdle: () => idle,
+    } as ExtensionContext;
+
+    await subagentTool.execute("tool-call-busy-status", { task: "Inspect the repo" }, undefined, undefined, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    expect(harness.sentMessages.some((message) => {
+      if (!message || typeof message !== "object") return false;
+      const details = (message as { details?: { mode?: unknown } }).details;
+      return details?.mode === "subagent_launch" || details?.mode === "subagent";
+    })).toBe(false);
+
+    idle = true;
+    const launchMessage = await waitForLaunchMessage(harness);
+    const completionMessage = await waitForCompletionMessage(harness);
+
+    const launchOption = harness.sentMessageOptions.find(({ message }) => message === launchMessage)?.options;
+    const completionOption = harness.sentMessageOptions.find(({ message }) => message === completionMessage)?.options;
+    expect(launchOption).toEqual({ triggerTurn: false });
+    expect(completionOption).toEqual({ triggerTurn: false });
+  });
+
   test("marks subagent run records failed when the child process fails", async () => {
     const tempDir = makeTempDir("collab-index-lifecycle-failure");
     writeFakePiBinary(tempDir);

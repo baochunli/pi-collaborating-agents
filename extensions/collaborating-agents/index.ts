@@ -799,6 +799,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   let remoteSessionSwitchContext: ExtensionCommandContext | null = null;
 
   const pendingSubagentCompletionUpdates: PendingSubagentCompletionUpdate[] = [];
+  let pendingSubagentCompletionFlushTimer: ReturnType<typeof setTimeout> | null = null;
   const subagentSessionNoticeLevels = new Map<string, "id" | "file">();
 
   registerRenderers(pi);
@@ -1706,7 +1707,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   }
 
   function sendSubagentLaunchUpdate(profile: string, launch: SpawnResult, recordId: string, batchRunId: string): void {
-    pi.sendMessage(
+    sendSubagentStatusPayload(
       {
         customType: "collab_focus_status",
         content: [
@@ -1749,7 +1750,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           launch,
         },
       },
-      { triggerTurn: false },
+      lastContext ?? undefined,
     );
   }
 
@@ -1821,7 +1822,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     if (previous) return;
 
     subagentSessionNoticeLevels.set(recordId, level);
-    pi.sendMessage(
+    sendSubagentStatusPayload(
       {
         customType: "collab_focus_status",
         content: [
@@ -1848,7 +1849,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           source,
         },
       },
-      { triggerTurn: false },
+      lastContext ?? undefined,
     );
   }
 
@@ -1963,16 +1964,21 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     sendSubagentSessionReadyNotice(recordId, "completion");
   }
 
-  function buildSubagentStatusSendOptions(ctx: ExtensionContext): { triggerTurn: true; deliverAs?: "steer" } {
-    if (!ctx.hasUI) return { triggerTurn: true };
-    return ctx.isIdle()
-      ? { triggerTurn: true }
-      : { triggerTurn: true, deliverAs: "steer" };
+  function schedulePendingSubagentCompletionFlush(ctx?: ExtensionContext): void {
+    const activeCtx = ctx ?? lastContext;
+    if (!activeCtx || pendingSubagentCompletionFlushTimer) return;
+
+    pendingSubagentCompletionFlushTimer = setTimeout(() => {
+      pendingSubagentCompletionFlushTimer = null;
+      flushPendingSubagentCompletionUpdates(activeCtx);
+    }, 100);
   }
 
   function trySendSubagentStatusPayload(payload: SubagentCompletionMessagePayload, ctx: ExtensionContext): boolean {
+    if (!ctx.isIdle()) return false;
+
     try {
-      pi.sendMessage(payload, buildSubagentStatusSendOptions(ctx));
+      pi.sendMessage(payload, { triggerTurn: false });
       return true;
     } catch {
       return false;
@@ -1986,12 +1992,18 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   function queueSubagentCompletionPayload(
     payload: SubagentCompletionMessagePayload,
     targetSessionFile: string | undefined,
+    ctx?: ExtensionContext,
   ): void {
     pendingSubagentCompletionUpdates.push({ payload, targetSessionFile });
+    schedulePendingSubagentCompletionFlush(ctx);
   }
 
   function flushPendingSubagentCompletionUpdates(ctx: ExtensionContext): void {
     if (pendingSubagentCompletionUpdates.length === 0) return;
+    if (!ctx.isIdle()) {
+      schedulePendingSubagentCompletionFlush(ctx);
+      return;
+    }
 
     const currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
     const { deliverable, deferred } = partitionPendingSubagentCompletionUpdates(
@@ -2011,6 +2023,35 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 
     if (retry.length > 0) {
       pendingSubagentCompletionUpdates.unshift(...retry);
+      schedulePendingSubagentCompletionFlush(ctx);
+    }
+  }
+
+  function sendSubagentStatusPayload(
+    payload: SubagentCompletionMessagePayload,
+    ctx?: ExtensionContext,
+    options?: { targetSessionFile?: string },
+  ): void {
+    const activeCtx = ctx ?? lastContext;
+    if (!activeCtx) {
+      try {
+        pi.sendMessage(payload, { triggerTurn: false });
+      } catch {
+        // No context is available yet, and there is nowhere safe to retry.
+      }
+      return;
+    }
+
+    const activeSessionFile = activeCtx.sessionManager.getSessionFile() ?? undefined;
+    const targetSessionFile = resolveSubagentCompletionTargetSessionFile(options?.targetSessionFile);
+
+    if (shouldDeferSubagentCompletionUpdate({ targetSessionFile, activeSessionFile })) {
+      queueSubagentCompletionPayload(payload, targetSessionFile, activeCtx);
+      return;
+    }
+
+    if (!trySendSubagentStatusPayload(payload, activeCtx)) {
+      queueSubagentCompletionPayload(payload, targetSessionFile, activeCtx);
     }
   }
 
@@ -2023,20 +2064,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
     options?: { targetSessionFile?: string },
   ): void {
-    const payload = buildSubagentCompletionMessagePayload(result);
-
-    const activeCtx = lastContext ?? ctx;
-    const activeSessionFile = activeCtx.sessionManager.getSessionFile() ?? undefined;
-    const targetSessionFile = resolveSubagentCompletionTargetSessionFile(options?.targetSessionFile);
-
-    if (shouldDeferSubagentCompletionUpdate({ targetSessionFile, activeSessionFile })) {
-      queueSubagentCompletionPayload(payload, targetSessionFile);
-      return;
-    }
-
-    if (!trySendSubagentStatusPayload(payload, activeCtx)) {
-      queueSubagentCompletionPayload(payload, targetSessionFile);
-    }
+    sendSubagentStatusPayload(buildSubagentCompletionMessagePayload(result), ctx, options);
   }
 
   function sendSubagentFailureUpdate(
@@ -2051,18 +2079,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       details: { mode: "subagent", error: errorMessage },
     };
 
-    const activeCtx = lastContext ?? ctx;
-    const activeSessionFile = activeCtx.sessionManager.getSessionFile() ?? undefined;
-    const targetSessionFile = resolveSubagentCompletionTargetSessionFile(options?.targetSessionFile);
-
-    if (shouldDeferSubagentCompletionUpdate({ targetSessionFile, activeSessionFile })) {
-      queueSubagentCompletionPayload(payload, targetSessionFile);
-      return;
-    }
-
-    if (!trySendSubagentStatusPayload(payload, activeCtx)) {
-      queueSubagentCompletionPayload(payload, targetSessionFile);
-    }
+    sendSubagentStatusPayload(payload, ctx, options);
   }
 
   function markAsOrchestrator(ctx: ExtensionContext): void {
@@ -2953,6 +2970,10 @@ By default subagents use the same model as the spawning session.` ,
   });
 
   pi.on("session_shutdown", async () => {
+    if (pendingSubagentCompletionFlushTimer) {
+      clearTimeout(pendingSubagentCompletionFlushTimer);
+      pendingSubagentCompletionFlushTimer = null;
+    }
     stopWatcher();
     stopRemoteSessionAutoRefresh();
     if (state.registered) {
