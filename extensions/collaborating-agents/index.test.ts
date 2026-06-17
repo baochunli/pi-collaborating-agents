@@ -236,4 +236,27 @@ describe("subagent launch identity", () => {
 
     await Promise.all((harness.handlers.get("session_shutdown") ?? []).map((handler) => handler(undefined, ctx)));
   });
+
+  test("planned records use the actual fallback type when requested type is unknown", async () => {
+    const tempDir = makeTempDir("collab-index-unknown-type");
+    writeFakePiBinary(tempDir);
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.HOME = tempDir;
+    process.env.USERPROFILE = tempDir;
+    process.env.COLLABORATING_AGENTS_DIR = path.join(tempDir, "state");
+
+    const harness = makeHarness();
+    collaboratingAgentsExtension(harness.pi);
+    const subagentTool = harness.tools.get("subagent");
+    if (!subagentTool) throw new Error("subagent tool was not registered");
+
+    const ctx = makeContext(tempDir);
+    await subagentTool.execute("tool-call-3", { task: "Inspect the repo", type: "missing-type" }, undefined, undefined, ctx);
+
+    const records = listSubagentRunRecords({ base: process.env.COLLABORATING_AGENTS_DIR!, registry: "", inbox: "", messageLog: "", runs: path.join(process.env.COLLABORATING_AGENTS_DIR!, "runs") });
+    expect(records).toHaveLength(1);
+    expect(records[0]?.type).toBe("worker");
+
+    await Promise.all((harness.handlers.get("session_shutdown") ?? []).map((handler) => handler(undefined, ctx)));
+  });
 });

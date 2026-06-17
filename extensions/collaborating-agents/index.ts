@@ -860,6 +860,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       model: baseAgentDef.model || resolvedModel.model,
     };
 
+    createPlannedSubagentRunRecords(params, ctx, batchRunId, typeConfig.name);
+
     if (hasSingle) {
       const profile = runtimeAgent.name;
       const taskToRun: SpawnTask = {
@@ -1270,22 +1272,16 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     return Array.from({ length: taskCount }, (_value, index) => `${batchRunId}-${index}`);
   }
 
-  function resolvePlannedSubagentType(params: SubagentLaunchParams, ctx: ExtensionContext): string {
-    const availableTypes = discoverSubagentTypes(ctx.cwd);
-    if (params.type) return findSubagentType(params.type, availableTypes)?.name ?? params.type.trim();
-    return getDefaultSubagentType(availableTypes).name;
-  }
-
   function createPlannedSubagentRunRecords(
     params: SubagentLaunchParams,
     ctx: ExtensionContext,
     batchRunId: string,
+    type: string,
   ): string[] {
     config = loadConfig(ctx.cwd);
 
     const tasks = getSubagentTaskItems(params);
     const childRunIds = createChildRunIds(batchRunId, tasks.length);
-    const type = resolvePlannedSubagentType(params, ctx);
     const now = new Date().toISOString();
     const parentSessionFile = ctx.sessionManager.getSessionFile() ?? coordinatorSessionFile ?? localSessionFile;
 
@@ -1335,7 +1331,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     options?: { batchRunId?: string },
   ): { batchRunId: string; childRunIds: string[] } {
     const batchRunId = options?.batchRunId ?? createSubagentBatchRunId();
-    const childRunIds = createPlannedSubagentRunRecords(params, ctx, batchRunId);
+    const childRunIds = createChildRunIds(batchRunId, getSubagentTaskItems(params).length);
     const launchSessionFile = ctx.sessionManager.getSessionFile() ?? coordinatorSessionFile ?? localSessionFile;
 
     state.activeSubagentRuns += 1;
