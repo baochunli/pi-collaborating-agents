@@ -48,14 +48,16 @@ describe("subagent completion payload helpers", () => {
 
     const payload = buildSubagentCompletionMessagePayload({
       content: [{ type: "text", text: "fallback" }],
-      details: { mode: "subagent", result: single },
+      details: { mode: "subagent", result: single, childRunIds: ["run-single"] },
       isError: false,
     });
 
     expect(payload.customType).toBe("collab_focus_status");
     expect(payload.content).toContain("Received final results from ClearWave.");
     expect(payload.content).toContain("## Summary\nall good");
-    expect(payload.details).toEqual({ mode: "subagent", result: single });
+    expect(payload.content).toContain('agent_message({ action: "tail", runId: "run-single" })');
+    expect(payload.content).toContain('agent_message({ action: "session", runId: "run-single" })');
+    expect(payload.details).toEqual({ mode: "subagent", result: single, childRunIds: ["run-single"] });
   });
 
   test("buildSubagentCompletionMessagePayload uses idle-grace wording for auto-closed cmux panes", () => {
@@ -74,7 +76,7 @@ describe("subagent completion payload helpers", () => {
     expect(payload.content).toContain("cmux pane auto-closed after turn-finished output plus idle grace");
   });
 
-  test("buildSubagentCompletionMessagePayload summarizes parallel failures", () => {
+  test("buildSubagentCompletionMessagePayload summarizes parallel failures with per-child hints", () => {
     const ok = makeSpawnResult({ name: "SwiftTiger-1a2b-ClearWave", output: "ok output", exitCode: 0 });
     const failed = makeSpawnResult({
       name: "SwiftTiger-1a2b-BrightRiver",
@@ -85,7 +87,7 @@ describe("subagent completion payload helpers", () => {
 
     const payload = buildSubagentCompletionMessagePayload({
       content: [{ type: "text", text: "fallback" }],
-      details: { mode: "subagent", results: [ok, failed] },
+      details: { mode: "subagent", results: [ok, failed], childRunIds: ["run-ok", "run-failed"] },
       isError: true,
     });
 
@@ -94,6 +96,30 @@ describe("subagent completion payload helpers", () => {
     expect(payload.content).toContain("### 2. BrightRiver (failed)");
     expect(payload.content).toContain("ok output");
     expect(payload.content).toContain("bad output");
+    expect(payload.content).toContain('agent_message({ action: "tail", runId: "run-ok" })');
+    expect(payload.content).toContain('agent_message({ action: "tail", runId: "run-failed" })');
+    expect(payload.content).toContain('agent_message({ action: "sessions", includeCompleted: true })');
+    expect(payload.content).not.toContain('runId: "ClearWave"');
+  });
+
+  test("buildSubagentCompletionMessagePayload includes hints for failed single results", () => {
+    const failed = makeSpawnResult({
+      name: "SwiftTiger-1a2b-BrightRiver",
+      output: "bad output",
+      exitCode: 1,
+      sessionId: "session-failed",
+      sessionFile: "/tmp/session-failed.jsonl",
+    });
+
+    const payload = buildSubagentCompletionMessagePayload({
+      content: [{ type: "text", text: "fallback" }],
+      details: { mode: "subagent", result: failed, childRunIds: ["run-failed"] },
+      isError: true,
+    });
+
+    expect(payload.content).toContain("Received an error from BrightRiver.");
+    expect(payload.content).toContain('agent_message({ action: "tail", runId: "run-failed" })');
+    expect(payload.content).toContain('agent_message({ action: "session", runId: "run-failed" })');
   });
 });
 

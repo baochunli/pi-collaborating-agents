@@ -755,6 +755,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   let remoteSessionSwitchContext: ExtensionCommandContext | null = null;
 
   const pendingSubagentCompletionUpdates: PendingSubagentCompletionUpdate[] = [];
+  const subagentSessionNoticeLevels = new Map<string, "id" | "file">();
 
   registerRenderers(pi);
 
@@ -1346,6 +1347,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       onLaunch?: (payload: {
         profile: string;
         launch: SpawnResult;
+        recordId: string;
+        batchRunId: string;
       }) => void | Promise<void>;
     },
   ): Promise<{
@@ -1466,6 +1469,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
             ? options.onLaunch({
                 profile,
                 launch,
+                recordId: childRunIds[0]!,
+                batchRunId,
               })
             : undefined;
         },
@@ -1548,6 +1553,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
             ? options.onLaunch({
                 profile: entry.def.name,
                 launch,
+                recordId,
+                batchRunId,
               })
             : undefined;
         },
@@ -1648,7 +1655,13 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     return { ok: true, mode: "single", taskCount: 1, type };
   }
 
-  function sendSubagentLaunchUpdate(profile: string, launch: SpawnResult): void {
+  function formatSessionFileStatus(result: Pick<SpawnResult, "sessionFile" | "sessionFileUnavailableReason">): string {
+    if (result.sessionFile) return `available (${result.sessionFile})`;
+    if (result.sessionFileUnavailableReason) return `pending (${result.sessionFileUnavailableReason})`;
+    return "pending";
+  }
+
+  function sendSubagentLaunchUpdate(profile: string, launch: SpawnResult, recordId: string, batchRunId: string): void {
     pi.sendMessage(
       {
         customType: "collab_focus_status",
@@ -1666,16 +1679,29 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           "```",
           "",
           `Profile: ${profile}`,
+          `Batch ID: ${batchRunId}`,
+          `Run ID: ${recordId}`,
+          `Runtime subagent name: ${launch.name}`,
+          `Display name: ${formatAgentDisplayName(launch.name)}`,
+          `Session ID: ${launch.sessionId ?? "(not reported yet)"}`,
+          `Session file: ${formatSessionFileStatus(launch)}`,
           `Working directory: ${launch.workingDirectory}`,
           `Launch mode: ${launch.launchMode}`,
           `cmux target: ${launch.cmuxWorkspaceRef ? `${launch.cmuxWorkspaceRef}${launch.cmuxPaneRef ? ` / ${launch.cmuxPaneRef}` : ""}${launch.cmuxSurfaceRef ? ` / ${launch.cmuxSurfaceRef}` : ""}` : "(not using cmux)"}`,
           `Type system prompt: ${launch.launchSystemPromptSource ? `${launch.launchSystemPromptSource} (${launch.launchSystemPromptLength ?? 0} chars)` : "(none)"}`,
           "(Type system prompt content is redacted in launch updates.)",
+          "",
+          "Inspect this subagent:",
+          `- agent_message({ action: "session", runId: "${recordId}" })`,
+          `- agent_message({ action: "tail", runId: "${recordId}" })`,
+          `- agent_message({ action: "sessions", includeCompleted: true })`,
         ].join("\n"),
         display: true,
         details: {
           mode: "subagent_launch",
           profile,
+          batchRunId,
+          recordId,
           launch,
         },
       },
@@ -1730,6 +1756,58 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     if (!warnings.includes(warning)) warnings.push(warning);
   }
 
+  function findSubagentRunListRecord(recordId: string): SubagentRunListRecord | undefined {
+    return listSubagentRunRecords(dirs).find((record) => record.recordId === recordId);
+  }
+
+  function sessionNoticeLevel(record: SubagentRunListRecord): "id" | "file" | undefined {
+    if (record.sessionFile) return "file";
+    if (record.sessionId) return "id";
+    return undefined;
+  }
+
+  function sendSubagentSessionReadyNotice(recordId: string, source: string): void {
+    const record = findSubagentRunListRecord(recordId);
+    if (!record) return;
+
+    const level = sessionNoticeLevel(record);
+    if (!level) return;
+
+    const previous = subagentSessionNoticeLevels.get(recordId);
+    if (previous) return;
+
+    subagentSessionNoticeLevels.set(recordId, level);
+    pi.sendMessage(
+      {
+        customType: "collab_focus_status",
+        content: [
+          "Subagent session ready.",
+          `Run ID: ${record.recordId}`,
+          `Batch ID: ${record.batchRunId}`,
+          `Runtime subagent name: ${record.name ?? "(not reported)"}`,
+          `Display name: ${formatRunName(record)}`,
+          `Session ID: ${record.sessionId ?? "(not reported)"}`,
+          `Session file: ${record.sessionFile ?? "(pending)"}`,
+          "",
+          "Inspect this subagent:",
+          `- agent_message({ action: "session", runId: "${record.recordId}" })`,
+          `- agent_message({ action: "tail", runId: "${record.recordId}" })`,
+        ].join("\n"),
+        display: true,
+        details: {
+          mode: "subagent_session_ready",
+          recordId: record.recordId,
+          batchRunId: record.batchRunId,
+          sessionId: record.sessionId,
+          sessionFile: record.sessionFile,
+          sessionReadyLevel: level,
+          source,
+        },
+      },
+      { triggerTurn: false },
+    );
+  }
+
   function safeUpdateSubagentRunRecordWith(
     recordId: string,
     phase: string,
@@ -1777,6 +1855,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       sessionFileUnavailableReason: metadata.sessionFile ? null : existing.sessionFileUnavailableReason,
       lastSeenAt: new Date().toISOString(),
     }));
+    sendSubagentSessionReadyNotice(recordId, "session metadata");
   }
 
   function markSubagentRunFromRegistration(recordId: string, childName: string | undefined, warnings: string[]): void {
@@ -1790,6 +1869,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       sessionFileUnavailableReason: registration.sessionFile ? null : existing.sessionFileUnavailableReason,
       lastSeenAt: new Date().toISOString(),
     }));
+    sendSubagentSessionReadyNotice(recordId, "registration metadata");
   }
 
   function findCompletedSubagentSnapshot(name: string | undefined): AgentRegistration | undefined {
@@ -1836,6 +1916,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         warnings: mergeWarnings(existing.warnings, result.warnings),
       };
     });
+    sendSubagentSessionReadyNotice(recordId, "completion");
   }
 
   function buildSubagentStatusSendOptions(ctx: ExtensionContext): { triggerTurn: true; deliverAs?: "steer" } {
@@ -2048,7 +2129,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           {
             batchRunId,
             includeLaunchBlock: false,
-            onLaunch: ({ profile, launch }) => sendSubagentLaunchUpdate(profile, launch),
+            onLaunch: ({ profile, launch, recordId, batchRunId }) => sendSubagentLaunchUpdate(profile, launch, recordId, batchRunId),
           },
         );
 

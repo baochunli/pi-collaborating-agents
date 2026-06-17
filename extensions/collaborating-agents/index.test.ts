@@ -205,17 +205,43 @@ async function waitForCompletionMessage(harness: { sentMessages: unknown[] }): P
   });
 }
 
+async function waitForLaunchMessage(harness: { sentMessages: unknown[] }): Promise<Record<string, unknown>> {
+  return await waitFor(() => {
+    return harness.sentMessages.find((message): message is Record<string, unknown> => {
+      if (!message || typeof message !== "object") return false;
+      const details = (message as { details?: unknown }).details;
+      return !!details && typeof details === "object" && (details as { mode?: unknown }).mode === "subagent_launch";
+    });
+  });
+}
+
+async function waitForSessionReadyMessages(
+  harness: { sentMessages: unknown[] },
+  count: number,
+): Promise<Record<string, unknown>[]> {
+  return await waitFor(() => {
+    const messages = harness.sentMessages.filter((message): message is Record<string, unknown> => {
+      if (!message || typeof message !== "object") return false;
+      const details = (message as { details?: unknown }).details;
+      return !!details && typeof details === "object" && (details as { mode?: unknown }).mode === "subagent_session_ready";
+    });
+    return messages.length >= count ? messages : undefined;
+  });
+}
+
 function makeHarness(): {
   pi: ExtensionAPI;
   tools: Map<string, ToolDefinition>;
   commands: Map<string, Omit<RegisteredCommand, "name" | "sourceInfo">>;
   handlers: Map<string, Array<(event?: unknown, ctx?: unknown) => unknown>>;
   sentMessages: unknown[];
+  sentMessageOptions: Array<{ message: unknown; options: unknown }>;
 } {
   const tools = new Map<string, ToolDefinition>();
   const commands = new Map<string, Omit<RegisteredCommand, "name" | "sourceInfo">>();
   const handlers = new Map<string, Array<(event?: unknown, ctx?: unknown) => unknown>>();
   const sentMessages: unknown[] = [];
+  const sentMessageOptions: Array<{ message: unknown; options: unknown }> = [];
 
   const pi = {
     on(event: string, handler: (event?: unknown, ctx?: unknown) => unknown): void {
@@ -235,8 +261,9 @@ function makeHarness(): {
       return undefined;
     },
     registerMessageRenderer(): void {},
-    sendMessage(message: unknown): void {
+    sendMessage(message: unknown, options?: unknown): void {
       sentMessages.push(message);
+      sentMessageOptions.push({ message, options });
     },
     sendUserMessage(): void {},
     appendEntry(): void {},
@@ -255,7 +282,7 @@ function makeHarness(): {
     setModel(): void {},
   } as unknown as ExtensionAPI;
 
-  return { pi, tools, commands, handlers, sentMessages };
+  return { pi, tools, commands, handlers, sentMessages, sentMessageOptions };
 }
 
 function makeContext(cwd: string): ExtensionContext {
@@ -928,7 +955,18 @@ describe("subagent launch identity", () => {
     });
 
     const details = result.details as { batchRunId: string; childRunIds: string[] };
-    expect(details.childRunIds).toEqual([`${details.batchRunId}-0`]);
+    const recordId = `${details.batchRunId}-0`;
+    expect(details.childRunIds).toEqual([recordId]);
+
+    const launchMessage = await waitForLaunchMessage(harness);
+    expect(String(launchMessage.content)).toContain(`Batch ID: ${details.batchRunId}`);
+    expect(String(launchMessage.content)).toContain(`Run ID: ${recordId}`);
+    expect(String(launchMessage.content)).toContain("Runtime subagent name:");
+    expect(String(launchMessage.content)).toContain("Display name:");
+    expect(String(launchMessage.content)).toContain("Session ID:");
+    expect(String(launchMessage.content)).toContain("Session file:");
+    expect(String(launchMessage.content)).toContain(`agent_message({ action: "session", runId: "${recordId}" })`);
+    expect(String(launchMessage.content)).toContain(`agent_message({ action: "tail", runId: "${recordId}" })`);
 
     const records = listSubagentRunRecords({ base: process.env.COLLABORATING_AGENTS_DIR!, registry: "", inbox: "", messageLog: "", runs: path.join(process.env.COLLABORATING_AGENTS_DIR!, "runs") });
     expect(records).toHaveLength(1);
@@ -1074,6 +1112,28 @@ describe("subagent launch identity", () => {
     });
     expect(completed.completedAt).toBeString();
     expect(Date.parse(completed.lastSeenAt)).toBeGreaterThanOrEqual(Date.parse(running.lastSeenAt));
+
+    const sessionReadyMessages = await waitForSessionReadyMessages(harness, 1);
+    expect(sessionReadyMessages).toHaveLength(1);
+    expect(String(sessionReadyMessages[0]?.content)).toContain("Subagent session ready");
+    expect(String(sessionReadyMessages[0]?.content)).toContain(`Run ID: ${recordId}`);
+    expect(String(sessionReadyMessages[0]?.content)).toContain('agent_message({ action: "session", runId:');
+    expect(String(sessionReadyMessages[0]?.content)).toContain('agent_message({ action: "tail", runId:');
+    expect(sessionReadyMessages[0]?.details).toMatchObject({
+      mode: "subagent_session_ready",
+      recordId,
+      sessionId: "fake-session",
+      sessionFile: childSessionFile,
+    });
+    const readyOption = harness.sentMessageOptions.find(({ message }) => message === sessionReadyMessages[0])?.options;
+    expect(readyOption).toEqual({ triggerTurn: false });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const readyCount = harness.sentMessages.filter((message) =>
+      !!message &&
+      typeof message === "object" &&
+      ((message as { details?: { mode?: unknown } }).details?.mode === "subagent_session_ready")
+    ).length;
+    expect(readyCount).toBe(1);
 
     const completionMessage = await waitForCompletionMessage(harness);
     expect(String(completionMessage.content)).toContain("fake-ok");

@@ -38,10 +38,27 @@ export function collectSpawnResults(details: Record<string, unknown>): SpawnResu
   return singleResult ? [singleResult] : [];
 }
 
+function collectChildRunIds(details: Record<string, unknown>): string[] {
+  return Array.isArray(details.childRunIds)
+    ? details.childRunIds.filter((runId): runId is string => typeof runId === "string" && runId.length > 0)
+    : [];
+}
+
+function inspectionHintLines(runId: string | undefined): string[] {
+  if (!runId) return [];
+  return [
+    "",
+    "Inspection:",
+    `- agent_message({ action: "tail", runId: "${runId}" })`,
+    `- agent_message({ action: "session", runId: "${runId}" })`,
+  ];
+}
+
 export function buildSubagentCompletionMessagePayload(
   result: SubagentCompletionToolResult,
 ): SubagentCompletionMessagePayload {
   const spawnResults = collectSpawnResults(result.details);
+  const childRunIds = collectChildRunIds(result.details);
 
   let intro: string;
   let body: string;
@@ -56,6 +73,7 @@ export function buildSubagentCompletionMessagePayload(
       const displayName = formatAgentDisplayName(r.name);
       const status = r.exitCode === 0 ? "ok" : "failed";
       const output = (r.output || "(no output)").trim() || "(no output)";
+      const runId = childRunIds[index];
       const cmuxNote = r.launchMode === "cmux-pane"
         ? r.cmuxPaneClosed
           ? "cmux pane auto-closed after turn-finished output plus idle grace"
@@ -63,14 +81,23 @@ export function buildSubagentCompletionMessagePayload(
             ? `cmux pane close note: ${r.cmuxCloseError}`
             : undefined
         : undefined;
-      return [`### ${index + 1}. ${displayName} (${status})`, cmuxNote ? `- ${cmuxNote}` : undefined, "", output]
+      return [
+        `### ${index + 1}. ${displayName} (${status})`,
+        runId ? `Run ID: ${runId}` : undefined,
+        cmuxNote ? `- ${cmuxNote}` : undefined,
+        "",
+        output,
+        ...inspectionHintLines(runId),
+      ]
         .filter((line): line is string => Boolean(line))
         .join("\n");
     });
 
-    body = sections.join("\n\n");
+    const sessionsHint = 'agent_message({ action: "sessions", includeCompleted: true })';
+    body = [...sections, `Inspect all subagent sessions:\n- ${sessionsHint}`].join("\n\n");
   } else {
     const singleResult = spawnResults[0];
+    const runId = childRunIds[0];
     const runtimeLabel = singleResult?.name ? formatAgentDisplayName(singleResult.name) : "the subagent";
     intro = result.isError
       ? `Received an error from ${runtimeLabel}.`
@@ -87,6 +114,7 @@ export function buildSubagentCompletionMessagePayload(
     body = [
       cmuxNote ? `- ${cmuxNote}` : undefined,
       (singleResult?.output || result.content[0]?.text || "(no output)").trim() || "(no output)",
+      ...inspectionHintLines(runId),
     ]
       .filter((line): line is string => Boolean(line))
       .join("\n\n");
