@@ -67,6 +67,7 @@ export interface Dirs {
   registry: string;
   inbox: string;
   messageLog: string;
+  runs: string;
 }
 
 export interface ExtensionState {
@@ -84,6 +85,36 @@ export interface ExtensionState {
 }
 
 export type SubagentLaunchMode = "process" | "cmux-pane";
+
+export type SubagentRunStatus = "launching" | "running" | "completed" | "failed";
+
+export interface SubagentRunRecord {
+  recordId: string;
+  batchRunId: string;
+  taskIndex: number;
+  parentAgent: string;
+  parentSessionId?: string;
+  parentSessionFile?: string;
+  parentPid?: number;
+  name?: string;
+  displayName?: string;
+  type: string;
+  taskPreview: string;
+  requestedCwd?: string;
+  cwd: string;
+  status: SubagentRunStatus;
+  sessionId?: string;
+  sessionFile?: string;
+  model?: string;
+  launchMode: SubagentLaunchMode;
+  startedAt: string;
+  lastSeenAt: string;
+  completedAt?: string;
+  exitCode?: number;
+  outputPreview?: string;
+  warnings?: string[];
+  sessionReadyNotifiedAt?: string;
+}
 
 export interface CollaboratingAgentsConfig {
   messageHistoryLimit: number;

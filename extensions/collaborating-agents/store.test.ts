@@ -15,10 +15,13 @@ import {
   resolveThreadPeerName,
   sendBroadcast,
   sendDirect,
+  listSubagentRunRecords,
   unregisterSelf,
+  updateSubagentRunRecord,
   updateSelfHeartbeat,
+  writeSubagentRunRecord,
 } from "./store.ts";
-import type { AgentRegistration, Dirs, InboxMessage, MessageLogEvent } from "./types.ts";
+import type { AgentRegistration, Dirs, InboxMessage, MessageLogEvent, SubagentRunRecord } from "./types.ts";
 
 const DEAD_PID = 99_999_999;
 
@@ -40,6 +43,7 @@ function makeDirs(prefix: string): Dirs {
     registry: path.join(base, "registry"),
     inbox: path.join(base, "inbox"),
     messageLog: path.join(base, "messages.jsonl"),
+    runs: path.join(base, "runs"),
   };
 }
 
@@ -68,6 +72,27 @@ function writeInboxMessageFile(dirs: Dirs, agentName: string, fileName: string, 
   const fullPath = path.join(dir, fileName);
   fs.writeFileSync(fullPath, JSON.stringify(payload, null, 2), "utf-8");
   return fullPath;
+}
+
+function makeRunRecord(overrides: Partial<SubagentRunRecord> = {}): SubagentRunRecord {
+  const now = new Date().toISOString();
+  return {
+    recordId: "batch-1-0",
+    batchRunId: "batch-1",
+    taskIndex: 0,
+    parentAgent: "Coordinator",
+    parentSessionId: "parent-session",
+    parentSessionFile: "/tmp/parent-session.jsonl",
+    parentPid: process.pid,
+    type: "worker",
+    taskPreview: "Inspect the codebase",
+    cwd: process.cwd(),
+    status: "launching",
+    launchMode: "process",
+    startedAt: now,
+    lastSeenAt: now,
+    ...overrides,
+  };
 }
 
 describe("store reservation matching", () => {
@@ -159,6 +184,105 @@ describe("store registration ownership", () => {
     const listed = listActiveAgents(dirs);
     expect(listed.map((a) => a.name)).toEqual(["AliveAgent"]);
     expect(fs.existsSync(path.join(dirs.registry, "DeadAgent.json"))).toBe(false);
+  });
+});
+
+describe("store subagent run records", () => {
+  test("writeSubagentRunRecord stores planned records by child record id and bounds previews", () => {
+    const dirs = makeDirs("collab-store-runs-write");
+    const longTask = "task ".repeat(400);
+    const longOutput = "output ".repeat(500);
+
+    const written = writeSubagentRunRecord(
+      dirs,
+      makeRunRecord({
+        recordId: "batch-abc-0",
+        batchRunId: "batch-abc",
+        taskPreview: longTask,
+        outputPreview: longOutput,
+      }),
+    );
+
+    expect(written).toBe(true);
+
+    const runPath = path.join(dirs.runs, "batch-abc-0.json");
+    expect(fs.existsSync(runPath)).toBe(true);
+
+    const stored = JSON.parse(fs.readFileSync(runPath, "utf-8")) as SubagentRunRecord;
+    expect(stored).toMatchObject({
+      recordId: "batch-abc-0",
+      batchRunId: "batch-abc",
+      taskIndex: 0,
+      status: "launching",
+    });
+    expect(stored.name).toBeUndefined();
+    expect(stored.displayName).toBeUndefined();
+    expect(stored.sessionId).toBeUndefined();
+    expect(stored.sessionFile).toBeUndefined();
+    expect(stored.taskPreview.length).toBeLessThanOrEqual(1000);
+    expect(stored.taskPreview).toContain("[truncated");
+    expect(stored.outputPreview?.length).toBeLessThanOrEqual(2000);
+    expect(stored.outputPreview).toContain("[truncated");
+  });
+
+  test("updateSubagentRunRecord merges patches without dropping concurrent metadata", () => {
+    const dirs = makeDirs("collab-store-runs-update");
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord())).toBe(true);
+    expect(
+      updateSubagentRunRecord(dirs, "batch-1-0", {
+        sessionId: "session-live",
+        sessionFile: "/tmp/session-live.jsonl",
+        lastSeenAt: "2026-01-01T00:00:01.000Z",
+      }),
+    ).toBe(true);
+
+    expect(
+      updateSubagentRunRecord(dirs, "batch-1-0", {
+        status: "completed",
+        completedAt: "2026-01-01T00:00:02.000Z",
+        outputPreview: "done",
+      }),
+    ).toBe(true);
+
+    const [stored] = listSubagentRunRecords(dirs);
+    expect(stored).toMatchObject({
+      recordId: "batch-1-0",
+      status: "completed",
+      sessionId: "session-live",
+      sessionFile: "/tmp/session-live.jsonl",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      outputPreview: "done",
+    });
+  });
+
+  test("listSubagentRunRecords ignores corrupt files and returns newest records first", () => {
+    const dirs = makeDirs("collab-store-runs-list");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          recordId: "batch-1-0",
+          batchRunId: "batch-1",
+          lastSeenAt: "2026-01-01T00:00:01.000Z",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          recordId: "batch-2-0",
+          batchRunId: "batch-2",
+          lastSeenAt: "2026-01-01T00:00:03.000Z",
+        }),
+      ),
+    ).toBe(true);
+
+    fs.writeFileSync(path.join(dirs.runs, "corrupt.json"), "{not json", "utf-8");
+
+    expect(listSubagentRunRecords(dirs).map((record) => record.recordId)).toEqual(["batch-2-0", "batch-1-0"]);
   });
 });
 

@@ -9,11 +9,16 @@ import type {
   InboxMessage,
   MessageLogEvent,
   ReservationConflict,
+  SubagentLaunchMode,
+  SubagentRunRecord,
+  SubagentRunStatus,
 } from "./types.js";
 
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 1500;
 const STALE_LOCK_MS = 30_000;
+const MAX_TASK_PREVIEW_LENGTH = 1000;
+const MAX_OUTPUT_PREVIEW_LENGTH = 2000;
 const SLEEP_BUFFER = new SharedArrayBuffer(4);
 const SLEEP_ARRAY = new Int32Array(SLEEP_BUFFER);
 
@@ -56,6 +61,14 @@ function isValidRole(role: unknown): role is AgentRole {
   return role === "subagent" || role === "orchestrator";
 }
 
+function isValidLaunchMode(mode: unknown): mode is SubagentLaunchMode {
+  return mode === "process" || mode === "cmux-pane";
+}
+
+function isValidSubagentRunStatus(status: unknown): status is SubagentRunStatus {
+  return status === "launching" || status === "running" || status === "completed" || status === "failed";
+}
+
 function isValidRegistration(reg: unknown): reg is AgentRegistration {
   if (!reg || typeof reg !== "object") return false;
   const r = reg as Record<string, unknown>;
@@ -94,6 +107,51 @@ function isValidInboxMessage(msg: unknown): msg is InboxMessage {
   );
 }
 
+function isValidOptionalString(value: unknown): boolean {
+  return typeof value === "undefined" || typeof value === "string";
+}
+
+function isValidOptionalNumber(value: unknown): boolean {
+  return typeof value === "undefined" || typeof value === "number";
+}
+
+function isValidOptionalStringArray(value: unknown): boolean {
+  return typeof value === "undefined" || (Array.isArray(value) && value.every((item) => typeof item === "string"));
+}
+
+function isValidSubagentRunRecord(record: unknown): record is SubagentRunRecord {
+  if (!record || typeof record !== "object") return false;
+  const r = record as Record<string, unknown>;
+
+  return (
+    typeof r.recordId === "string" &&
+    typeof r.batchRunId === "string" &&
+    typeof r.taskIndex === "number" &&
+    typeof r.parentAgent === "string" &&
+    isValidOptionalString(r.parentSessionId) &&
+    isValidOptionalString(r.parentSessionFile) &&
+    isValidOptionalNumber(r.parentPid) &&
+    isValidOptionalString(r.name) &&
+    isValidOptionalString(r.displayName) &&
+    typeof r.type === "string" &&
+    typeof r.taskPreview === "string" &&
+    isValidOptionalString(r.requestedCwd) &&
+    typeof r.cwd === "string" &&
+    isValidSubagentRunStatus(r.status) &&
+    isValidOptionalString(r.sessionId) &&
+    isValidOptionalString(r.sessionFile) &&
+    isValidOptionalString(r.model) &&
+    isValidLaunchMode(r.launchMode) &&
+    typeof r.startedAt === "string" &&
+    typeof r.lastSeenAt === "string" &&
+    isValidOptionalString(r.completedAt) &&
+    isValidOptionalNumber(r.exitCode) &&
+    isValidOptionalString(r.outputPreview) &&
+    isValidOptionalStringArray(r.warnings) &&
+    isValidOptionalString(r.sessionReadyNotifiedAt)
+  );
+}
+
 function readJsonFile<T>(path: string): T | null {
   try {
     return JSON.parse(fs.readFileSync(path, "utf-8")) as T;
@@ -112,6 +170,20 @@ function registrationLockPath(dirs: Dirs, agentName: string): string {
 
 function inboxDir(dirs: Dirs, agentName: string): string {
   return join(dirs.inbox, agentName);
+}
+
+function isSafeRunRecordId(recordId: string): boolean {
+  return recordId.length > 0 && !recordId.includes("/") && !recordId.includes("\\") && !recordId.includes("\0");
+}
+
+function subagentRunRecordPath(dirs: Dirs, recordId: string): string | null {
+  if (!isSafeRunRecordId(recordId)) return null;
+  return join(dirs.runs, `${recordId}.json`);
+}
+
+function subagentRunRecordLockPath(dirs: Dirs, recordId: string): string | null {
+  const path = subagentRunRecordPath(dirs, recordId);
+  return path ? `${path}.lock` : null;
 }
 
 function readLockOwner(lockDir: string): { pid?: number; acquiredAt?: number } | null {
@@ -191,6 +263,40 @@ function withRegistrationLock<T>(dirs: Dirs, agentName: string, fn: () => T): T 
   }
 }
 
+function withSubagentRunRecordLock<T>(dirs: Dirs, recordId: string, fn: () => T): T | undefined {
+  const lockPath = subagentRunRecordLockPath(dirs, recordId);
+  if (!lockPath) return undefined;
+
+  const release = acquireLockSync(lockPath);
+  if (!release) return undefined;
+
+  try {
+    return fn();
+  } finally {
+    release();
+  }
+}
+
+function truncatePreview(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+
+  const suffix = ` [truncated from ${value.length} chars]`;
+  const headLength = Math.max(0, maxLength - suffix.length);
+  return `${value.slice(0, headLength)}${suffix}`;
+}
+
+function normalizeSubagentRunRecord(record: SubagentRunRecord): SubagentRunRecord {
+  return {
+    ...record,
+    taskPreview: truncatePreview(record.taskPreview, MAX_TASK_PREVIEW_LENGTH),
+    outputPreview:
+      typeof record.outputPreview === "string"
+        ? truncatePreview(record.outputPreview, MAX_OUTPUT_PREVIEW_LENGTH)
+        : undefined,
+    warnings: record.warnings ? [...record.warnings] : undefined,
+  };
+}
+
 function writeFileAtomic(path: string, content: string): boolean {
   const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
 
@@ -214,6 +320,90 @@ function writeFileAtomic(path: string, content: string): boolean {
     }
     return false;
   }
+}
+
+export function writeSubagentRunRecord(dirs: Dirs, record: SubagentRunRecord): boolean {
+  ensureDirSync(dirs.base);
+  ensureDirSync(dirs.runs);
+
+  if (!isSafeRunRecordId(record.recordId)) return false;
+
+  const normalized = normalizeSubagentRunRecord(record);
+  if (!isValidSubagentRunRecord(normalized)) return false;
+
+  const result = withSubagentRunRecordLock(dirs, normalized.recordId, () => {
+    const path = subagentRunRecordPath(dirs, normalized.recordId);
+    if (!path) return false;
+    return writeFileAtomic(path, JSON.stringify(normalized, null, 2));
+  });
+
+  return result ?? false;
+}
+
+export function updateSubagentRunRecord(
+  dirs: Dirs,
+  recordId: string,
+  patch: Partial<SubagentRunRecord>,
+): boolean {
+  ensureDirSync(dirs.base);
+  ensureDirSync(dirs.runs);
+
+  if (!isSafeRunRecordId(recordId)) return false;
+
+  const result = withSubagentRunRecordLock(dirs, recordId, () => {
+    const path = subagentRunRecordPath(dirs, recordId);
+    if (!path) return false;
+
+    const existing = readJsonFile<unknown>(path);
+    if (!existing || !isValidSubagentRunRecord(existing)) return false;
+
+    const merged = normalizeSubagentRunRecord({
+      ...existing,
+      ...patch,
+      recordId: existing.recordId,
+      batchRunId: existing.batchRunId,
+      taskIndex: existing.taskIndex,
+    });
+
+    if (!isValidSubagentRunRecord(merged)) return false;
+    return writeFileAtomic(path, JSON.stringify(merged, null, 2));
+  });
+
+  return result ?? false;
+}
+
+export function listSubagentRunRecords(dirs: Dirs, options: { limit?: number } = {}): SubagentRunRecord[] {
+  ensureDirSync(dirs.runs);
+
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(dirs.runs);
+  } catch {
+    return [];
+  }
+
+  const records: SubagentRunRecord[] = [];
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+
+    const parsed = readJsonFile<unknown>(join(dirs.runs, entry));
+    if (!parsed || !isValidSubagentRunRecord(parsed)) continue;
+
+    records.push(parsed);
+  }
+
+  records.sort((a, b) => {
+    const lastSeen = Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt);
+    if (lastSeen !== 0) return lastSeen;
+
+    const started = Date.parse(b.startedAt) - Date.parse(a.startedAt);
+    if (started !== 0) return started;
+
+    return a.recordId.localeCompare(b.recordId);
+  });
+
+  if (typeof options.limit === "number" && options.limit >= 0) return records.slice(0, options.limit);
+  return records;
 }
 
 function removeRegistrationIfStillDead(filePath: string, expected: AgentRegistration): void {

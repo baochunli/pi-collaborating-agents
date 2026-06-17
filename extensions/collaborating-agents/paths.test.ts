@@ -50,6 +50,7 @@ describe("path resolution", () => {
       registry: path.join(expectedBase, "registry"),
       inbox: path.join(expectedBase, "inbox"),
       messageLog: path.join(expectedBase, "messages.jsonl"),
+      runs: path.join(expectedBase, "runs"),
     });
   });
 
@@ -67,6 +68,7 @@ describe("path resolution", () => {
       registry: path.join(overrideBase, "registry"),
       inbox: path.join(overrideBase, "inbox"),
       messageLog: path.join(overrideBase, "messages.jsonl"),
+      runs: path.join(overrideBase, "runs"),
     });
   });
 });

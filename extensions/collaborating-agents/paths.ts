@@ -9,5 +9,6 @@ export function resolveDirs(): Dirs {
     registry: join(base, "registry"),
     inbox: join(base, "inbox"),
     messageLog: join(base, "messages.jsonl"),
+    runs: join(base, "runs"),
   };
 }
