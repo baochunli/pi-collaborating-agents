@@ -14,12 +14,14 @@ import {
   getAgentByName,
   getConflictsWithOtherAgents,
   listActiveAgents,
+  listSubagentRunRecords,
   processInbox,
   readAgentRegistration,
   readMessageLog,
   readMessageLogTail,
   registerSelf,
   resolveActiveAgentName,
+  resolveSubagentRunRecord,
   resolveThreadPeerName,
   sendBroadcast,
   sendDirect,
@@ -34,10 +36,14 @@ import type {
   AgentRegistration,
   AgentRole,
   CollaboratingAgentsConfig,
+  Dirs,
   ExtensionState,
   InboxMessage,
   MessageLogEvent,
+  SubagentRunListRecord,
   SubagentRunRecord,
+  SubagentRunResolutionContext,
+  SubagentRunResolutionResult,
   SubagentRunStatus,
 } from "./types.js";
 import {
@@ -96,6 +102,8 @@ function resolveHomeDir(): string {
 const AGENT_MESSAGE_ACTIONS = [
   "status",
   "list",
+  "sessions",
+  "session",
   "send",
   "broadcast",
   "feed",
@@ -106,9 +114,10 @@ const AGENT_MESSAGE_ACTIONS = [
 
 const AgentMessageParams = Type.Object({
   action: StringEnum(AGENT_MESSAGE_ACTIONS, {
-    description: "Action: status | list | send | broadcast | feed | thread | reserve | release",
+    description: "Action: status | list | sessions | session | send | broadcast | feed | thread | reserve | release",
   }),
-  to: Type.Optional(Type.String({ description: "Target agent name (required for send/thread)" })),
+  to: Type.Optional(Type.String({ description: "Target agent name (send/thread) or subagent run selector (session)" })),
+  runId: Type.Optional(Type.String({ description: "Subagent run id selector for session action; takes precedence over to" })),
   message: Type.Optional(Type.String({ description: "Message text (required for send/broadcast)" })),
   replyTo: Type.Optional(Type.String({ description: "Reply message id (optional, for send)" })),
   urgent: Type.Optional(
@@ -116,7 +125,8 @@ const AgentMessageParams = Type.Object({
       description: "If true, interrupt recipients immediately. If false, queue after current turn.",
     }),
   ),
-  limit: Type.Optional(Type.Number({ description: "Max messages to return (feed/thread), default 20" })),
+  limit: Type.Optional(Type.Number({ description: "Max messages or subagent runs to return, default 20" })),
+  includeCompleted: Type.Optional(Type.Boolean({ description: "Include completed/failed subagent runs in sessions output" })),
   paths: Type.Optional(Type.Array(Type.String(), { description: "Reservation path patterns (reserve/release)" })),
   reason: Type.Optional(Type.String({ description: "Optional reservation reason (reserve)" })),
 });
@@ -143,6 +153,23 @@ type SubagentRunRecordPatch = Partial<SubagentRunRecord> & {
   sessionFileUnavailableReason?: string | null;
 };
 
+interface AgentMessageSubagentRunParams {
+  to?: string;
+  runId?: string;
+  limit?: number;
+  includeCompleted?: boolean;
+}
+
+interface AgentMessageSubagentRunContext extends SubagentRunResolutionContext {
+  now?: Date | string | number;
+}
+
+interface AgentMessageToolResponse {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+  details: Record<string, unknown>;
+}
+
 function formatToolCallArgs(args: unknown): string {
   const json = JSON.stringify(args, null, 2) ?? "{}";
   const maxChars = 2000;
@@ -156,6 +183,274 @@ function isProcessAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+function normalizeSubagentSessionLimit(raw: number | undefined, fallback = 20, max = 100): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
+  return Math.max(1, Math.min(max, Math.floor(raw)));
+}
+
+function isActiveRunStatus(status: SubagentRunStatus): boolean {
+  return status === "launching" || status === "running";
+}
+
+function isRunScopedToContext(record: SubagentRunListRecord, context: AgentMessageSubagentRunContext): boolean {
+  if (context.parentSessionId) return record.parentSessionId === context.parentSessionId;
+  if (
+    context.parentAgent &&
+    typeof context.parentPid === "number" &&
+    record.parentAgent === context.parentAgent &&
+    record.parentPid === context.parentPid
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function formatRunName(record: SubagentRunListRecord): string {
+  return record.displayName ?? (record.name ? formatAgentDisplayName(record.name) : "(not launched)");
+}
+
+function formatSessionId(sessionId: string | undefined): string {
+  return sessionId ? `${sessionId.slice(0, 12)}${sessionId.length > 12 ? "..." : ""}` : "(not reported)";
+}
+
+function formatRunCandidateList(candidates: SubagentRunListRecord[]): string {
+  if (candidates.length === 0) return "No candidate subagent runs are available.";
+  return candidates
+    .map((record) => {
+      const stale = record.isStale ? " [stale]" : "";
+      return `- ${record.recordId} (${formatRunName(record)}, ${record.status}${stale}, session ${formatSessionId(record.sessionId)})`;
+    })
+    .join("\n");
+}
+
+export function formatSubagentRunList(args: {
+  records: SubagentRunListRecord[];
+  total: number;
+  limit: number;
+  includeCompleted: boolean;
+}): string {
+  if (args.total === 0) {
+    return args.includeCompleted
+      ? "No subagent sessions found for this coordinator."
+      : "No active subagent sessions found for this coordinator.";
+  }
+
+  const lines = args.records.map((record) => {
+    const stale = record.isStale ? " [stale]" : "";
+    const sessionFile = record.sessionFile
+      ? "session file ready"
+      : record.sessionFileUnavailableReason
+        ? "session file pending"
+        : "session file unknown";
+    return [
+      `- ${record.recordId}: ${formatRunName(record)}`,
+      `${record.status}${stale}`,
+      `type ${record.type}`,
+      `session ${formatSessionId(record.sessionId)}`,
+      sessionFile,
+      `task "${record.taskPreview}"`,
+    ].join(" | ");
+  });
+
+  if (args.records.length < args.total) {
+    lines.push(`${args.total - args.records.length} more not shown. Increase limit to inspect more runs.`);
+  }
+
+  return `Subagent sessions (${args.records.length} of ${args.total}):\n${lines.join("\n")}`;
+}
+
+export function formatSubagentRunDetail(record: SubagentRunListRecord): string {
+  const stale = record.isStale ? " [stale]" : "";
+  const lines = [
+    `Subagent session ${record.recordId}`,
+    `Name: ${formatRunName(record)}`,
+    `Status: ${record.status}${stale}`,
+    `Batch ID: ${record.batchRunId}`,
+    `Task index: ${record.taskIndex}`,
+    `Type: ${record.type}`,
+    `Session ID: ${record.sessionId ?? "(not reported)"}`,
+    `Session file: ${record.sessionFile ?? "(not available)"}`,
+    `Working directory: ${record.cwd}`,
+    `Started: ${record.startedAt}`,
+    `Last seen: ${record.lastSeenAt}`,
+    `Task: ${record.taskPreview}`,
+  ];
+
+  if (record.sessionFileUnavailableReason) {
+    lines.push(`Session file note: ${record.sessionFileUnavailableReason}`);
+  }
+  if (record.completedAt) lines.push(`Completed: ${record.completedAt}`);
+  if (typeof record.exitCode === "number") lines.push(`Exit code: ${record.exitCode}`);
+  if (record.model) lines.push(`Model: ${record.model}`);
+  if (record.outputPreview) lines.push(`Output preview: ${record.outputPreview}`);
+  if (record.warnings?.length) lines.push(`Warnings: ${record.warnings.join("; ")}`);
+
+  return lines.join("\n");
+}
+
+export function findSessionFileBySessionId(sessionId: string | undefined): string | undefined {
+  if (!sessionId) return undefined;
+
+  const sessionsRoot = join(resolveHomeDir(), ".pi", "agent", "sessions");
+  if (!fs.existsSync(sessionsRoot)) return undefined;
+
+  const targetSuffix = `_${sessionId}.jsonl`;
+  const stack = [sessionsRoot];
+
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    if (!dir) continue;
+
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (entry.name.endsWith(targetSuffix)) return fullPath;
+    }
+  }
+
+  return undefined;
+}
+
+export function handleAgentMessageSessions(
+  dirs: Dirs,
+  params: AgentMessageSubagentRunParams,
+  context: AgentMessageSubagentRunContext,
+): AgentMessageToolResponse {
+  const limit = normalizeSubagentSessionLimit(params.limit);
+  const includeCompleted = params.includeCompleted === true;
+  const scoped = listSubagentRunRecords(dirs, {
+    now: context.now,
+    staleAfterMs: context.staleAfterMs,
+  }).filter((record) => isRunScopedToContext(record, context));
+  const filtered = includeCompleted ? scoped : scoped.filter((record) => isActiveRunStatus(record.status));
+  const records = filtered.slice(0, limit);
+  const truncated = records.length < filtered.length;
+
+  return {
+    content: [{ type: "text", text: formatSubagentRunList({ records, total: filtered.length, limit, includeCompleted }) }],
+    details: {
+      action: "sessions",
+      includeCompleted,
+      limit,
+      total: filtered.length,
+      displayed: records.length,
+      truncated,
+      remaining: Math.max(0, filtered.length - records.length),
+      records,
+    },
+  };
+}
+
+function refreshResolvedRunRecord(
+  dirs: Dirs,
+  record: SubagentRunListRecord,
+  context: AgentMessageSubagentRunContext,
+): { record: SubagentRunListRecord; sessionFileResolved: boolean } {
+  if (record.sessionFile || !record.sessionId) {
+    return { record, sessionFileResolved: false };
+  }
+
+  const sessionFile = findSessionFileBySessionId(record.sessionId);
+  if (!sessionFile) return { record, sessionFileResolved: false };
+
+  const updated = updateSubagentRunRecordWith(dirs, record.recordId, (existing) => ({
+    sessionFile: existing.sessionFile ?? sessionFile,
+    sessionFileUnavailableReason: null,
+  }));
+  if (!updated) return { record, sessionFileResolved: false };
+
+  const refreshed = resolveSubagentRunRecord(dirs, record.recordId, context);
+  return {
+    record: refreshed.status === "ok" ? refreshed.record : { ...record, sessionFile, sessionFileUnavailableReason: undefined },
+    sessionFileResolved: true,
+  };
+}
+
+function resolutionFromRunIdMatches(
+  selector: string,
+  matches: SubagentRunListRecord[],
+): SubagentRunResolutionResult | undefined {
+  if (matches.length === 0) return undefined;
+  if (matches.length === 1) return { status: "ok", record: matches[0] };
+  return {
+    status: "ambiguous",
+    message: `Selector "${selector}" matched multiple subagent runs`,
+    candidates: [...matches].sort((a, b) => a.recordId.localeCompare(b.recordId)),
+  };
+}
+
+function resolveSubagentRunId(
+  dirs: Dirs,
+  runId: string,
+  context: AgentMessageSubagentRunContext,
+): SubagentRunResolutionResult {
+  const selector = runId.trim();
+  const records = listSubagentRunRecords(dirs, {
+    now: context.now,
+    staleAfterMs: context.staleAfterMs,
+  });
+
+  return (
+    resolutionFromRunIdMatches(selector, records.filter((record) => record.recordId === selector)) ??
+    resolutionFromRunIdMatches(selector, records.filter((record) => record.recordId.startsWith(selector))) ??
+    resolutionFromRunIdMatches(selector, records.filter((record) => record.batchRunId === selector)) ??
+    resolveSubagentRunRecord(dirs, selector, context)
+  );
+}
+
+export function handleAgentMessageSession(
+  dirs: Dirs,
+  params: AgentMessageSubagentRunParams,
+  context: AgentMessageSubagentRunContext,
+): AgentMessageToolResponse {
+  const requestedSelector = params.runId?.trim() || params.to?.trim() || "latest";
+  const resolved = params.runId?.trim()
+    ? resolveSubagentRunId(dirs, params.runId, context)
+    : resolveSubagentRunRecord(dirs, requestedSelector, context);
+
+  if (resolved.status !== "ok") {
+    const error = resolved.status === "ambiguous" ? "ambiguous_selector" : "not_found";
+    const candidates = resolved.candidates;
+    return {
+      content: [{ type: "text", text: `${resolved.message}\n\nCandidates:\n${formatRunCandidateList(candidates)}` }],
+      isError: true,
+      details: {
+        action: "session",
+        requestedSelector,
+        requestedRunId: params.runId,
+        requestedTo: params.to,
+        error,
+        message: resolved.message,
+        candidates,
+      },
+    };
+  }
+
+  const { record, sessionFileResolved } = refreshResolvedRunRecord(dirs, resolved.record, context);
+  return {
+    content: [{ type: "text", text: formatSubagentRunDetail(record) }],
+    details: {
+      action: "session",
+      requestedSelector,
+      requestedRunId: params.runId,
+      requestedTo: params.to,
+      sessionFileResolved,
+      record,
+    },
+  };
 }
 
 export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
@@ -1122,40 +1417,6 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     );
   }
 
-  function findSessionFileBySessionId(sessionId: string | undefined): string | undefined {
-    if (!sessionId) return undefined;
-
-    const sessionsRoot = join(resolveHomeDir(), ".pi", "agent", "sessions");
-    if (!fs.existsSync(sessionsRoot)) return undefined;
-
-    const targetSuffix = `_${sessionId}.jsonl`;
-    const stack = [sessionsRoot];
-
-    while (stack.length > 0) {
-      const dir = stack.pop();
-      if (!dir) continue;
-
-      let entries: fs.Dirent[] = [];
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-
-      for (const entry of entries) {
-        const fullPath = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          stack.push(fullPath);
-          continue;
-        }
-        if (!entry.isFile()) continue;
-        if (entry.name.endsWith(targetSuffix)) return fullPath;
-      }
-    }
-
-    return undefined;
-  }
-
   function snapshotCompletedSubagents(results: SpawnResult[]): void {
     const now = new Date().toISOString();
     const liveByName = new Map(listActiveAgents(dirs).map((agent) => [agent.name, agent] as const));
@@ -1557,6 +1818,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 Actions:
 - status: Current agent identity/focus/peer count
 - list: List active agents
+- sessions: List scoped subagent run/session records
+- session: Resolve one subagent run/session record
 - send: Send direct message to one active agent (set urgent: true to interrupt immediately)
 - broadcast: Send message to all active peers (set urgent: true to interrupt immediately)
 - feed: Read recent global messages
@@ -1630,6 +1893,22 @@ Actions:
           content: [{ type: "text", text: `Active agents:\n${lines.join("\n")}` }],
           details: { action, agents: peers },
         };
+      }
+
+      if (action === "sessions") {
+        return handleAgentMessageSessions(dirs, params, {
+          parentAgent: state.agentName,
+          parentSessionId: ctx.sessionManager.getSessionId(),
+          parentPid: process.pid,
+        });
+      }
+
+      if (action === "session") {
+        return handleAgentMessageSession(dirs, params, {
+          parentAgent: state.agentName,
+          parentSessionId: ctx.sessionManager.getSessionId(),
+          parentPid: process.pid,
+        });
       }
 
       if (action === "send") {

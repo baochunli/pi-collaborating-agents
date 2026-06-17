@@ -8,9 +8,12 @@ import type {
   RegisteredCommand,
   ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
-import collaboratingAgentsExtension from "./index.ts";
-import { listSubagentRunRecords, updateSubagentRunRecord } from "./store.ts";
-import type { Dirs, SubagentRunListRecord } from "./types.ts";
+import collaboratingAgentsExtension, {
+  handleAgentMessageSession,
+  handleAgentMessageSessions,
+} from "./index.ts";
+import { listSubagentRunRecords, updateSubagentRunRecord, writeSubagentRunRecord } from "./store.ts";
+import type { Dirs, SubagentRunListRecord, SubagentRunRecord } from "./types.ts";
 
 const tempDirs: string[] = [];
 const ORIGINAL_COLLAB_DIR = process.env.COLLABORATING_AGENTS_DIR;
@@ -138,6 +141,25 @@ function makeDirs(stateDir: string): Dirs {
   };
 }
 
+function makeRunRecord(overrides: Partial<SubagentRunRecord> = {}): SubagentRunRecord {
+  return {
+    recordId: "run-1",
+    batchRunId: "batch-1",
+    taskIndex: 0,
+    parentAgent: "Coordinator",
+    parentSessionId: "parent-session",
+    parentPid: 123,
+    type: "worker",
+    taskPreview: "Inspect the repository",
+    cwd: "/work",
+    status: "running",
+    launchMode: "process",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    lastSeenAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
 function listRecords(stateDir: string): SubagentRunListRecord[] {
   return listSubagentRunRecords(makeDirs(stateDir));
 }
@@ -257,6 +279,251 @@ function makeContext(cwd: string): ExtensionContext {
     getSystemPrompt: () => "system prompt",
   } as ExtensionContext;
 }
+
+describe("agent_message subagent sessions", () => {
+  test("sessions lists scoped runs newest first with completed filtering, stale markers, and truncation", () => {
+    const stateDir = makeTempDir("collab-index-sessions-list");
+    const dirs = makeDirs(stateDir);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "run-stale",
+      batchRunId: "batch-stale",
+      name: "worker-stale",
+      displayName: "Worker Stale",
+      status: "running",
+      lastSeenAt: "2026-01-04T00:00:00.000Z",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "run-done",
+      batchRunId: "batch-done",
+      name: "worker-done",
+      displayName: "Worker Done",
+      status: "completed",
+      lastSeenAt: "2026-01-03T00:00:00.000Z",
+      completedAt: "2026-01-03T00:05:00.000Z",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "run-failed",
+      batchRunId: "batch-failed",
+      name: "worker-failed",
+      displayName: "Worker Failed",
+      status: "failed",
+      lastSeenAt: "2026-01-02T00:00:00.000Z",
+      completedAt: "2026-01-02T00:05:00.000Z",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "other-parent",
+      batchRunId: "batch-other",
+      parentSessionId: "other-session",
+      parentPid: 456,
+      lastSeenAt: "2026-01-05T00:00:00.000Z",
+    }))).toBe(true);
+
+    const activeOnly = handleAgentMessageSessions(dirs, { limit: 10 }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:05.000Z",
+      staleAfterMs: 1000,
+    });
+    expect(activeOnly.details).toMatchObject({
+      action: "sessions",
+      includeCompleted: false,
+      total: 1,
+      truncated: false,
+    });
+    expect((activeOnly.details as { records: SubagentRunListRecord[] }).records.map((record) => record.recordId)).toEqual(["run-stale"]);
+
+    const withCompleted = handleAgentMessageSessions(dirs, { limit: 2, includeCompleted: true }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:05.000Z",
+      staleAfterMs: 1000,
+    });
+
+    expect(withCompleted.content[0]?.text).toContain("Subagent sessions (2 of 3)");
+    expect(withCompleted.content[0]?.text).toContain("[stale]");
+    expect(withCompleted.content[0]?.text).toContain("1 more not shown");
+    expect(withCompleted.details).toMatchObject({
+      action: "sessions",
+      includeCompleted: true,
+      total: 3,
+      displayed: 2,
+      truncated: true,
+    });
+    expect((withCompleted.details as { records: SubagentRunListRecord[] }).records.map((record) => record.recordId)).toEqual([
+      "run-stale",
+      "run-done",
+    ]);
+  });
+
+  test("session uses runId precedence, defaults to latest, and lazily resolves missing session files", () => {
+    const tempDir = makeTempDir("collab-index-session-detail");
+    const stateDir = path.join(tempDir, "state");
+    const dirs = makeDirs(stateDir);
+    process.env.HOME = tempDir;
+    process.env.USERPROFILE = tempDir;
+
+    const fallbackSessionFile = path.join(tempDir, ".pi", "agent", "sessions", "nested", "local_target-session.jsonl");
+    fs.mkdirSync(path.dirname(fallbackSessionFile), { recursive: true });
+    fs.writeFileSync(fallbackSessionFile, "", "utf-8");
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "run-target",
+      batchRunId: "batch-target",
+      name: "worker-target",
+      displayName: "Worker Target",
+      sessionId: "target-session",
+      sessionFileUnavailableReason: "missing for now",
+      lastSeenAt: "2026-01-03T00:00:00.000Z",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "run-selector",
+      batchRunId: "batch-selector",
+      name: "selector",
+      displayName: "Selector",
+      sessionId: "selector-session",
+      sessionFile: path.join(tempDir, "selector.jsonl"),
+      lastSeenAt: "2026-01-04T00:00:00.000Z",
+    }))).toBe(true);
+
+    const byRunId = handleAgentMessageSession(dirs, { runId: "run-target", to: "selector" }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:00.000Z",
+    });
+    expect(byRunId.details).toMatchObject({
+      action: "session",
+      requestedSelector: "run-target",
+      record: {
+        recordId: "run-target",
+        sessionFile: fallbackSessionFile,
+      },
+      sessionFileResolved: true,
+    });
+    expect(byRunId.content[0]?.text).toContain(fallbackSessionFile);
+    expect(listRecords(stateDir).find((record) => record.recordId === "run-target")?.sessionFile).toBe(fallbackSessionFile);
+
+    const latest = handleAgentMessageSession(dirs, {}, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:00.000Z",
+    });
+    expect(latest.details).toMatchObject({
+      action: "session",
+      requestedSelector: "latest",
+      record: {
+        recordId: "run-selector",
+      },
+    });
+  });
+
+  test("session runId resolution prefers record id over colliding names", () => {
+    const stateDir = makeTempDir("collab-index-session-run-id-precedence");
+    const dirs = makeDirs(stateDir);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "run-target",
+      batchRunId: "batch-target",
+      name: "worker-target",
+      displayName: "Worker Target",
+      lastSeenAt: "2026-01-02T00:00:00.000Z",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "actual-record",
+      batchRunId: "batch-actual",
+      name: "run-target",
+      displayName: "Run Target",
+      lastSeenAt: "2026-01-03T00:00:00.000Z",
+    }))).toBe(true);
+
+    const result = handleAgentMessageSession(dirs, { runId: "run-target" }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:00.000Z",
+    });
+
+    expect(result.details).toMatchObject({
+      action: "session",
+      record: {
+        recordId: "run-target",
+      },
+    });
+  });
+
+  test("session returns helpful candidate lists for unknown and ambiguous selectors", () => {
+    const stateDir = makeTempDir("collab-index-session-errors");
+    const dirs = makeDirs(stateDir);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "shared-0",
+      batchRunId: "batch-shared",
+      taskIndex: 0,
+      name: "worker-one",
+      displayName: "Worker One",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "shared-1",
+      batchRunId: "batch-shared",
+      taskIndex: 1,
+      name: "worker-two",
+      displayName: "Worker Two",
+    }))).toBe(true);
+
+    const context = {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:00.000Z",
+    };
+
+    const ambiguous = handleAgentMessageSession(dirs, { to: "batch-shared" }, context);
+    expect(ambiguous.isError).toBe(true);
+    expect(ambiguous.details).toMatchObject({
+      action: "session",
+      error: "ambiguous_selector",
+      candidates: [{ recordId: "shared-0" }, { recordId: "shared-1" }],
+    });
+    expect(ambiguous.content[0]?.text).toContain("matched multiple subagent runs");
+    expect(ambiguous.content[0]?.text).toContain("shared-0");
+
+    const missing = handleAgentMessageSession(dirs, { to: "missing" }, context);
+    expect(missing.isError).toBe(true);
+    expect(missing.details).toMatchObject({
+      action: "session",
+      error: "not_found",
+      candidates: [{ recordId: "shared-0" }, { recordId: "shared-1" }],
+    });
+    expect(missing.content[0]?.text).toContain("No subagent run matched");
+  });
+
+  test("agent_message accepts sessions and session actions", async () => {
+    const tempDir = makeTempDir("collab-index-session-tool");
+    process.env.HOME = tempDir;
+    process.env.USERPROFILE = tempDir;
+    process.env.COLLABORATING_AGENTS_DIR = path.join(tempDir, "state");
+
+    const harness = makeHarness();
+    collaboratingAgentsExtension(harness.pi);
+    const agentMessageTool = harness.tools.get("agent_message");
+    if (!agentMessageTool) throw new Error("agent_message tool was not registered");
+
+    const ctx = makeContext(tempDir);
+    const sessions = await agentMessageTool.execute("tool-call-sessions", { action: "sessions" }, undefined, undefined, ctx);
+    expect(sessions.isError).toBeUndefined();
+    expect(sessions.details).toMatchObject({ action: "sessions", records: [] });
+
+    const session = await agentMessageTool.execute("tool-call-session", { action: "session" }, undefined, undefined, ctx);
+    expect(session.isError).toBe(true);
+    expect(session.details).toMatchObject({ action: "session", error: "not_found" });
+
+    await Promise.all((harness.handlers.get("session_shutdown") ?? []).map((handler) => handler(undefined, ctx)));
+  });
+});
 
 describe("subagent launch identity", () => {
   test("subagent tool returns batch/run ids and writes planned single-child records immediately", async () => {

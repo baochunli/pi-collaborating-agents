@@ -156,6 +156,8 @@ export interface CollaboratingAgentsConfig {
 export type AgentMessageAction =
   | "status"
   | "list"
+  | "sessions"
+  | "session"
   | "send"
   | "broadcast"
   | "feed"
