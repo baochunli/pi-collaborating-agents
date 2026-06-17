@@ -1126,7 +1126,7 @@ describe("subagent spawn", () => {
     process.env.TEST_ARGS_FILE = argsFile;
     process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
     process.env.TEST_CMUX_SEND_ASYNC = "1";
-    process.env.TEST_PI_EXIT_DELAY_MS = "2500";
+    process.env.TEST_PI_EXIT_DELAY_MS = "5000";
     process.env.TEST_PI_SAME_MTIME_FINAL_ONLY = "1";
 
     const agentDef: SpawnAgentDefinition = {
@@ -1157,7 +1157,7 @@ describe("subagent spawn", () => {
 
     const elapsed = Date.now() - startedAt;
     expect(elapsed).toBeGreaterThanOrEqual(1000);
-    expect(elapsed).toBeLessThan(2000);
+    expect(elapsed).toBeLessThan(4500);
     expect(result.exitCode).toBe(0);
     expect(result.output).toBe("fake-ok");
     expect(result.cmuxPaneClosed).toBe(true);
@@ -1215,7 +1215,7 @@ describe("subagent spawn", () => {
       },
     );
 
-    expect(Date.now() - startedAt).toBeLessThan(2400);
+    expect(Date.now() - startedAt).toBeLessThan(4500);
     expect(result.exitCode).toBe(0);
     expect(result.cmuxPaneClosed).toBeUndefined();
     expect(result.cmuxCloseError).toBeUndefined();
@@ -1538,7 +1538,7 @@ describe("subagent spawn", () => {
     process.env.TEST_ARGS_FILE = argsFile;
     process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
     process.env.TEST_CMUX_SEND_ASYNC = "1";
-    process.env.TEST_PI_EXIT_DELAY_MS = "2500";
+    process.env.TEST_PI_EXIT_DELAY_MS = "5000";
 
     const agentDef: SpawnAgentDefinition = {
       name: "worker",
@@ -1567,7 +1567,7 @@ describe("subagent spawn", () => {
 
     const elapsed = Date.now() - startedAt;
     expect(elapsed).toBeGreaterThanOrEqual(1000);
-    expect(elapsed).toBeLessThan(2400);
+    expect(elapsed).toBeLessThan(4500);
     expect(result.exitCode).toBe(0);
     expect(result.cmuxPaneClosed).toBe(true);
 

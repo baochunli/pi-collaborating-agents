@@ -317,6 +317,36 @@ function makeContext(cwd: string): ExtensionContext {
   } as ExtensionContext;
 }
 
+describe("tool documentation metadata", () => {
+  test("agent_message describes subagent session inspection actions and selectors", () => {
+    const harness = makeHarness();
+    collaboratingAgentsExtension(harness.pi);
+
+    const agentMessageTool = harness.tools.get("agent_message");
+    expect(agentMessageTool).toBeDefined();
+
+    const description = agentMessageTool?.description ?? "";
+    expect(description).toContain("- sessions:");
+    expect(description).toContain("- session:");
+    expect(description).toContain("- tail:");
+    expect(description).toContain("display name");
+    expect(description).toContain("canonical name");
+    expect(description).toContain("recordId");
+    expect(description).toContain("batch id");
+    expect(description).toContain("session id prefix");
+    expect(description).toContain("latest");
+    expect(description).toContain("Do not scan ~/.pi/agent/sessions manually");
+
+    const subagentTool = harness.tools.get("subagent");
+    const subagentDescription = subagentTool?.description ?? "";
+    expect(subagentDescription).toContain("Batch ID");
+    expect(subagentDescription).toContain("Run ID");
+    expect(subagentDescription).toContain('agent_message({ action: "sessions" })');
+    expect(subagentDescription).toContain('agent_message({ action: "session", runId:');
+    expect(subagentDescription).toContain('agent_message({ action: "tail", runId:');
+  });
+});
+
 describe("agent_message subagent sessions", () => {
   test("sessions lists scoped runs newest first with completed filtering, stale markers, and truncation", () => {
     const stateDir = makeTempDir("collab-index-sessions-list");

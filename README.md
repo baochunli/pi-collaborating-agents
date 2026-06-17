@@ -117,6 +117,9 @@ Actions:
 
 - `status` – current identity, focus mode, peer count, and your reservation count
 - `list` – list active agents (includes reservation counts when present)
+- `sessions` – list scoped subagent run/session records; active runs by default, completed/failed when `includeCompleted: true`
+- `session` – resolve one subagent run/session record
+- `tail` – read a concise transcript tail for one resolved subagent run/session
 - `send` – send direct message (`to` + `message`, optional `replyTo`, optional `urgent`)
 - `broadcast` – send to all active peers (`message`, optional `urgent`)
 - `feed` – recent global message log (`limit` optional)
@@ -130,6 +133,11 @@ Examples:
 
 ```ts
 agent_message({ action: "list" })
+agent_message({ action: "sessions" })
+agent_message({ action: "sessions", includeCompleted: true })
+agent_message({ action: "session", runId: "subagent-run-id" })
+agent_message({ action: "tail", runId: "subagent-run-id" })
+agent_message({ action: "tail", to: "latest" })
 agent_message({ action: "send", to: "BlueFalcon", message: "I finished parsing" })
 agent_message({ action: "send", to: "BlueFalcon", message: "Following up on your last note", replyTo: "msg-123" })
 agent_message({ action: "send", to: "BlueFalcon", message: "Need your decision now", urgent: true })
@@ -139,6 +147,33 @@ agent_message({ action: "reserve", paths: ["src/server/", "src/routes/account.ts
 agent_message({ action: "release", paths: ["src/server/"] })
 agent_message({ action: "release" })
 ```
+
+### Subagent Session Inspection
+
+Coordinators should inspect spawned subagents with `agent_message` instead of searching transcript files directly. Do not scan `~/.pi/agent/sessions` manually for normal subagent inspection; use the run registry so selectors stay scoped to the current coordinator.
+
+Common calls:
+
+```ts
+agent_message({ action: "sessions" })
+agent_message({ action: "sessions", includeCompleted: true })
+agent_message({ action: "session", runId: "subagent-run-id" })
+agent_message({ action: "tail", runId: "subagent-run-id" })
+agent_message({ action: "tail", to: "latest" })
+```
+
+Selectors accepted by `session` and `tail`:
+
+- child run id / `recordId`: the stable per-child id returned by `subagent` and launch notices
+- display name: the readable subagent name shown in launch/completion output
+- canonical name: the runtime subagent name recorded by the extension
+- batch id: accepted only when it resolves to one child; parallel batches are ambiguous and return candidates
+- session id prefix: matches the reported Pi session id prefix
+- `latest`: newest subagent run for the current coordinator
+
+`sessions` lists active/running records by default. Pass `includeCompleted: true` to include completed and failed runs. `session` returns run metadata, session id, session file status, launch mode, cwd, and task preview. `tail` reads and formats the resolved session JSONL tail; it rejects raw file paths so agents do not bypass selector scoping.
+
+Process-mode subagents are launched as background `pi` child processes without a deterministic `--session` file. The extension records the session id from child output and attaches a session file only after child self-registration or fallback discovery by session id. Until then, tailing can report: `Process-mode session file unavailable until child registration or fallback discovery provides one.` In `cmux-pane` mode, the extension creates an explicit session file under `~/.pi/agent/sessions/collaborating-agents-subagents/` and tails that file after it appears.
 
 ### The `subagent` Tool
 
@@ -186,6 +221,8 @@ subagent({
   ]
 })
 ```
+
+Launch responses and background launch notices include a Batch ID plus one child Run ID per spawned subagent. Prefer those Run IDs for `agent_message({ action: "session", runId: "..." })` and `agent_message({ action: "tail", runId: "..." })`; use `agent_message({ action: "sessions" })` to rediscover current active runs and `includeCompleted: true` for recent completed runs.
 
 ## Subagent Type Configuration
 
@@ -352,6 +389,7 @@ This affects:
 
 - `registry/` (active agent registrations)
 - `inbox/` (per-agent inbound queue)
+- `runs/` (durable subagent run/session records)
 - `messages.jsonl` (global append-only message log)
 
 Use this to isolate per-project state or relocate agent data.
@@ -383,11 +421,39 @@ States in this extension are stored at `~/.pi/agent/collaborating-agents/`:
 .pi/agent/collaborating-agents/
 ├── registry/          # One JSON file per agent
 ├── inbox/{name}/      # Inbound messages as JSON files, watched with fs.watch, one directory for each agent
+├── runs/              # Durable subagent run/session records, one JSON file per child run
 └── messages.jsonl     # Append-only log of all messages in the system
 ```
 
-To run all tests:
+## Validation
+
+Use `bun test` for implementation and docs validation. Useful focused checks for the subagent session inspection surface:
 
 ```bash
+bun test extensions/collaborating-agents/docs.test.ts
+bun test extensions/collaborating-agents/index.test.ts --test-name-pattern "tool documentation metadata|agent_message subagent sessions|subagent launch identity"
+bun test extensions/collaborating-agents/session-tail.test.ts
 bun test
+npm pack --dry-run
 ```
+
+Keep `npm pack --dry-run` as the packaging check before publishing or validating package contents.
+
+Manual smoke: process mode
+
+1. Use default `subagentLaunchMode: "process"` and spawn a single subagent.
+2. Confirm the launch notice shows Batch ID, Run ID, runtime name, and session status.
+3. Run `agent_message({ action: "sessions" })`, then `agent_message({ action: "session", runId: "<run-id>" })`.
+4. Run `agent_message({ action: "tail", runId: "<run-id>" })`; if the session file is still unavailable, confirm the process-mode unavailable reason is shown.
+
+Manual smoke: parallel ambiguity
+
+1. Spawn at least two parallel subagents in one batch.
+2. Run `agent_message({ action: "session", runId: "<batch-id>" })` and confirm it reports an ambiguous selector with candidate child Run IDs.
+3. Run `agent_message({ action: "tail", runId: "<child-run-id>" })` for a specific child.
+
+Manual smoke: cmux mode
+
+1. When running inside cmux, set `subagentLaunchMode: "cmux-pane"` and spawn a subagent.
+2. Confirm a visible pane opens and the launch/session-ready notices include a session file.
+3. Run `agent_message({ action: "tail", runId: "<run-id>" })` and confirm it tails the cmux session file.

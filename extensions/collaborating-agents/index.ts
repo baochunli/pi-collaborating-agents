@@ -118,8 +118,8 @@ const AgentMessageParams = Type.Object({
   action: StringEnum(AGENT_MESSAGE_ACTIONS, {
     description: "Action: status | list | sessions | session | tail | send | broadcast | feed | thread | reserve | release",
   }),
-  to: Type.Optional(Type.String({ description: "Target agent name (send/thread) or subagent run selector (session/tail)" })),
-  runId: Type.Optional(Type.String({ description: "Subagent run id selector for session/tail actions; takes precedence over to" })),
+  to: Type.Optional(Type.String({ description: "Target agent name (send/thread) or subagent run selector (session/tail): display name, canonical name, recordId, batch id, session id prefix, or latest" })),
+  runId: Type.Optional(Type.String({ description: "Subagent run selector for session/tail actions; preferred for child run id/recordId and takes precedence over to" })),
   message: Type.Optional(Type.String({ description: "Message text (required for send/broadcast)" })),
   replyTo: Type.Optional(Type.String({ description: "Reply message id (optional, for send)" })),
   urgent: Type.Optional(
@@ -127,9 +127,9 @@ const AgentMessageParams = Type.Object({
       description: "If true, interrupt recipients immediately. If false, queue after current turn.",
     }),
   ),
-  limit: Type.Optional(Type.Number({ description: "Max messages or subagent runs to return, default 20" })),
-  includeCompleted: Type.Optional(Type.Boolean({ description: "Include completed/failed subagent runs in sessions output" })),
-  raw: Type.Optional(Type.Boolean({ description: "For tail, include structured parsed entries in details" })),
+  limit: Type.Optional(Type.Number({ description: "Max messages, subagent runs, or tail entries to return; default 20" })),
+  includeCompleted: Type.Optional(Type.Boolean({ description: "For sessions, include completed/failed subagent runs; default lists active runs only" })),
+  raw: Type.Optional(Type.Boolean({ description: "For tail, include structured parsed session entries in details" })),
   paths: Type.Optional(Type.Array(Type.String(), { description: "Reservation path patterns (reserve/release)" })),
   reason: Type.Optional(Type.String({ description: "Optional reservation reason (reserve)" })),
 });
@@ -2165,7 +2165,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 Actions:
 - status: Current agent identity/focus/peer count
 - list: List active agents
-- sessions: List scoped subagent run/session records
+- sessions: List scoped subagent run/session records (active by default; pass includeCompleted: true for completed/failed)
 - session: Resolve one subagent run/session record
 - tail: Read a concise transcript tail for one subagent run/session
 - send: Send direct message to one active agent (set urgent: true to interrupt immediately)
@@ -2173,7 +2173,9 @@ Actions:
 - feed: Read recent global messages
 - thread: Read direct-message thread with one peer agent
 - reserve: Reserve files/directories for exclusive write/edit intent
-- release: Release reservations (specific paths or all)`,
+- release: Release reservations (specific paths or all)
+
+Subagent run selectors for session/tail: child run id/recordId, display name, canonical name, batch id when unambiguous, session id prefix, or latest. Prefer the Run ID returned by subagent launch/completion output. Do not scan ~/.pi/agent/sessions manually for normal subagent inspection; use sessions/session/tail so lookups stay scoped to this coordinator.`,
     parameters: AgentMessageParams,
     renderCall(args, theme) {
       const text = [
@@ -2506,6 +2508,8 @@ Actions:
 Modes:
 - Single: { task }
 - Parallel: { tasks: [{ task, cwd? }, ...] }
+
+Launch results include a Batch ID plus one child Run ID per spawned subagent. Inspect progress with agent_message({ action: "sessions" }), agent_message({ action: "session", runId: "<run-id>" }), and agent_message({ action: "tail", runId: "<run-id>" }).
 
 By default subagents use the same model as the spawning session.` ,
     parameters: SubagentParams,
