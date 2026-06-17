@@ -331,10 +331,7 @@ export function handleAgentMessageSessions(
 ): AgentMessageToolResponse {
   const limit = normalizeSubagentSessionLimit(params.limit);
   const includeCompleted = params.includeCompleted === true;
-  const scoped = listSubagentRunRecords(dirs, {
-    now: context.now,
-    staleAfterMs: context.staleAfterMs,
-  }).filter((record) => isRunScopedToContext(record, context));
+  const scoped = scopedSubagentRunRecords(dirs, context);
   const filtered = includeCompleted ? scoped : scoped.filter((record) => isActiveRunStatus(record.status));
   const records = filtered.slice(0, limit);
   const truncated = records.length < filtered.length;
@@ -379,6 +376,16 @@ function refreshResolvedRunRecord(
   };
 }
 
+function scopedSubagentRunRecords(
+  dirs: Dirs,
+  context: AgentMessageSubagentRunContext,
+): SubagentRunListRecord[] {
+  return listSubagentRunRecords(dirs, {
+    now: context.now,
+    staleAfterMs: context.staleAfterMs,
+  }).filter((record) => isRunScopedToContext(record, context));
+}
+
 function resolutionFromRunIdMatches(
   selector: string,
   matches: SubagentRunListRecord[],
@@ -398,17 +405,36 @@ function resolveSubagentRunId(
   context: AgentMessageSubagentRunContext,
 ): SubagentRunResolutionResult {
   const selector = runId.trim();
-  const records = listSubagentRunRecords(dirs, {
-    now: context.now,
-    staleAfterMs: context.staleAfterMs,
-  });
+  const records = scopedSubagentRunRecords(dirs, context);
 
   return (
     resolutionFromRunIdMatches(selector, records.filter((record) => record.recordId === selector)) ??
     resolutionFromRunIdMatches(selector, records.filter((record) => record.recordId.startsWith(selector))) ??
     resolutionFromRunIdMatches(selector, records.filter((record) => record.batchRunId === selector)) ??
-    resolveSubagentRunRecord(dirs, selector, context)
+    resolveScopedSubagentRunRecord(dirs, selector, context)
   );
+}
+
+function resolveScopedSubagentRunRecord(
+  dirs: Dirs,
+  selector: string,
+  context: AgentMessageSubagentRunContext,
+): SubagentRunResolutionResult {
+  const resolved = resolveSubagentRunRecord(dirs, selector, context);
+  if (resolved.status === "ok") {
+    return isRunScopedToContext(resolved.record, context)
+      ? resolved
+      : {
+          status: "not_found",
+          message: `No subagent run matched "${selector}" for this coordinator`,
+          candidates: scopedSubagentRunRecords(dirs, context).slice(0, context.candidateLimit ?? 10),
+        };
+  }
+
+  return {
+    ...resolved,
+    candidates: resolved.candidates.filter((record) => isRunScopedToContext(record, context)),
+  };
 }
 
 export function handleAgentMessageSession(
@@ -419,7 +445,7 @@ export function handleAgentMessageSession(
   const requestedSelector = params.runId?.trim() || params.to?.trim() || "latest";
   const resolved = params.runId?.trim()
     ? resolveSubagentRunId(dirs, params.runId, context)
-    : resolveSubagentRunRecord(dirs, requestedSelector, context);
+    : resolveScopedSubagentRunRecord(dirs, requestedSelector, context);
 
   if (resolved.status !== "ok") {
     const error = resolved.status === "ambiguous" ? "ambiguous_selector" : "not_found";

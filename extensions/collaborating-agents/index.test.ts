@@ -501,6 +501,53 @@ describe("agent_message subagent sessions", () => {
     expect(missing.content[0]?.text).toContain("No subagent run matched");
   });
 
+  test("session selectors and candidates are scoped to the current coordinator", () => {
+    const stateDir = makeTempDir("collab-index-session-scope");
+    const dirs = makeDirs(stateDir);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "current-run",
+      batchRunId: "batch-current",
+      name: "current-worker",
+      displayName: "Current Worker",
+      parentSessionId: "current-session",
+      parentPid: 123,
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "other-run",
+      batchRunId: "batch-other",
+      name: "other-worker",
+      displayName: "Other Worker",
+      parentSessionId: "other-session",
+      parentPid: 456,
+    }))).toBe(true);
+
+    const context = {
+      parentAgent: "Coordinator",
+      parentSessionId: "current-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:00.000Z",
+    };
+
+    const byRunId = handleAgentMessageSession(dirs, { runId: "other-run" }, context);
+    expect(byRunId.isError).toBe(true);
+    expect(byRunId.details).toMatchObject({
+      action: "session",
+      error: "not_found",
+      candidates: [{ recordId: "current-run" }],
+    });
+    expect(JSON.stringify((byRunId.details as { candidates?: unknown }).candidates)).not.toContain("other-run");
+
+    const byName = handleAgentMessageSession(dirs, { to: "other-worker" }, context);
+    expect(byName.isError).toBe(true);
+    expect(byName.details).toMatchObject({
+      action: "session",
+      error: "not_found",
+      candidates: [{ recordId: "current-run" }],
+    });
+    expect(JSON.stringify((byName.details as { candidates?: unknown }).candidates)).not.toContain("other-worker");
+  });
+
   test("agent_message accepts sessions and session actions", async () => {
     const tempDir = makeTempDir("collab-index-session-tool");
     process.env.HOME = tempDir;
