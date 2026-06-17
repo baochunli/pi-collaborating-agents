@@ -24,6 +24,7 @@ import {
   sendDirect,
   unregisterSelf,
   updateSelfHeartbeat,
+  writeSubagentRunRecord,
 } from "./store.js";
 import { registerRenderers } from "./renderers.js";
 import type {
@@ -34,6 +35,7 @@ import type {
   ExtensionState,
   InboxMessage,
   MessageLogEvent,
+  SubagentRunRecord,
 } from "./types.js";
 import {
   createSpawnAgentDefinitionFromType,
@@ -759,6 +761,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     },
     ctx: ExtensionContext,
     options?: {
+      batchRunId: string;
       includeLaunchBlock?: boolean;
       onLaunch?: (payload: {
         profile: string;
@@ -829,7 +832,15 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 
     markAsOrchestrator(ctx);
 
-    const runId = randomUUID().slice(0, 8);
+    const batchRunId = options?.batchRunId;
+    if (!batchRunId) {
+      return {
+        content: [{ type: "text", text: "Missing batch run id for subagent launch." }],
+        isError: true,
+        details: { mode: "subagent", error: "missing_batch_run_id" },
+      };
+    }
+
     const enableSessionControl = params.sessionControl !== false;
     const includeLaunchBlock = options?.includeLaunchBlock ?? true;
 
@@ -859,7 +870,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 
       const result = await runSpawnTask(ctx.cwd, taskToRun, runtimeAgent, {
         index: 0,
-        runId,
+        runId: batchRunId,
         defaultCwd: params.cwd,
         enableSessionControl,
         recursionDepth: depthState.depth,
@@ -892,7 +903,9 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         isError: ok ? false : true,
         details: {
           mode: "subagent",
-          runId,
+          runId: batchRunId,
+          batchRunId,
+          childRunIds: [`${batchRunId}-0`],
           single: true,
           profile,
           type: typeConfig.name,
@@ -927,7 +940,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     const results = await mapWithConcurrencyLimit(resolvedTasks, concurrency, async (entry, index) => {
       return await runSpawnTask(ctx.cwd, entry.task, entry.def, {
         index,
-        runId,
+        runId: batchRunId,
         defaultCwd: params.cwd,
         enableSessionControl,
         recursionDepth: depthState.depth,
@@ -981,7 +994,9 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       isError: successCount === results.length ? false : true,
       details: {
         mode: "subagent",
-        runId,
+        runId: batchRunId,
+        batchRunId,
+        childRunIds: results.map((_result, index) => `${batchRunId}-${index}`),
         single: false,
         concurrency,
         launchStaggerMs,
@@ -1239,7 +1254,88 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     return "A subagent run is already in progress. Do not wait for direct subagent messages; final outputs are auto-collected and posted when the run completes.";
   }
 
-  function launchSubagentsInBackground(params: SubagentLaunchParams, ctx: ExtensionContext): void {
+  function createSubagentBatchRunId(): string {
+    return randomUUID().slice(0, 8);
+  }
+
+  function getSubagentTaskItems(params: SubagentLaunchParams): Array<{ task: string; cwd?: string }> {
+    if (typeof params.task === "string" && params.task.trim().length > 0) {
+      return [{ task: params.task, cwd: params.cwd }];
+    }
+
+    return params.tasks ?? [];
+  }
+
+  function createChildRunIds(batchRunId: string, taskCount: number): string[] {
+    return Array.from({ length: taskCount }, (_value, index) => `${batchRunId}-${index}`);
+  }
+
+  function resolvePlannedSubagentType(params: SubagentLaunchParams, ctx: ExtensionContext): string {
+    const availableTypes = discoverSubagentTypes(ctx.cwd);
+    if (params.type) return findSubagentType(params.type, availableTypes)?.name ?? params.type.trim();
+    return getDefaultSubagentType(availableTypes).name;
+  }
+
+  function createPlannedSubagentRunRecords(
+    params: SubagentLaunchParams,
+    ctx: ExtensionContext,
+    batchRunId: string,
+  ): string[] {
+    config = loadConfig(ctx.cwd);
+
+    const tasks = getSubagentTaskItems(params);
+    const childRunIds = createChildRunIds(batchRunId, tasks.length);
+    const type = resolvePlannedSubagentType(params, ctx);
+    const now = new Date().toISOString();
+    const parentSessionFile = ctx.sessionManager.getSessionFile() ?? coordinatorSessionFile ?? localSessionFile;
+
+    tasks.forEach((task, taskIndex) => {
+      const record: SubagentRunRecord = {
+        recordId: childRunIds[taskIndex]!,
+        batchRunId,
+        taskIndex,
+        parentAgent: state.agentName,
+        parentSessionId: ctx.sessionManager.getSessionId(),
+        parentSessionFile,
+        parentPid: process.pid,
+        type,
+        taskPreview: task.task,
+        requestedCwd: task.cwd ?? params.cwd,
+        cwd: task.cwd ?? params.cwd ?? ctx.cwd,
+        status: "launching",
+        launchMode: config.subagentLaunchMode,
+        startedAt: now,
+        lastSeenAt: now,
+      };
+
+      writeSubagentRunRecord(dirs, record);
+    });
+
+    return childRunIds;
+  }
+
+  function formatSubagentLaunchQueuedText(mode: "single" | "parallel", taskCount: number, batchRunId: string, childRunIds: string[]): string {
+    const label =
+      mode === "single"
+        ? "Subagent launched in background."
+        : `${taskCount} subagents launched in background.`;
+    const runLabel = mode === "single" ? `Run ID: ${childRunIds[0]}` : `Run IDs: ${childRunIds.join(", ")}`;
+    return [
+      label,
+      `Batch ID: ${batchRunId}`,
+      runLabel,
+      'Use agent_message({ action: "sessions" }) or agent_message({ action: "tail", to: "latest" }) to inspect progress.',
+      "Do not wait for direct subagent messages; final outputs are auto-collected and posted on completion.",
+    ].join("\n");
+  }
+
+  function launchSubagentsInBackground(
+    params: SubagentLaunchParams,
+    ctx: ExtensionContext,
+    options?: { batchRunId?: string },
+  ): { batchRunId: string; childRunIds: string[] } {
+    const batchRunId = options?.batchRunId ?? createSubagentBatchRunId();
+    const childRunIds = createPlannedSubagentRunRecords(params, ctx, batchRunId);
     const launchSessionFile = ctx.sessionManager.getSessionFile() ?? coordinatorSessionFile ?? localSessionFile;
 
     state.activeSubagentRuns += 1;
@@ -1253,6 +1349,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           params,
           ctx,
           {
+            batchRunId,
             includeLaunchBlock: false,
             onLaunch: ({ profile, launch }) => sendSubagentLaunchUpdate(profile, launch),
           },
@@ -1278,6 +1375,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         updateStatus(ctx);
       }
     })();
+
+    return { batchRunId, childRunIds };
   }
 
   pi.registerTool({
@@ -1640,21 +1739,24 @@ By default subagents use the same model as the spawning session.` ,
       }
 
       if (ctx.hasUI) ctx.ui.notify("Launching subagent in background...", "info");
-      launchSubagentsInBackground(params, ctx);
-
-      const label =
-        validation.mode === "single"
-          ? "Subagent launched in background."
-          : `${validation.taskCount} subagents launched in background.`;
+      const batchRunId = createSubagentBatchRunId();
+      const { childRunIds } = launchSubagentsInBackground(params, ctx, { batchRunId });
 
       return {
-        content: [{ type: "text", text: `${label} Do not wait for direct subagent messages; final outputs are auto-collected and posted on completion.` }],
+        content: [
+          {
+            type: "text",
+            text: formatSubagentLaunchQueuedText(validation.mode, validation.taskCount, batchRunId, childRunIds),
+          },
+        ],
         details: {
           mode: "subagent",
           queued: true,
           background: true,
           launchMode: validation.mode,
           taskCount: validation.taskCount,
+          batchRunId,
+          childRunIds,
         },
       };
     },
@@ -1716,9 +1818,14 @@ By default subagents use the same model as the spawning session.` ,
       }
 
       const typeLabel = type ? ` (${type})` : "";
-      ctx.ui.notify(`Launching subagent${typeLabel} in background...`, "info");
+      const batchRunId = createSubagentBatchRunId();
+      const childRunIds = createChildRunIds(batchRunId, 1);
+      ctx.ui.notify(
+        `Launching subagent${typeLabel} in background. Batch ID: ${batchRunId}. Run ID: ${childRunIds[0]}.`,
+        "info",
+      );
 
-      launchSubagentsInBackground({ task, type }, ctx);
+      launchSubagentsInBackground({ task, type }, ctx, { batchRunId });
     },
   });
 
