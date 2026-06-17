@@ -404,6 +404,31 @@ function resolutionFromRunIdMatches(
   };
 }
 
+function normalizeSubagentRunSelector(selector: string | undefined): string {
+  return (selector?.trim() || "latest").replace(/\s+\((subagent|orchestrator)\)$/i, "");
+}
+
+function latestScopedSubagentRun(records: SubagentRunListRecord[]): SubagentRunListRecord | undefined {
+  return [...records].sort((a, b) => {
+    const lastSeen = Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt);
+    if (lastSeen !== 0) return lastSeen;
+
+    const started = Date.parse(b.startedAt) - Date.parse(a.startedAt);
+    if (started !== 0) return started;
+
+    if (a.isStale !== b.isStale) return a.isStale ? 1 : -1;
+
+    return a.recordId.localeCompare(b.recordId);
+  })[0];
+}
+
+function cappedScopedSubagentRunCandidates(
+  records: SubagentRunListRecord[],
+  context: AgentMessageSubagentRunContext,
+): SubagentRunListRecord[] {
+  return records.slice(0, Math.max(0, context.candidateLimit ?? 10));
+}
+
 function resolveSubagentRunId(
   dirs: Dirs,
   runId: string,
@@ -425,20 +450,39 @@ function resolveScopedSubagentRunRecord(
   selector: string,
   context: AgentMessageSubagentRunContext,
 ): SubagentRunResolutionResult {
-  const resolved = resolveSubagentRunRecord(dirs, selector, context);
-  if (resolved.status === "ok") {
-    return isRunScopedToContext(resolved.record, context)
-      ? resolved
-      : {
-          status: "not_found",
-          message: `No subagent run matched "${selector}" for this coordinator`,
-          candidates: scopedSubagentRunRecords(dirs, context).slice(0, context.candidateLimit ?? 10),
-        };
+  const normalizedSelector = normalizeSubagentRunSelector(selector);
+  const records = scopedSubagentRunRecords(dirs, context);
+
+  if (normalizedSelector === "latest") {
+    const latest = latestScopedSubagentRun(records);
+    if (latest) return { status: "ok", record: latest };
+
+    return {
+      status: "not_found",
+      message: "No runs for current coordinator. Select a specific runId from candidates.",
+      candidates: cappedScopedSubagentRunCandidates(records, context),
+    };
+  }
+
+  const matchers: Array<(record: SubagentRunListRecord) => boolean> = [
+    (record) => record.name === normalizedSelector,
+    (record) => record.displayName === normalizedSelector,
+    (record) => typeof record.name === "string" && record.name.startsWith(normalizedSelector),
+    (record) => typeof record.displayName === "string" && record.displayName.startsWith(normalizedSelector),
+    (record) => typeof record.sessionId === "string" && record.sessionId.startsWith(normalizedSelector),
+    (record) => record.recordId.startsWith(normalizedSelector),
+    (record) => record.batchRunId === normalizedSelector,
+  ];
+
+  for (const matcher of matchers) {
+    const result = resolutionFromRunIdMatches(normalizedSelector, records.filter(matcher));
+    if (result) return result;
   }
 
   return {
-    ...resolved,
-    candidates: resolved.candidates.filter((record) => isRunScopedToContext(record, context)),
+    status: "not_found",
+    message: `No subagent run matched "${normalizedSelector}" for this coordinator`,
+    candidates: cappedScopedSubagentRunCandidates(records, context),
   };
 }
 

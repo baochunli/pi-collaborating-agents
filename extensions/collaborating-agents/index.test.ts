@@ -588,6 +588,24 @@ describe("agent_message subagent sessions", () => {
       parentSessionId: "other-session",
       parentPid: 456,
     }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "current-shared-name",
+      batchRunId: "batch-current-shared",
+      name: "shared-worker",
+      displayName: "Shared Worker",
+      parentSessionId: "current-session",
+      parentPid: 123,
+      lastSeenAt: "2026-01-03T00:00:00.000Z",
+    }))).toBe(true);
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "other-shared-name",
+      batchRunId: "batch-other-shared",
+      name: "shared-worker",
+      displayName: "Shared Worker",
+      parentSessionId: "other-session",
+      parentPid: 456,
+      lastSeenAt: "2026-01-02T00:00:00.000Z",
+    }))).toBe(true);
 
     const context = {
       parentAgent: "Coordinator",
@@ -601,18 +619,27 @@ describe("agent_message subagent sessions", () => {
     expect(byRunId.details).toMatchObject({
       action: "session",
       error: "not_found",
-      candidates: [{ recordId: "current-run" }],
     });
-    expect(JSON.stringify((byRunId.details as { candidates?: unknown }).candidates)).not.toContain("other-run");
+    const byRunIdCandidates = JSON.stringify((byRunId.details as { candidates?: unknown }).candidates);
+    expect(byRunIdCandidates).toContain("current-run");
+    expect(byRunIdCandidates).not.toContain("other-run");
 
     const byName = handleAgentMessageSession(dirs, { to: "other-worker" }, context);
     expect(byName.isError).toBe(true);
     expect(byName.details).toMatchObject({
       action: "session",
       error: "not_found",
-      candidates: [{ recordId: "current-run" }],
     });
-    expect(JSON.stringify((byName.details as { candidates?: unknown }).candidates)).not.toContain("other-worker");
+    const byNameCandidates = JSON.stringify((byName.details as { candidates?: unknown }).candidates);
+    expect(byNameCandidates).toContain("current-run");
+    expect(byNameCandidates).not.toContain("other-worker");
+
+    const sharedName = handleAgentMessageSession(dirs, { to: "shared-worker" }, context);
+    expect(sharedName.isError).toBeUndefined();
+    expect(sharedName.details).toMatchObject({
+      action: "session",
+      record: { recordId: "current-shared-name" },
+    });
   });
 
   test("tail returns formatted output and raw details from a scoped run record", () => {
