@@ -33,6 +33,7 @@ export interface SpawnResult {
   warnings?: string[];
   sessionId?: string;
   sessionFile?: string;
+  sessionFileUnavailableReason?: string;
   launchMode: "process" | "cmux-pane";
   workingDirectory: string;
   launchArgs: string[];
@@ -54,6 +55,9 @@ export interface SpawnResult {
   cmuxPaneClosed?: boolean;
   cmuxCloseError?: string;
 }
+
+export const PROCESS_MODE_SESSION_FILE_UNAVAILABLE_REASON =
+  "Process-mode session file unavailable until child registration or fallback discovery provides one.";
 
 export interface SpawnSessionMetadata {
   name: string;
@@ -727,6 +731,7 @@ function createPiEventProcessor(
     if (e.type === "session" && typeof e.id === "string") {
       result.sessionId = e.id;
       result.sessionFile ??= readSelfRegisteredSessionFile(result.name, e.id);
+      if (result.sessionFile) result.sessionFileUnavailableReason = undefined;
       onSessionMetadata?.({ sessionId: e.id, sessionFile: result.sessionFile });
       return;
     }
@@ -1507,6 +1512,9 @@ export async function runSpawnTask(
   const cwd = task.cwd || options.defaultCwd || runtimeCwd;
 
   const launchMode = options.launchMode ?? "process";
+  // Process-mode uses Pi JSON events for the first iteration. We do not pass
+  // `--session` here until support is proven end-to-end, so transcript tailing
+  // is best-effort until child registration or a fallback scan finds a file.
   const sessionFile = launchMode === "cmux-pane" ? createSubagentSessionFilePath(childName, options.runId.slice(0, 8)) : undefined;
   const exitMarkerPath = sessionFile ? createSubagentExitMarkerPath(sessionFile) : undefined;
 
@@ -1533,6 +1541,7 @@ export async function runSpawnTask(
     exitCode: 1,
     output: "",
     sessionFile,
+    sessionFileUnavailableReason: launchMode === "process" ? PROCESS_MODE_SESSION_FILE_UNAVAILABLE_REASON : undefined,
     launchMode,
     workingDirectory: cwd,
     launchArgs,

@@ -692,6 +692,10 @@ describe("subagent spawn", () => {
     expect(result.exitCode).toBe(0);
     expect(result.output).toBe("fake-ok");
     expect(result.sessionId).toBe("fake-session");
+    expect(result.sessionFile).toBeUndefined();
+    expect(result.sessionFileUnavailableReason).toBe("Process-mode session file unavailable until child registration or fallback discovery provides one.");
+    const capturedArgs = JSON.parse(fs.readFileSync(argsFile, "utf-8")) as string[];
+    expect(capturedArgs).not.toContain("--session");
     expect(observedMetadata).toEqual([
       {
         name: result.name,
@@ -782,6 +786,7 @@ describe("subagent spawn", () => {
     expect(result.output).toBe("fake-ok");
     expect(result.sessionId).toBe("fake-session");
     expect(result.sessionFile).toBe(sessionFile);
+    expect(result.sessionFileUnavailableReason).toBeUndefined();
     expect(observedMetadata).toEqual([
       {
         name: result.name,

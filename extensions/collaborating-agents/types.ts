@@ -105,6 +105,7 @@ export interface SubagentRunRecord {
   status: SubagentRunStatus;
   sessionId?: string;
   sessionFile?: string;
+  sessionFileUnavailableReason?: string;
   model?: string;
   launchMode: SubagentLaunchMode;
   startedAt: string;

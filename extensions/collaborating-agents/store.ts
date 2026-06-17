@@ -145,6 +145,7 @@ function isValidSubagentRunRecord(record: unknown): record is SubagentRunRecord 
     isValidSubagentRunStatus(r.status) &&
     isValidOptionalString(r.sessionId) &&
     isValidOptionalString(r.sessionFile) &&
+    isValidOptionalString(r.sessionFileUnavailableReason) &&
     isValidOptionalString(r.model) &&
     isValidLaunchMode(r.launchMode) &&
     typeof r.startedAt === "string" &&

@@ -479,6 +479,37 @@ describe("subagent launch identity", () => {
     await Promise.all((harness.handlers.get("session_shutdown") ?? []).map((handler) => handler(undefined, ctx)));
   });
 
+  test("records process-mode session file unavailability for downstream tail handlers", async () => {
+    const tempDir = makeTempDir("collab-index-process-session-file-unavailable");
+    writeFakePiBinary(tempDir);
+    const stateDir = path.join(tempDir, "state");
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.HOME = tempDir;
+    process.env.USERPROFILE = tempDir;
+    process.env.COLLABORATING_AGENTS_DIR = stateDir;
+
+    const harness = makeHarness();
+    collaboratingAgentsExtension(harness.pi);
+    const subagentTool = harness.tools.get("subagent");
+    if (!subagentTool) throw new Error("subagent tool was not registered");
+
+    const ctx = makeContext(tempDir);
+    const result = await subagentTool.execute("tool-call-process-unavailable", { task: "Inspect the repo" }, undefined, undefined, ctx);
+    const details = result.details as { childRunIds: string[] };
+    const recordId = details.childRunIds[0]!;
+
+    const completed = await waitForRunRecord(stateDir, recordId, (record) => record.status === "completed");
+    expect(completed).toMatchObject({
+      recordId,
+      sessionId: "fake-session",
+      sessionFileUnavailableReason: "Process-mode session file unavailable until child registration or fallback discovery provides one.",
+    });
+    expect(completed.sessionFile).toBeUndefined();
+
+    await Promise.all((harness.handlers.get("session_shutdown") ?? []).map((handler) => handler(undefined, ctx)));
+  });
+
   test("fills missing completed run session file from session-id search without dropping concurrent metadata", async () => {
     const tempDir = makeTempDir("collab-index-lifecycle-fallback");
     writeFakePiBinary(tempDir);

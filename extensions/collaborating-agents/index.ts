@@ -43,6 +43,7 @@ import type {
 import {
   createSpawnAgentDefinitionFromType,
   mapWithConcurrencyLimit,
+  PROCESS_MODE_SESSION_FILE_UNAVAILABLE_REASON,
   runSpawnTask,
   type SpawnAgentDefinition,
   type SpawnResult,
@@ -1277,6 +1278,11 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         registration?.sessionFile ??
         previous?.sessionFile ??
         findSessionFileBySessionId(sessionId);
+      const sessionFileUnavailableReason =
+        sessionFile
+          ? undefined
+          : result.sessionFileUnavailableReason ??
+            (result.launchMode === "process" && sessionId ? PROCESS_MODE_SESSION_FILE_UNAVAILABLE_REASON : undefined);
 
       return {
         name: existing.name ?? result.name,
@@ -1284,6 +1290,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         status: result.exitCode === 0 ? "completed" : "failed",
         sessionId,
         sessionFile,
+        sessionFileUnavailableReason,
         model: existing.model ?? result.resolvedModel ?? live?.model ?? registration?.model ?? previous?.model,
         lastSeenAt: now,
         completedAt: now,
