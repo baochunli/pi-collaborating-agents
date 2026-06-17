@@ -10,7 +10,10 @@ import type {
   MessageLogEvent,
   ReservationConflict,
   SubagentLaunchMode,
+  SubagentRunListRecord,
   SubagentRunRecord,
+  SubagentRunResolutionContext,
+  SubagentRunResolutionResult,
   SubagentRunStatus,
 } from "./types.js";
 
@@ -19,6 +22,8 @@ const LOCK_TIMEOUT_MS = 1500;
 const STALE_LOCK_MS = 30_000;
 const MAX_TASK_PREVIEW_LENGTH = 1000;
 const MAX_OUTPUT_PREVIEW_LENGTH = 2000;
+const DEFAULT_RUN_STALE_AFTER_MS = 5 * 60 * 1000;
+const DEFAULT_RUN_CANDIDATE_LIMIT = 5;
 const SLEEP_BUFFER = new SharedArrayBuffer(4);
 const SLEEP_ARRAY = new Int32Array(SLEEP_BUFFER);
 
@@ -297,6 +302,35 @@ function normalizeSubagentRunRecord(record: SubagentRunRecord): SubagentRunRecor
   };
 }
 
+function toTimestamp(value: Date | string | number | undefined): number {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return value;
+  if (typeof value === "string") return Date.parse(value);
+  return Date.now();
+}
+
+function deriveRunDisplayName(record: SubagentRunRecord): string | undefined {
+  if (record.displayName) return record.displayName;
+  return record.name ? formatAgentDisplayName(record.name) : undefined;
+}
+
+function deriveRunIsStale(record: SubagentRunRecord, nowMs: number, staleAfterMs: number): boolean {
+  if (record.status !== "launching" && record.status !== "running") return false;
+
+  const lastSeenMs = Date.parse(record.lastSeenAt);
+  if (!Number.isFinite(lastSeenMs)) return false;
+
+  return nowMs - lastSeenMs > staleAfterMs;
+}
+
+function toListRecord(record: SubagentRunRecord, nowMs: number, staleAfterMs: number): SubagentRunListRecord {
+  return {
+    ...record,
+    displayName: deriveRunDisplayName(record),
+    isStale: deriveRunIsStale(record, nowMs, staleAfterMs),
+  };
+}
+
 function definedPatch<T extends Record<string, unknown>>(patch: Partial<T>): Partial<T> {
   const result: Partial<T> = {};
   for (const [key, value] of Object.entries(patch)) {
@@ -381,7 +415,10 @@ export function updateSubagentRunRecord(
   return result ?? false;
 }
 
-export function listSubagentRunRecords(dirs: Dirs, options: { limit?: number } = {}): SubagentRunRecord[] {
+export function listSubagentRunRecords(
+  dirs: Dirs,
+  options: { limit?: number; now?: Date | string | number; staleAfterMs?: number } = {},
+): SubagentRunListRecord[] {
   ensureDirSync(dirs.runs);
 
   let entries: string[] = [];
@@ -391,14 +428,16 @@ export function listSubagentRunRecords(dirs: Dirs, options: { limit?: number } =
     return [];
   }
 
-  const records: SubagentRunRecord[] = [];
+  const nowMs = toTimestamp(options.now);
+  const staleAfterMs = options.staleAfterMs ?? DEFAULT_RUN_STALE_AFTER_MS;
+  const records: SubagentRunListRecord[] = [];
   for (const entry of entries) {
     if (!entry.endsWith(".json")) continue;
 
     const parsed = readJsonFile<unknown>(join(dirs.runs, entry));
     if (!parsed || !isValidSubagentRunRecord(parsed)) continue;
 
-    records.push(parsed);
+    records.push(toListRecord(parsed, nowMs, staleAfterMs));
   }
 
   records.sort((a, b) => {
@@ -413,6 +452,101 @@ export function listSubagentRunRecords(dirs: Dirs, options: { limit?: number } =
 
   if (typeof options.limit === "number" && options.limit >= 0) return records.slice(0, options.limit);
   return records;
+}
+
+function cappedRunCandidates(records: SubagentRunListRecord[], limit = DEFAULT_RUN_CANDIDATE_LIMIT): SubagentRunListRecord[] {
+  return records.slice(0, Math.max(0, limit));
+}
+
+function byRecordId(a: SubagentRunListRecord, b: SubagentRunListRecord): number {
+  return a.recordId.localeCompare(b.recordId);
+}
+
+function resolutionFromMatches(
+  selector: string,
+  matches: SubagentRunListRecord[],
+): SubagentRunResolutionResult | undefined {
+  if (matches.length === 0) return undefined;
+  if (matches.length === 1) return { status: "ok", record: matches[0] };
+  return {
+    status: "ambiguous",
+    message: `Selector "${selector}" matched multiple subagent runs`,
+    candidates: [...matches].sort(byRecordId),
+  };
+}
+
+function latestRun(records: SubagentRunListRecord[]): SubagentRunListRecord | undefined {
+  return [...records].sort((a, b) => {
+    const lastSeen = Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt);
+    if (lastSeen !== 0) return lastSeen;
+
+    const started = Date.parse(b.startedAt) - Date.parse(a.startedAt);
+    if (started !== 0) return started;
+
+    if (a.isStale !== b.isStale) return a.isStale ? 1 : -1;
+
+    return byRecordId(a, b);
+  })[0];
+}
+
+function resolveLatestSubagentRunRecord(
+  records: SubagentRunListRecord[],
+  context: SubagentRunResolutionContext,
+): SubagentRunResolutionResult {
+  if (context.parentSessionId) {
+    const sessionMatches = records.filter((record) => record.parentSessionId === context.parentSessionId);
+    const latest = latestRun(sessionMatches);
+    if (latest) return { status: "ok", record: latest };
+  }
+
+  if (context.parentAgent && typeof context.parentPid === "number") {
+    const ownerMatches = records.filter(
+      (record) => record.parentAgent === context.parentAgent && record.parentPid === context.parentPid,
+    );
+    const latest = latestRun(ownerMatches);
+    if (latest) return { status: "ok", record: latest };
+  }
+
+  return {
+    status: "not_found",
+    message: "No runs for current coordinator. Select a specific runId from candidates.",
+    candidates: cappedRunCandidates(records, context.candidateLimit),
+  };
+}
+
+export function resolveSubagentRunRecord(
+  dirs: Dirs,
+  selector: string | undefined,
+  context: SubagentRunResolutionContext,
+): SubagentRunResolutionResult {
+  const normalizedSelector = selector?.trim() || "latest";
+  const records = listSubagentRunRecords(dirs, {
+    now: context.now,
+    staleAfterMs: context.staleAfterMs,
+  });
+
+  if (normalizedSelector === "latest") return resolveLatestSubagentRunRecord(records, context);
+
+  const matchers: Array<(record: SubagentRunListRecord) => boolean> = [
+    (record) => record.name === normalizedSelector,
+    (record) => record.displayName === normalizedSelector,
+    (record) => typeof record.name === "string" && record.name.startsWith(normalizedSelector),
+    (record) => typeof record.displayName === "string" && record.displayName.startsWith(normalizedSelector),
+    (record) => typeof record.sessionId === "string" && record.sessionId.startsWith(normalizedSelector),
+    (record) => record.recordId.startsWith(normalizedSelector),
+    (record) => record.batchRunId === normalizedSelector,
+  ];
+
+  for (const matcher of matchers) {
+    const result = resolutionFromMatches(normalizedSelector, records.filter(matcher));
+    if (result) return result;
+  }
+
+  return {
+    status: "not_found",
+    message: `No subagent run matched "${normalizedSelector}"`,
+    candidates: cappedRunCandidates(records, context.candidateLimit),
+  };
 }
 
 function removeRegistrationIfStillDead(filePath: string, expected: AgentRegistration): void {

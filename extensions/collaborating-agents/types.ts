@@ -116,6 +116,36 @@ export interface SubagentRunRecord {
   sessionReadyNotifiedAt?: string;
 }
 
+export interface SubagentRunListRecord extends SubagentRunRecord {
+  displayName?: string;
+  isStale: boolean;
+}
+
+export interface SubagentRunResolutionContext {
+  parentAgent: string;
+  parentSessionId?: string;
+  parentPid?: number;
+  now?: Date | string | number;
+  staleAfterMs?: number;
+  candidateLimit?: number;
+}
+
+export type SubagentRunResolutionResult =
+  | {
+      status: "ok";
+      record: SubagentRunListRecord;
+    }
+  | {
+      status: "ambiguous";
+      message: string;
+      candidates: SubagentRunListRecord[];
+    }
+  | {
+      status: "not_found";
+      message: string;
+      candidates: SubagentRunListRecord[];
+    };
+
 export interface CollaboratingAgentsConfig {
   messageHistoryLimit: number;
   subagentLaunchMode: SubagentLaunchMode;

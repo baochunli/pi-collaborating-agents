@@ -11,6 +11,7 @@ import {
   readMessageLog,
   readMessageLogTail,
   registerSelf,
+  resolveSubagentRunRecord,
   resolveActiveAgentName,
   resolveThreadPeerName,
   sendBroadcast,
@@ -315,6 +316,203 @@ describe("store subagent run records", () => {
     fs.writeFileSync(path.join(dirs.runs, "corrupt.json"), "{not json", "utf-8");
 
     expect(listSubagentRunRecords(dirs).map((record) => record.recordId)).toEqual(["batch-2-0", "batch-1-0"]);
+  });
+
+  test("listSubagentRunRecords derives stale state for old active records without changing status", () => {
+    const dirs = makeDirs("collab-store-runs-stale");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          recordId: "old-running-0",
+          batchRunId: "old-running",
+          status: "running",
+          lastSeenAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          recordId: "old-completed-0",
+          batchRunId: "old-completed",
+          status: "completed",
+          lastSeenAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+
+    const records = listSubagentRunRecords(dirs, {
+      now: new Date("2026-01-01T00:10:00.000Z"),
+      staleAfterMs: 60_000,
+    });
+
+    const running = records.find((record) => record.recordId === "old-running-0");
+    const completed = records.find((record) => record.recordId === "old-completed-0");
+    expect(running).toMatchObject({ status: "running", isStale: true });
+    expect(completed).toMatchObject({ status: "completed", isStale: false });
+  });
+
+  test("resolveSubagentRunRecord supports names, prefixes, session id, and record id selectors", () => {
+    const dirs = makeDirs("collab-store-runs-resolve");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          recordId: "sunny-run-0",
+          batchRunId: "batch-sunny",
+          name: "worker-aa-SunnyBreeze",
+          sessionId: "session-sunny-123",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          recordId: "misty-run-0",
+          batchRunId: "batch-misty",
+          name: "reviewer-bb-MistyVale",
+          sessionId: "session-misty-456",
+        }),
+      ),
+    ).toBe(true);
+
+    const context = { parentAgent: "Coordinator", parentSessionId: "parent-session" };
+
+    expect(resolveSubagentRunRecord(dirs, "worker-aa-SunnyBreeze", context)).toMatchObject({
+      status: "ok",
+      record: { recordId: "sunny-run-0" },
+    });
+    expect(resolveSubagentRunRecord(dirs, "SunnyBreeze", context)).toMatchObject({
+      status: "ok",
+      record: { recordId: "sunny-run-0" },
+    });
+    expect(resolveSubagentRunRecord(dirs, "reviewer-bb", context)).toMatchObject({
+      status: "ok",
+      record: { recordId: "misty-run-0" },
+    });
+    expect(resolveSubagentRunRecord(dirs, "Misty", context)).toMatchObject({
+      status: "ok",
+      record: { recordId: "misty-run-0" },
+    });
+    expect(resolveSubagentRunRecord(dirs, "session-sunny", context)).toMatchObject({
+      status: "ok",
+      record: { recordId: "sunny-run-0" },
+    });
+    expect(resolveSubagentRunRecord(dirs, "sunny-run", context)).toMatchObject({
+      status: "ok",
+      record: { recordId: "sunny-run-0" },
+    });
+  });
+
+  test("resolveSubagentRunRecord returns ambiguity for shared batch ids and ambiguous display prefixes", () => {
+    const dirs = makeDirs("collab-store-runs-resolve-ambiguous");
+
+    for (const [recordId, name] of [
+      ["batch-shared-0", "worker-aa-SunnyBreeze"],
+      ["batch-shared-1", "reviewer-bb-SunnyBrook"],
+    ] as const) {
+      expect(
+        writeSubagentRunRecord(
+          dirs,
+          makeRunRecord({
+            recordId,
+            batchRunId: "batch-shared",
+            name,
+          }),
+        ),
+      ).toBe(true);
+    }
+
+    const context = { parentAgent: "Coordinator", parentSessionId: "parent-session" };
+
+    expect(resolveSubagentRunRecord(dirs, "batch-shared", context)).toMatchObject({
+      status: "ambiguous",
+      candidates: [{ recordId: "batch-shared-0" }, { recordId: "batch-shared-1" }],
+    });
+    expect(resolveSubagentRunRecord(dirs, "Sunny", context)).toMatchObject({
+      status: "ambiguous",
+      candidates: [{ recordId: "batch-shared-0" }, { recordId: "batch-shared-1" }],
+    });
+  });
+
+  test("resolveSubagentRunRecord scopes latest and never falls back to global newest records", () => {
+    const dirs = makeDirs("collab-store-runs-resolve-latest");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          recordId: "global-newest-0",
+          batchRunId: "global-newest",
+          parentAgent: "OtherCoordinator",
+          parentSessionId: "other-session",
+          parentPid: 111,
+          lastSeenAt: "2026-01-01T00:04:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          recordId: "scoped-stale-0",
+          batchRunId: "scoped-stale",
+          parentSessionId: "current-session",
+          status: "running",
+          lastSeenAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          recordId: "scoped-fresh-0",
+          batchRunId: "scoped-fresh",
+          parentSessionId: "current-session",
+          status: "running",
+          lastSeenAt: "2026-01-01T00:01:45.000Z",
+        }),
+      ),
+    ).toBe(true);
+
+    expect(
+      resolveSubagentRunRecord(dirs, "latest", {
+        parentAgent: "Coordinator",
+        parentSessionId: "current-session",
+        now: new Date("2026-01-01T00:02:00.000Z"),
+        staleAfterMs: 30_000,
+      }),
+    ).toMatchObject({
+      status: "ok",
+      record: { recordId: "scoped-fresh-0", isStale: false },
+    });
+
+    expect(
+      resolveSubagentRunRecord(dirs, "latest", {
+        parentAgent: "Coordinator",
+        parentPid: process.pid,
+      }),
+    ).toMatchObject({
+      status: "ok",
+      record: { recordId: "scoped-fresh-0" },
+    });
+
+    expect(
+      resolveSubagentRunRecord(dirs, "latest", {
+        parentAgent: "UnknownCoordinator",
+        parentSessionId: "missing-session",
+      }),
+    ).toMatchObject({
+      status: "not_found",
+      message: expect.stringContaining("No runs for current coordinator"),
+      candidates: expect.any(Array),
+    });
   });
 });
 
