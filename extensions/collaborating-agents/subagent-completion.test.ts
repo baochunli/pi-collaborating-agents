@@ -55,6 +55,7 @@ describe("subagent completion payload helpers", () => {
     expect(payload.customType).toBe("collab_focus_status");
     expect(payload.content).toContain("Received final results from ClearWave.");
     expect(payload.content).toContain("## Summary\nall good");
+    expect(payload.content).toContain('Inspect transcript:\nagent_message({ action: "tail", to: "SwiftTiger-1a2b-ClearWave", limit: 50 })');
     expect(payload.details).toEqual({ mode: "subagent", result: single });
   });
 
@@ -94,6 +95,10 @@ describe("subagent completion payload helpers", () => {
     expect(payload.content).toContain("### 2. BrightRiver (failed)");
     expect(payload.content).toContain("ok output");
     expect(payload.content).toContain("bad output");
+    expect(payload.content).toContain("Inspect transcripts:");
+    expect(payload.content).toContain('- ClearWave: agent_message({ action: "tail", to: "SwiftTiger-1a2b-ClearWave", limit: 50 })');
+    expect(payload.content).toContain('- BrightRiver: agent_message({ action: "tail", to: "SwiftTiger-1a2b-BrightRiver", limit: 50 })');
+    expect(payload.content).toContain('agent_message({ action: "sessions" })');
   });
 });
 

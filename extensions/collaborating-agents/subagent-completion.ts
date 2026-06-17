@@ -38,6 +38,24 @@ export function collectSpawnResults(details: Record<string, unknown>): SpawnResu
   return singleResult ? [singleResult] : [];
 }
 
+function buildInspectionHint(results: SpawnResult[]): string {
+  if (results.length === 0) return "";
+
+  if (results.length === 1) {
+    const result = results[0]!;
+    return [
+      "Inspect transcript:",
+      `agent_message({ action: "tail", to: "${result.name}", limit: 50 })`,
+    ].join("\n");
+  }
+
+  return [
+    "Inspect transcripts:",
+    ...results.map((result) => `- ${formatAgentDisplayName(result.name)}: agent_message({ action: "tail", to: "${result.name}", limit: 50 })`),
+    `agent_message({ action: "sessions" })`,
+  ].join("\n");
+}
+
 export function buildSubagentCompletionMessagePayload(
   result: SubagentCompletionToolResult,
 ): SubagentCompletionMessagePayload {
@@ -92,9 +110,12 @@ export function buildSubagentCompletionMessagePayload(
       .join("\n\n");
   }
 
+  const inspectionHint = buildInspectionHint(spawnResults);
+  const content = inspectionHint ? `${intro}\n\n${body}\n\n${inspectionHint}` : `${intro}\n\n${body}`;
+
   return {
     customType: "collab_focus_status",
-    content: `${intro}\n\n${body}`,
+    content,
     display: true,
     details: result.details,
   };
