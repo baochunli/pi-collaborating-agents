@@ -1204,9 +1204,14 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     warnings: string[],
     updater: (existing: SubagentRunRecord) => Partial<SubagentRunRecord> | undefined,
   ): boolean {
-    const ok = updateSubagentRunRecordWith(dirs, recordId, updater);
-    if (!ok) appendRunRecordWarning(warnings, recordId, phase);
-    return ok;
+    try {
+      const ok = updateSubagentRunRecordWith(dirs, recordId, updater);
+      if (!ok) appendRunRecordWarning(warnings, recordId, phase);
+      return ok;
+    } catch {
+      appendRunRecordWarning(warnings, recordId, phase);
+      return false;
+    }
   }
 
   function markSubagentRunLaunched(recordId: string, type: string, launch: SpawnResult, warnings: string[]): void {
@@ -1451,8 +1456,12 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         lastSeenAt: now,
       };
 
-      const ok = writeSubagentRunRecord(dirs, record);
-      if (!ok && warnings) appendRunRecordWarning(warnings, record.recordId, "planning");
+      try {
+        const ok = writeSubagentRunRecord(dirs, record);
+        if (!ok && warnings) appendRunRecordWarning(warnings, record.recordId, "planning");
+      } catch {
+        if (warnings) appendRunRecordWarning(warnings, record.recordId, "planning");
+      }
     });
 
     return childRunIds;

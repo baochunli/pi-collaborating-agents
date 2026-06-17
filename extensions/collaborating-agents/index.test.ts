@@ -562,4 +562,37 @@ describe("subagent launch identity", () => {
 
     await Promise.all((harness.handlers.get("session_shutdown") ?? []).map((handler) => handler(undefined, ctx)));
   });
+
+  test("keeps subagent output flowing when lifecycle registry updates throw", async () => {
+    const tempDir = makeTempDir("collab-index-lifecycle-throwing-write");
+    writeFakePiBinary(tempDir);
+    const stateDir = path.join(tempDir, "state");
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.HOME = tempDir;
+    process.env.USERPROFILE = tempDir;
+    process.env.COLLABORATING_AGENTS_DIR = stateDir;
+    process.env.TEST_PI_EXIT_DELAY_MS = "250";
+
+    const harness = makeHarness();
+    collaboratingAgentsExtension(harness.pi);
+    const subagentTool = harness.tools.get("subagent");
+    if (!subagentTool) throw new Error("subagent tool was not registered");
+
+    const ctx = makeContext(tempDir);
+    const result = await subagentTool.execute("tool-call-throwing-write", { task: "Inspect the repo" }, undefined, undefined, ctx);
+    const details = result.details as { childRunIds: string[] };
+    const recordId = details.childRunIds[0]!;
+    await waitForRunRecord(stateDir, recordId, (record) => record.status === "launching" || record.status === "running");
+
+    fs.rmSync(path.join(stateDir, "runs"), { recursive: true, force: true });
+    fs.writeFileSync(path.join(stateDir, "runs"), "not a directory", "utf-8");
+
+    const completionMessage = await waitForCompletionMessage(harness);
+    expect(String(completionMessage.content)).toContain("fake-ok");
+    const completionDetails = completionMessage.details as { lifecycleWarnings?: string[] };
+    expect(completionDetails.lifecycleWarnings?.some((warning) => warning.includes("Failed to update subagent run record"))).toBe(true);
+
+    await Promise.all((harness.handlers.get("session_shutdown") ?? []).map((handler) => handler(undefined, ctx)));
+  });
 });
