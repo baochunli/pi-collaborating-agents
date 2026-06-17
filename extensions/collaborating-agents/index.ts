@@ -139,6 +139,10 @@ const SUBAGENT_MAX_CONCURRENCY = 4;
 const SUBAGENT_DEFAULT_MAX_DEPTH = 2;
 const SUBAGENT_LAUNCH_STAGGER_MS = 250;
 
+type SubagentRunRecordPatch = Partial<SubagentRunRecord> & {
+  sessionFileUnavailableReason?: string | null;
+};
+
 function formatToolCallArgs(args: unknown): string {
   const json = JSON.stringify(args, null, 2) ?? "{}";
   const maxChars = 2000;
@@ -1203,7 +1207,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     recordId: string,
     phase: string,
     warnings: string[],
-    updater: (existing: SubagentRunRecord) => Partial<SubagentRunRecord> | undefined,
+    updater: (existing: SubagentRunRecord) => SubagentRunRecordPatch | undefined,
   ): boolean {
     try {
       const ok = updateSubagentRunRecordWith(dirs, recordId, updater);
@@ -1226,6 +1230,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         status: isTerminalRunStatus(existing.status) ? existing.status : "running",
         sessionId: launch.sessionId ?? existing.sessionId,
         sessionFile: launch.sessionFile ?? existing.sessionFile,
+        sessionFileUnavailableReason: launch.sessionFile ? null : launch.sessionFileUnavailableReason ?? existing.sessionFileUnavailableReason,
         model: launch.resolvedModel ?? existing.model,
         launchMode: launch.launchMode,
         lastSeenAt: now,
@@ -1242,6 +1247,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     safeUpdateSubagentRunRecordWith(recordId, "session metadata", warnings, (existing) => ({
       sessionId: metadata.sessionId ?? existing.sessionId,
       sessionFile: metadata.sessionFile ?? existing.sessionFile,
+      sessionFileUnavailableReason: metadata.sessionFile ? null : existing.sessionFileUnavailableReason,
       lastSeenAt: new Date().toISOString(),
     }));
   }
@@ -1254,6 +1260,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     safeUpdateSubagentRunRecordWith(recordId, "registration metadata", warnings, (existing) => ({
       sessionId: existing.sessionId ?? registration.sessionId,
       sessionFile: existing.sessionFile ?? registration.sessionFile,
+      sessionFileUnavailableReason: registration.sessionFile ? null : existing.sessionFileUnavailableReason,
       lastSeenAt: new Date().toISOString(),
     }));
   }
@@ -1283,6 +1290,9 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           ? undefined
           : result.sessionFileUnavailableReason ??
             (result.launchMode === "process" && sessionId ? PROCESS_MODE_SESSION_FILE_UNAVAILABLE_REASON : undefined);
+      result.sessionId = sessionId ?? result.sessionId;
+      result.sessionFile = sessionFile ?? result.sessionFile;
+      result.sessionFileUnavailableReason = sessionFile ? undefined : sessionFileUnavailableReason;
 
       return {
         name: existing.name ?? result.name,
@@ -1290,7 +1300,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         status: result.exitCode === 0 ? "completed" : "failed",
         sessionId,
         sessionFile,
-        sessionFileUnavailableReason,
+        sessionFileUnavailableReason: sessionFile ? null : sessionFileUnavailableReason,
         model: existing.model ?? result.resolvedModel ?? live?.model ?? registration?.model ?? previous?.model,
         lastSeenAt: now,
         completedAt: now,

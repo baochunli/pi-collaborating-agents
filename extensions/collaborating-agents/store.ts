@@ -27,6 +27,8 @@ const DEFAULT_RUN_CANDIDATE_LIMIT = 5;
 const SLEEP_BUFFER = new SharedArrayBuffer(4);
 const SLEEP_ARRAY = new Int32Array(SLEEP_BUFFER);
 
+type NullablePatch<T> = { [K in keyof T]?: T[K] | null };
+
 function ensureDirSync(dir: string): void {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
@@ -332,11 +334,11 @@ function toListRecord(record: SubagentRunRecord, nowMs: number, staleAfterMs: nu
   };
 }
 
-function definedPatch<T extends Record<string, unknown>>(patch: Partial<T>): Partial<T> {
+function definedPatch<T extends Record<string, unknown>>(patch: NullablePatch<T>): Partial<T> {
   const result: Partial<T> = {};
   for (const [key, value] of Object.entries(patch)) {
     if (typeof value === "undefined") continue;
-    result[key as keyof T] = value as T[keyof T];
+    result[key as keyof T] = value === null ? undefined : value as T[keyof T];
   }
   return result;
 }
@@ -387,7 +389,7 @@ export function writeSubagentRunRecord(dirs: Dirs, record: SubagentRunRecord): b
 export function updateSubagentRunRecord(
   dirs: Dirs,
   recordId: string,
-  patch: Partial<SubagentRunRecord>,
+  patch: NullablePatch<SubagentRunRecord>,
 ): boolean {
   return updateSubagentRunRecordWith(dirs, recordId, () => patch);
 }
@@ -395,7 +397,7 @@ export function updateSubagentRunRecord(
 export function updateSubagentRunRecordWith(
   dirs: Dirs,
   recordId: string,
-  updater: (existing: SubagentRunRecord) => Partial<SubagentRunRecord> | undefined,
+  updater: (existing: SubagentRunRecord) => NullablePatch<SubagentRunRecord> | undefined,
 ): boolean {
   ensureDirSync(dirs.base);
   ensureDirSync(dirs.runs);

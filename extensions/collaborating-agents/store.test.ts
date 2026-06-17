@@ -290,6 +290,31 @@ describe("store subagent run records", () => {
     });
   });
 
+  test("updateSubagentRunRecord can clear session file unavailable reason when a file is found", () => {
+    const dirs = makeDirs("collab-store-runs-clear-unavailable");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          sessionId: "session-live",
+          sessionFileUnavailableReason: "session file unavailable yet",
+        }),
+      ),
+    ).toBe(true);
+
+    expect(
+      updateSubagentRunRecord(dirs, "batch-1-0", {
+        sessionFile: "/tmp/session-live.jsonl",
+        sessionFileUnavailableReason: null,
+      }),
+    ).toBe(true);
+
+    const [stored] = listSubagentRunRecords(dirs);
+    expect(stored?.sessionFile).toBe("/tmp/session-live.jsonl");
+    expect(stored?.sessionFileUnavailableReason).toBeUndefined();
+  });
+
   test("updateSubagentRunRecordWith merges against the latest stored record", () => {
     const dirs = makeDirs("collab-store-runs-update-with");
 

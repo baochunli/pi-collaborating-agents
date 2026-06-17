@@ -536,7 +536,10 @@ describe("subagent launch identity", () => {
     const completed = await waitForRunRecord(stateDir, recordId, (record) => record.status === "completed");
     expect(completed.sessionId).toBe("fake-session");
     expect(completed.sessionFile).toBe(fallbackSessionFile);
-    await waitForCompletionMessage(harness);
+    const fallbackCompletionMessage = await waitForCompletionMessage(harness);
+    const fallbackCompletionDetails = fallbackCompletionMessage.details as { result?: { sessionFile?: string; sessionFileUnavailableReason?: string } };
+    expect(fallbackCompletionDetails.result?.sessionFile).toBe(fallbackSessionFile);
+    expect(fallbackCompletionDetails.result?.sessionFileUnavailableReason).toBeUndefined();
     await new Promise((resolve) => setTimeout(resolve, 25));
 
     const concurrentSessionFile = path.join(tempDir, "concurrent-session.jsonl");
