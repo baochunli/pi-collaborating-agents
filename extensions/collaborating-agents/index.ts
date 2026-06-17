@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, extname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Text, matchesKey, type TUI } from "@mariozechner/pi-tui";
@@ -14,16 +14,21 @@ import {
   getAgentByName,
   getConflictsWithOtherAgents,
   listActiveAgents,
+  listSubagentRunRecords,
   processInbox,
+  readAgentRegistration,
   readMessageLog,
   readMessageLogTail,
   registerSelf,
   resolveActiveAgentName,
+  resolveSubagentRunRecord,
   resolveThreadPeerName,
   sendBroadcast,
   sendDirect,
   unregisterSelf,
   updateSelfHeartbeat,
+  updateSubagentRunRecordWith,
+  writeSubagentRunRecord,
 } from "./store.js";
 import { registerRenderers } from "./renderers.js";
 import type {
@@ -31,16 +36,24 @@ import type {
   AgentRegistration,
   AgentRole,
   CollaboratingAgentsConfig,
+  Dirs,
   ExtensionState,
   InboxMessage,
   MessageLogEvent,
+  SubagentRunListRecord,
+  SubagentRunRecord,
+  SubagentRunResolutionContext,
+  SubagentRunResolutionResult,
+  SubagentRunStatus,
 } from "./types.js";
 import {
   createSpawnAgentDefinitionFromType,
   mapWithConcurrencyLimit,
+  PROCESS_MODE_SESSION_FILE_UNAVAILABLE_REASON,
   runSpawnTask,
   type SpawnAgentDefinition,
   type SpawnResult,
+  type SpawnSessionMetadata,
   type SpawnTask,
 } from "./subagent-spawn.js";
 import {
@@ -57,6 +70,7 @@ import {
   formatSubagentType,
   getDefaultSubagentType,
 } from "./subagent-types.js";
+import { formatSessionTail, readSessionTail } from "./session-tail.js";
 
 const STATUS_KEY = "collab";
 const WATCH_DEBOUNCE_MS = 40;
@@ -76,9 +90,22 @@ function getInitialAgentName(): string {
   return envName && envName.length > 0 ? envName : generateName();
 }
 
+function resolveHomeDir(): string {
+  const envHome = process.env.HOME?.trim();
+  if (envHome) return envHome;
+
+  const envUserProfile = process.env.USERPROFILE?.trim();
+  if (envUserProfile) return envUserProfile;
+
+  return homedir();
+}
+
 const AGENT_MESSAGE_ACTIONS = [
   "status",
   "list",
+  "sessions",
+  "session",
+  "tail",
   "send",
   "broadcast",
   "feed",
@@ -89,9 +116,10 @@ const AGENT_MESSAGE_ACTIONS = [
 
 const AgentMessageParams = Type.Object({
   action: StringEnum(AGENT_MESSAGE_ACTIONS, {
-    description: "Action: status | list | send | broadcast | feed | thread | reserve | release",
+    description: "Action: status | list | sessions | session | tail | send | broadcast | feed | thread | reserve | release",
   }),
-  to: Type.Optional(Type.String({ description: "Target agent name (required for send/thread)" })),
+  to: Type.Optional(Type.String({ description: "Target agent name (send/thread) or subagent run selector (session/tail): display name, canonical name, recordId, batch id, session id prefix, or latest" })),
+  runId: Type.Optional(Type.String({ description: "Subagent run selector for session/tail actions; preferred for child run id/recordId and takes precedence over to" })),
   message: Type.Optional(Type.String({ description: "Message text (required for send/broadcast)" })),
   replyTo: Type.Optional(Type.String({ description: "Reply message id (optional, for send)" })),
   urgent: Type.Optional(
@@ -99,7 +127,9 @@ const AgentMessageParams = Type.Object({
       description: "If true, interrupt recipients immediately. If false, queue after current turn.",
     }),
   ),
-  limit: Type.Optional(Type.Number({ description: "Max messages to return (feed/thread), default 20" })),
+  limit: Type.Optional(Type.Number({ description: "Max messages, subagent runs, or tail entries to return; default 20" })),
+  includeCompleted: Type.Optional(Type.Boolean({ description: "For sessions, include completed/failed subagent runs; default lists active runs only" })),
+  raw: Type.Optional(Type.Boolean({ description: "For tail, include structured parsed session entries in details" })),
   paths: Type.Optional(Type.Array(Type.String(), { description: "Reservation path patterns (reserve/release)" })),
   reason: Type.Optional(Type.String({ description: "Optional reservation reason (reserve)" })),
 });
@@ -122,6 +152,29 @@ const SUBAGENT_MAX_CONCURRENCY = 4;
 const SUBAGENT_DEFAULT_MAX_DEPTH = 2;
 const SUBAGENT_LAUNCH_STAGGER_MS = 250;
 
+type SubagentRunRecordPatch = Partial<SubagentRunRecord> & {
+  sessionFileUnavailableReason?: string | null;
+};
+
+interface AgentMessageSubagentRunParams {
+  to?: string;
+  runId?: string;
+  limit?: number;
+  includeCompleted?: boolean;
+  raw?: boolean;
+}
+
+interface AgentMessageSubagentRunContext extends SubagentRunResolutionContext {
+  now?: Date | string | number;
+  completedSubagents?: AgentRegistration[];
+}
+
+interface AgentMessageToolResponse {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+  details: Record<string, unknown>;
+}
+
 function formatToolCallArgs(args: unknown): string {
   const json = JSON.stringify(args, null, 2) ?? "{}";
   const maxChars = 2000;
@@ -135,6 +188,579 @@ function isProcessAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+function normalizeSubagentSessionLimit(raw: number | undefined, fallback = 20, max = 100): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
+  return Math.max(1, Math.min(max, Math.floor(raw)));
+}
+
+function isActiveRunStatus(status: SubagentRunStatus): boolean {
+  return status === "launching" || status === "running";
+}
+
+function isRunScopedToContext(record: SubagentRunListRecord, context: AgentMessageSubagentRunContext): boolean {
+  if (context.parentSessionId) return record.parentSessionId === context.parentSessionId;
+  if (
+    context.parentAgent &&
+    typeof context.parentPid === "number" &&
+    record.parentAgent === context.parentAgent &&
+    record.parentPid === context.parentPid
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function formatRunName(record: SubagentRunListRecord): string {
+  return record.displayName ?? (record.name ? formatAgentDisplayName(record.name) : "(not launched)");
+}
+
+function formatSessionId(sessionId: string | undefined): string {
+  return sessionId ? `${sessionId.slice(0, 12)}${sessionId.length > 12 ? "..." : ""}` : "(not reported)";
+}
+
+function formatRunCandidateList(candidates: SubagentRunListRecord[]): string {
+  if (candidates.length === 0) return "No candidate subagent runs are available.";
+  return candidates
+    .map((record) => {
+      const stale = record.isStale ? " [stale]" : "";
+      return `- ${record.recordId} (${formatRunName(record)}, ${record.status}${stale}, session ${formatSessionId(record.sessionId)})`;
+    })
+    .join("\n");
+}
+
+export function formatSubagentRunList(args: {
+  records: SubagentRunListRecord[];
+  total: number;
+  limit: number;
+  includeCompleted: boolean;
+}): string {
+  if (args.total === 0) {
+    return args.includeCompleted
+      ? "No subagent sessions found for this coordinator."
+      : "No active subagent sessions found for this coordinator.";
+  }
+
+  const lines = args.records.map((record) => {
+    const stale = record.isStale ? " [stale]" : "";
+    const sessionFile = record.sessionFile
+      ? "session file ready"
+      : record.sessionFileUnavailableReason
+        ? "session file pending"
+        : "session file unknown";
+    return [
+      `- ${record.recordId}: ${formatRunName(record)}`,
+      `${record.status}${stale}`,
+      `type ${record.type}`,
+      `session ${formatSessionId(record.sessionId)}`,
+      sessionFile,
+      `task "${record.taskPreview}"`,
+    ].join(" | ");
+  });
+
+  if (args.records.length < args.total) {
+    lines.push(`${args.total - args.records.length} more not shown. Increase limit to inspect more runs.`);
+  }
+
+  return `Subagent sessions (${args.records.length} of ${args.total}):\n${lines.join("\n")}`;
+}
+
+export function formatSubagentRunDetail(record: SubagentRunListRecord): string {
+  const stale = record.isStale ? " [stale]" : "";
+  const lines = [
+    `Subagent session ${record.recordId}`,
+    `Name: ${formatRunName(record)}`,
+    `Status: ${record.status}${stale}`,
+    `Batch ID: ${record.batchRunId}`,
+    `Task index: ${record.taskIndex}`,
+    `Type: ${record.type}`,
+    `Session ID: ${record.sessionId ?? "(not reported)"}`,
+    `Session file: ${record.sessionFile ?? "(not available)"}`,
+    `Working directory: ${record.cwd}`,
+    `Started: ${record.startedAt}`,
+    `Last seen: ${record.lastSeenAt}`,
+    `Task: ${record.taskPreview}`,
+  ];
+
+  if (record.sessionFileUnavailableReason) {
+    lines.push(`Session file note: ${record.sessionFileUnavailableReason}`);
+  }
+  if (record.completedAt) lines.push(`Completed: ${record.completedAt}`);
+  if (typeof record.exitCode === "number") lines.push(`Exit code: ${record.exitCode}`);
+  if (record.model) lines.push(`Model: ${record.model}`);
+  if (record.outputPreview) lines.push(`Output preview: ${record.outputPreview}`);
+  if (record.warnings?.length) lines.push(`Warnings: ${record.warnings.join("; ")}`);
+
+  return lines.join("\n");
+}
+
+export function findSessionFileBySessionId(sessionId: string | undefined): string | undefined {
+  if (!sessionId) return undefined;
+
+  const sessionsRoot = join(resolveHomeDir(), ".pi", "agent", "sessions");
+  if (!fs.existsSync(sessionsRoot)) return undefined;
+
+  const targetSuffix = `_${sessionId}.jsonl`;
+  const stack = [sessionsRoot];
+
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    if (!dir) continue;
+
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (entry.name.endsWith(targetSuffix)) return fullPath;
+    }
+  }
+
+  return undefined;
+}
+
+export function handleAgentMessageSessions(
+  dirs: Dirs,
+  params: AgentMessageSubagentRunParams,
+  context: AgentMessageSubagentRunContext,
+): AgentMessageToolResponse {
+  const limit = normalizeSubagentSessionLimit(params.limit);
+  const includeCompleted = params.includeCompleted === true;
+  const scoped = scopedSubagentRunRecords(dirs, context);
+  const filtered = includeCompleted ? scoped : scoped.filter((record) => isActiveRunStatus(record.status));
+  const records = filtered.slice(0, limit);
+  const truncated = records.length < filtered.length;
+
+  return {
+    content: [{ type: "text", text: formatSubagentRunList({ records, total: filtered.length, limit, includeCompleted }) }],
+    details: {
+      action: "sessions",
+      includeCompleted,
+      limit,
+      total: filtered.length,
+      displayed: records.length,
+      truncated,
+      remaining: Math.max(0, filtered.length - records.length),
+      records,
+    },
+  };
+}
+
+function refreshResolvedRunRecord(
+  dirs: Dirs,
+  record: SubagentRunListRecord,
+  context: AgentMessageSubagentRunContext,
+): { record: SubagentRunListRecord; sessionFileResolved: boolean } {
+  if (record.sessionFile || !record.sessionId) {
+    return { record, sessionFileResolved: false };
+  }
+
+  const sessionFile = findSessionFileBySessionId(record.sessionId);
+  if (!sessionFile) return { record, sessionFileResolved: false };
+
+  const updated = updateSubagentRunRecordWith(dirs, record.recordId, (existing) => ({
+    sessionFile: existing.sessionFile ?? sessionFile,
+    sessionFileUnavailableReason: null,
+  }));
+  if (!updated) return { record, sessionFileResolved: false };
+
+  const refreshed = resolveSubagentRunRecord(dirs, record.recordId, context);
+  return {
+    record: refreshed.status === "ok" ? refreshed.record : { ...record, sessionFile, sessionFileUnavailableReason: undefined },
+    sessionFileResolved: true,
+  };
+}
+
+function scopedSubagentRunRecords(
+  dirs: Dirs,
+  context: AgentMessageSubagentRunContext,
+): SubagentRunListRecord[] {
+  return listSubagentRunRecords(dirs, {
+    now: context.now,
+    staleAfterMs: context.staleAfterMs,
+  }).filter((record) => isRunScopedToContext(record, context));
+}
+
+function resolutionFromRunIdMatches(
+  selector: string,
+  matches: SubagentRunListRecord[],
+): SubagentRunResolutionResult | undefined {
+  if (matches.length === 0) return undefined;
+  if (matches.length === 1) return { status: "ok", record: matches[0] };
+  return {
+    status: "ambiguous",
+    message: `Selector "${selector}" matched multiple subagent runs`,
+    candidates: [...matches].sort((a, b) => a.recordId.localeCompare(b.recordId)),
+  };
+}
+
+function normalizeSubagentRunSelector(selector: string | undefined): string {
+  return (selector?.trim() || "latest").replace(/\s+\((subagent|orchestrator)\)$/i, "");
+}
+
+function latestScopedSubagentRun(records: SubagentRunListRecord[]): SubagentRunListRecord | undefined {
+  return [...records].sort((a, b) => {
+    const lastSeen = Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt);
+    if (lastSeen !== 0) return lastSeen;
+
+    const started = Date.parse(b.startedAt) - Date.parse(a.startedAt);
+    if (started !== 0) return started;
+
+    if (a.isStale !== b.isStale) return a.isStale ? 1 : -1;
+
+    return a.recordId.localeCompare(b.recordId);
+  })[0];
+}
+
+function cappedScopedSubagentRunCandidates(
+  records: SubagentRunListRecord[],
+  context: AgentMessageSubagentRunContext,
+): SubagentRunListRecord[] {
+  return records.slice(0, Math.max(0, context.candidateLimit ?? 10));
+}
+
+function resolveSubagentRunId(
+  dirs: Dirs,
+  runId: string,
+  context: AgentMessageSubagentRunContext,
+): SubagentRunResolutionResult {
+  const selector = runId.trim();
+  const records = scopedSubagentRunRecords(dirs, context);
+
+  return (
+    resolutionFromRunIdMatches(selector, records.filter((record) => record.recordId === selector)) ??
+    resolutionFromRunIdMatches(selector, records.filter((record) => record.recordId.startsWith(selector))) ??
+    resolutionFromRunIdMatches(selector, records.filter((record) => record.batchRunId === selector)) ??
+    resolveScopedSubagentRunRecord(dirs, selector, context)
+  );
+}
+
+function resolveScopedSubagentRunRecord(
+  dirs: Dirs,
+  selector: string,
+  context: AgentMessageSubagentRunContext,
+): SubagentRunResolutionResult {
+  const normalizedSelector = normalizeSubagentRunSelector(selector);
+  const records = scopedSubagentRunRecords(dirs, context);
+
+  if (normalizedSelector === "latest") {
+    const latest = latestScopedSubagentRun(records);
+    if (latest) return { status: "ok", record: latest };
+
+    return {
+      status: "not_found",
+      message: "No runs for current coordinator. Select a specific runId from candidates.",
+      candidates: cappedScopedSubagentRunCandidates(records, context),
+    };
+  }
+
+  const matchers: Array<(record: SubagentRunListRecord) => boolean> = [
+    (record) => record.name === normalizedSelector,
+    (record) => record.displayName === normalizedSelector,
+    (record) => typeof record.name === "string" && record.name.startsWith(normalizedSelector),
+    (record) => typeof record.displayName === "string" && record.displayName.startsWith(normalizedSelector),
+    (record) => typeof record.sessionId === "string" && record.sessionId.startsWith(normalizedSelector),
+    (record) => record.recordId.startsWith(normalizedSelector),
+    (record) => record.batchRunId === normalizedSelector,
+  ];
+
+  for (const matcher of matchers) {
+    const result = resolutionFromRunIdMatches(normalizedSelector, records.filter(matcher));
+    if (result) return result;
+  }
+
+  return {
+    status: "not_found",
+    message: `No subagent run matched "${normalizedSelector}" for this coordinator`,
+    candidates: cappedScopedSubagentRunCandidates(records, context),
+  };
+}
+
+export function handleAgentMessageSession(
+  dirs: Dirs,
+  params: AgentMessageSubagentRunParams,
+  context: AgentMessageSubagentRunContext,
+): AgentMessageToolResponse {
+  const requestedSelector = params.runId?.trim() || params.to?.trim() || "latest";
+  const resolved = params.runId?.trim()
+    ? resolveSubagentRunId(dirs, params.runId, context)
+    : resolveScopedSubagentRunRecord(dirs, requestedSelector, context);
+
+  if (resolved.status !== "ok") {
+    const error = resolved.status === "ambiguous" ? "ambiguous_selector" : "not_found";
+    const candidates = resolved.candidates;
+    return {
+      content: [{ type: "text", text: `${resolved.message}\n\nCandidates:\n${formatRunCandidateList(candidates)}` }],
+      isError: true,
+      details: {
+        action: "session",
+        requestedSelector,
+        requestedRunId: params.runId,
+        requestedTo: params.to,
+        error,
+        message: resolved.message,
+        candidates,
+      },
+    };
+  }
+
+  const { record, sessionFileResolved } = refreshResolvedRunRecord(dirs, resolved.record, context);
+  return {
+    content: [{ type: "text", text: formatSubagentRunDetail(record) }],
+    details: {
+      action: "session",
+      requestedSelector,
+      requestedRunId: params.runId,
+      requestedTo: params.to,
+      sessionFileResolved,
+      record,
+    },
+  };
+}
+
+function looksLikeFilePath(selector: string | undefined): boolean {
+  if (!selector) return false;
+  return isAbsolute(selector) || selector.includes("/") || selector.includes("\\");
+}
+
+function tailError(args: {
+  error: string;
+  message: string;
+  requestedSelector: string;
+  params: AgentMessageSubagentRunParams;
+  record?: SubagentRunListRecord;
+  sessionFile?: string;
+  extraDetails?: Record<string, unknown>;
+}): AgentMessageToolResponse {
+  return {
+    content: [{ type: "text", text: args.message }],
+    isError: true,
+    details: {
+      action: "tail",
+      requestedSelector: args.requestedSelector,
+      requestedRunId: args.params.runId,
+      requestedTo: args.params.to,
+      error: args.error,
+      message: args.message,
+      record: args.record,
+      sessionFile: args.sessionFile,
+      ...args.extraDetails,
+    },
+  };
+}
+
+function completedRegistrationForRecord(
+  record: SubagentRunListRecord,
+  completedSubagents: AgentRegistration[] | undefined,
+): AgentRegistration | undefined {
+  if (!record.name || !completedSubagents?.length) return undefined;
+  return completedSubagents.find((agent) => agent.name === record.name && registrationMatchesRun(record, agent));
+}
+
+function registrationMatchesRun(record: SubagentRunListRecord, registration: AgentRegistration): boolean {
+  if (record.sessionId && registration.sessionId !== record.sessionId) return false;
+  return true;
+}
+
+function activeRegistrationForRecord(dirs: Dirs, record: SubagentRunListRecord): AgentRegistration | undefined {
+  if (!record.name) return undefined;
+  return listActiveAgents(dirs).find((agent) => agent.name === record.name && registrationMatchesRun(record, agent));
+}
+
+function resolveTailSessionFile(
+  dirs: Dirs,
+  record: SubagentRunListRecord,
+  context: AgentMessageSubagentRunContext,
+): { sessionFile?: string; source?: string; resolved: boolean; record: SubagentRunListRecord } {
+  if (record.sessionFile) {
+    return { sessionFile: record.sessionFile, source: "run_record", resolved: false, record };
+  }
+
+  const registration = activeRegistrationForRecord(dirs, record);
+  const completedRegistration = completedRegistrationForRecord(record, context.completedSubagents);
+  const sessionFile =
+    registration?.sessionFile ??
+    completedRegistration?.sessionFile ??
+    findSessionFileBySessionId(record.sessionId);
+  const source =
+    registration?.sessionFile
+      ? "registration"
+      : completedRegistration?.sessionFile
+        ? "completed_registration"
+        : sessionFile
+          ? "session_id"
+          : undefined;
+
+  if (!sessionFile) {
+    return { record, resolved: false };
+  }
+
+  const updated = updateSubagentRunRecordWith(dirs, record.recordId, (existing) => ({
+    sessionFile: existing.sessionFile ?? sessionFile,
+    sessionFileUnavailableReason: null,
+  }));
+  if (!updated) {
+    return { sessionFile, source, resolved: false, record: { ...record, sessionFile, sessionFileUnavailableReason: undefined } };
+  }
+
+  const refreshed = resolveScopedSubagentRunRecord(dirs, record.recordId, context);
+  return {
+    sessionFile,
+    source,
+    resolved: true,
+    record: refreshed.status === "ok" ? refreshed.record : { ...record, sessionFile, sessionFileUnavailableReason: undefined },
+  };
+}
+
+function validateSessionFilePath(sessionFile: string): { ok: true } | { ok: false; error: string; message: string } {
+  if (extname(sessionFile) !== ".jsonl") {
+    return {
+      ok: false,
+      error: "invalid_session_file",
+      message: `Resolved session file is not a Pi session JSONL file: ${sessionFile}`,
+    };
+  }
+
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(sessionFile);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    return {
+      ok: false,
+      error: err.code === "ENOENT" ? "session_file_missing" : "session_file_unreadable",
+      message: `Resolved session file is not readable: ${sessionFile}`,
+    };
+  }
+
+  if (!stats.isFile()) {
+    return {
+      ok: false,
+      error: "session_file_not_file",
+      message: `Resolved session path is not a file: ${sessionFile}`,
+    };
+  }
+
+  return { ok: true };
+}
+
+export function handleAgentMessageTail(
+  dirs: Dirs,
+  params: AgentMessageSubagentRunParams,
+  context: AgentMessageSubagentRunContext,
+): AgentMessageToolResponse {
+  const requestedSelector = params.runId?.trim() || params.to?.trim() || "latest";
+  if (!params.runId?.trim() && looksLikeFilePath(params.to?.trim())) {
+    return tailError({
+      error: "invalid_selector",
+      message: "agent_message tail does not accept file paths. Use a subagent run id, name, session id, or latest.",
+      requestedSelector,
+      params,
+    });
+  }
+
+  const resolved = params.runId?.trim()
+    ? resolveSubagentRunId(dirs, params.runId, context)
+    : resolveScopedSubagentRunRecord(dirs, requestedSelector, context);
+
+  if (resolved.status !== "ok") {
+    const error = resolved.status === "ambiguous" ? "ambiguous_selector" : "not_found";
+    const message = `${resolved.message}\n\nCandidates:\n${formatRunCandidateList(resolved.candidates)}`;
+    return tailError({
+      error,
+      message,
+      requestedSelector,
+      params,
+      extraDetails: { candidates: resolved.candidates },
+    });
+  }
+
+  const session = resolveTailSessionFile(dirs, resolved.record, context);
+  const record = session.record;
+  const sessionFile = session.sessionFile;
+  if (!sessionFile) {
+    const reason = record.sessionFileUnavailableReason ?? "No session file is available for this subagent run yet.";
+    return tailError({
+      error: "session_file_unavailable",
+      message: `Session file is unavailable for ${record.recordId}: ${reason}`,
+      requestedSelector,
+      params,
+      record,
+    });
+  }
+
+  const validation = validateSessionFilePath(sessionFile);
+  if (!validation.ok) {
+    return tailError({
+      error: validation.error,
+      message: validation.message,
+      requestedSelector,
+      params,
+      record,
+      sessionFile,
+    });
+  }
+
+  const limit = normalizeSubagentSessionLimit(params.limit);
+  let tail;
+  try {
+    tail = readSessionTail(sessionFile, { maxLines: limit });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return tailError({
+      error: "session_file_unreadable",
+      message: `Failed to read session file for ${record.recordId}: ${message}`,
+      requestedSelector,
+      params,
+      record,
+      sessionFile,
+    });
+  }
+
+  const formatted = formatSessionTail(tail.entries, { runStatus: record.status });
+  const malformed = tail.malformedLineCount > 0 ? `\nMalformed JSONL lines skipped: ${tail.malformedLineCount}` : "";
+  const truncated = tail.truncatedStart ? "\nStart of file was truncated before parsing." : "";
+  const rawNote = params.raw === true ? "\nStructured entries are available in details." : "";
+  return {
+    content: [
+      {
+        type: "text",
+        text: [
+          `Subagent tail ${record.recordId} (${formatRunName(record)})`,
+          `Session file: ${sessionFile}`,
+          "",
+          formatted || "(no parsed session events)",
+          `${malformed}${truncated}${rawNote}`,
+        ].filter((line) => line.length > 0).join("\n"),
+      },
+    ],
+    details: {
+      action: "tail",
+      requestedSelector,
+      requestedRunId: params.runId,
+      requestedTo: params.to,
+      raw: params.raw === true,
+      limit,
+      record,
+      sessionFile,
+      sessionFileResolved: session.resolved,
+      sessionFileSource: session.source,
+      entries: tail.entries,
+      malformedLineCount: tail.malformedLineCount,
+      bytesRead: tail.bytesRead,
+      truncatedStart: tail.truncatedStart,
+    },
+  };
 }
 
 export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
@@ -173,6 +799,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   let remoteSessionSwitchContext: ExtensionCommandContext | null = null;
 
   const pendingSubagentCompletionUpdates: PendingSubagentCompletionUpdate[] = [];
+  const subagentSessionNoticeLevels = new Map<string, "id" | "file">();
 
   registerRenderers(pi);
 
@@ -759,10 +1386,13 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     },
     ctx: ExtensionContext,
     options?: {
+      batchRunId: string;
       includeLaunchBlock?: boolean;
       onLaunch?: (payload: {
         profile: string;
         launch: SpawnResult;
+        recordId: string;
+        batchRunId: string;
       }) => void | Promise<void>;
     },
   ): Promise<{
@@ -829,7 +1459,15 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 
     markAsOrchestrator(ctx);
 
-    const runId = randomUUID().slice(0, 8);
+    const batchRunId = options?.batchRunId;
+    if (!batchRunId) {
+      return {
+        content: [{ type: "text", text: "Missing batch run id for subagent launch." }],
+        isError: true,
+        details: { mode: "subagent", error: "missing_batch_run_id" },
+      };
+    }
+
     const enableSessionControl = params.sessionControl !== false;
     const includeLaunchBlock = options?.includeLaunchBlock ?? true;
 
@@ -849,6 +1487,9 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       model: baseAgentDef.model || resolvedModel.model,
     };
 
+    const runRecordWarnings: string[] = [];
+    const childRunIds = createPlannedSubagentRunRecords(params, ctx, batchRunId, typeConfig.name, runRecordWarnings);
+
     if (hasSingle) {
       const profile = runtimeAgent.name;
       const taskToRun: SpawnTask = {
@@ -859,21 +1500,32 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 
       const result = await runSpawnTask(ctx.cwd, taskToRun, runtimeAgent, {
         index: 0,
-        runId,
+        runId: batchRunId,
         defaultCwd: params.cwd,
         enableSessionControl,
         recursionDepth: depthState.depth,
         parentAgentName: state.agentName,
         launchMode: config.subagentLaunchMode,
         closeCompletedCmuxPane: config.closeCompletedCmuxPanes,
-        onLaunch: options?.onLaunch
-          ? (launch) =>
-              options.onLaunch?.({
+        onLaunch: (launch) => {
+          markSubagentRunLaunched(childRunIds[0]!, typeConfig.name, launch, runRecordWarnings);
+          return options?.onLaunch
+            ? options.onLaunch({
                 profile,
                 launch,
+                recordId: childRunIds[0]!,
+                batchRunId,
               })
-          : undefined,
+            : undefined;
+        },
+        onSessionMetadata: (metadata) => {
+          markSubagentRunSessionMetadata(childRunIds[0]!, metadata, runRecordWarnings);
+        },
       });
+      markSubagentRunFromRegistration(childRunIds[0]!, result.name, runRecordWarnings);
+      markSubagentRunCompleted(childRunIds[0]!, result, runRecordWarnings);
+
+      const lifecycleWarnings = runRecordWarnings.length > 0 ? [...runRecordWarnings] : undefined;
 
       const resolutionLine = typeNotFoundWarning
         ? `⚠️ ${typeNotFoundWarning}\n\nUsing subagent type '${typeConfig.name}'.`
@@ -892,11 +1544,14 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         isError: ok ? false : true,
         details: {
           mode: "subagent",
-          runId,
+          runId: batchRunId,
+          batchRunId,
+          childRunIds: [childRunIds[0]],
           single: true,
           profile,
           type: typeConfig.name,
           result,
+          lifecycleWarnings,
           modelResolutionWarning: resolvedModel.warning,
           typeNotFoundWarning,
         },
@@ -925,9 +1580,10 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     const launchStaggerMs = SUBAGENT_LAUNCH_STAGGER_MS;
 
     const results = await mapWithConcurrencyLimit(resolvedTasks, concurrency, async (entry, index) => {
-      return await runSpawnTask(ctx.cwd, entry.task, entry.def, {
+      const recordId = childRunIds[index]!;
+      const result = await runSpawnTask(ctx.cwd, entry.task, entry.def, {
         index,
-        runId,
+        runId: batchRunId,
         defaultCwd: params.cwd,
         enableSessionControl,
         recursionDepth: depthState.depth,
@@ -935,15 +1591,27 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         launchDelayMs: launchStaggerMs * index,
         launchMode: config.subagentLaunchMode,
         closeCompletedCmuxPane: config.closeCompletedCmuxPanes,
-        onLaunch: options?.onLaunch
-          ? (launch) =>
-              options.onLaunch?.({
+        onLaunch: (launch) => {
+          markSubagentRunLaunched(recordId, typeConfig.name, launch, runRecordWarnings);
+          return options?.onLaunch
+            ? options.onLaunch({
                 profile: entry.def.name,
                 launch,
+                recordId,
+                batchRunId,
               })
-          : undefined,
+            : undefined;
+        },
+        onSessionMetadata: (metadata) => {
+          markSubagentRunSessionMetadata(recordId, metadata, runRecordWarnings);
+        },
       });
+      markSubagentRunFromRegistration(recordId, result.name, runRecordWarnings);
+      markSubagentRunCompleted(recordId, result, runRecordWarnings);
+      return result;
     });
+
+    const lifecycleWarnings = runRecordWarnings.length > 0 ? [...runRecordWarnings] : undefined;
 
     const successCount = results.filter((r) => r.exitCode === 0).length;
     const lines = results.map((r) => {
@@ -981,13 +1649,16 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       isError: successCount === results.length ? false : true,
       details: {
         mode: "subagent",
-        runId,
+        runId: batchRunId,
+        batchRunId,
+        childRunIds,
         single: false,
         concurrency,
         launchStaggerMs,
         profile: typeConfig.name,
         type: typeConfig.name,
         results,
+        lifecycleWarnings,
         modelResolutionWarning: resolvedModel.warning,
         typeNotFoundWarning,
       },
@@ -1028,7 +1699,13 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     return { ok: true, mode: "single", taskCount: 1, type };
   }
 
-  function sendSubagentLaunchUpdate(profile: string, launch: SpawnResult): void {
+  function formatSessionFileStatus(result: Pick<SpawnResult, "sessionFile" | "sessionFileUnavailableReason">): string {
+    if (result.sessionFile) return `available (${result.sessionFile})`;
+    if (result.sessionFileUnavailableReason) return `pending (${result.sessionFileUnavailableReason})`;
+    return "pending";
+  }
+
+  function sendSubagentLaunchUpdate(profile: string, launch: SpawnResult, recordId: string, batchRunId: string): void {
     pi.sendMessage(
       {
         customType: "collab_focus_status",
@@ -1046,55 +1723,34 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           "```",
           "",
           `Profile: ${profile}`,
+          `Batch ID: ${batchRunId}`,
+          `Run ID: ${recordId}`,
+          `Runtime subagent name: ${launch.name}`,
+          `Display name: ${formatAgentDisplayName(launch.name)}`,
+          `Session ID: ${launch.sessionId ?? "(not reported yet)"}`,
+          `Session file: ${formatSessionFileStatus(launch)}`,
           `Working directory: ${launch.workingDirectory}`,
           `Launch mode: ${launch.launchMode}`,
           `cmux target: ${launch.cmuxWorkspaceRef ? `${launch.cmuxWorkspaceRef}${launch.cmuxPaneRef ? ` / ${launch.cmuxPaneRef}` : ""}${launch.cmuxSurfaceRef ? ` / ${launch.cmuxSurfaceRef}` : ""}` : "(not using cmux)"}`,
           `Type system prompt: ${launch.launchSystemPromptSource ? `${launch.launchSystemPromptSource} (${launch.launchSystemPromptLength ?? 0} chars)` : "(none)"}`,
           "(Type system prompt content is redacted in launch updates.)",
+          "",
+          "Inspect this subagent:",
+          `- agent_message({ action: "session", runId: "${recordId}" })`,
+          `- agent_message({ action: "tail", runId: "${recordId}" })`,
+          `- agent_message({ action: "sessions", includeCompleted: true })`,
         ].join("\n"),
         display: true,
         details: {
           mode: "subagent_launch",
           profile,
+          batchRunId,
+          recordId,
           launch,
         },
       },
       { triggerTurn: false },
     );
-  }
-
-  function findSessionFileBySessionId(sessionId: string | undefined): string | undefined {
-    if (!sessionId) return undefined;
-
-    const sessionsRoot = join(homedir(), ".pi", "agent", "sessions");
-    if (!fs.existsSync(sessionsRoot)) return undefined;
-
-    const targetSuffix = `_${sessionId}.jsonl`;
-    const stack = [sessionsRoot];
-
-    while (stack.length > 0) {
-      const dir = stack.pop();
-      if (!dir) continue;
-
-      let entries: fs.Dirent[] = [];
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-
-      for (const entry of entries) {
-        const fullPath = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          stack.push(fullPath);
-          continue;
-        }
-        if (!entry.isFile()) continue;
-        if (entry.name.endsWith(targetSuffix)) return fullPath;
-      }
-    }
-
-    return undefined;
   }
 
   function snapshotCompletedSubagents(results: SpawnResult[]): void {
@@ -1124,6 +1780,187 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     });
 
     state.completedSubagents = snapshots.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  function isTerminalRunStatus(status: SubagentRunStatus): boolean {
+    return status === "completed" || status === "failed";
+  }
+
+  function mergeWarnings(existing: string[] | undefined, next: string[] | undefined): string[] | undefined {
+    if (!existing?.length && !next?.length) return undefined;
+    const merged: string[] = [];
+    for (const warning of [...(existing ?? []), ...(next ?? [])]) {
+      if (!merged.includes(warning)) merged.push(warning);
+    }
+    return merged;
+  }
+
+  function appendRunRecordWarning(warnings: string[], recordId: string, phase: string): void {
+    const warning = `Failed to update subagent run record ${recordId} during ${phase}`;
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
+
+  function findSubagentRunListRecord(recordId: string): SubagentRunListRecord | undefined {
+    return listSubagentRunRecords(dirs).find((record) => record.recordId === recordId);
+  }
+
+  function sessionNoticeLevel(record: SubagentRunListRecord): "id" | "file" | undefined {
+    if (record.sessionFile) return "file";
+    if (record.sessionId) return "id";
+    return undefined;
+  }
+
+  function sendSubagentSessionReadyNotice(recordId: string, source: string): void {
+    const record = findSubagentRunListRecord(recordId);
+    if (!record) return;
+
+    const level = sessionNoticeLevel(record);
+    if (!level) return;
+
+    const previous = subagentSessionNoticeLevels.get(recordId);
+    if (previous) return;
+
+    subagentSessionNoticeLevels.set(recordId, level);
+    pi.sendMessage(
+      {
+        customType: "collab_focus_status",
+        content: [
+          "Subagent session ready.",
+          `Run ID: ${record.recordId}`,
+          `Batch ID: ${record.batchRunId}`,
+          `Runtime subagent name: ${record.name ?? "(not reported)"}`,
+          `Display name: ${formatRunName(record)}`,
+          `Session ID: ${record.sessionId ?? "(not reported)"}`,
+          `Session file: ${record.sessionFile ?? "(pending)"}`,
+          "",
+          "Inspect this subagent:",
+          `- agent_message({ action: "session", runId: "${record.recordId}" })`,
+          `- agent_message({ action: "tail", runId: "${record.recordId}" })`,
+        ].join("\n"),
+        display: true,
+        details: {
+          mode: "subagent_session_ready",
+          recordId: record.recordId,
+          batchRunId: record.batchRunId,
+          sessionId: record.sessionId,
+          sessionFile: record.sessionFile,
+          sessionReadyLevel: level,
+          source,
+        },
+      },
+      { triggerTurn: false },
+    );
+  }
+
+  function safeUpdateSubagentRunRecordWith(
+    recordId: string,
+    phase: string,
+    warnings: string[],
+    updater: (existing: SubagentRunRecord) => SubagentRunRecordPatch | undefined,
+  ): boolean {
+    try {
+      const ok = updateSubagentRunRecordWith(dirs, recordId, updater);
+      if (!ok) appendRunRecordWarning(warnings, recordId, phase);
+      return ok;
+    } catch {
+      appendRunRecordWarning(warnings, recordId, phase);
+      return false;
+    }
+  }
+
+  function markSubagentRunLaunched(recordId: string, type: string, launch: SpawnResult, warnings: string[]): void {
+    safeUpdateSubagentRunRecordWith(recordId, "launch", warnings, (existing) => {
+      const now = new Date().toISOString();
+      return {
+        name: launch.name,
+        displayName: formatAgentDisplayName(launch.name),
+        type,
+        cwd: launch.workingDirectory,
+        status: isTerminalRunStatus(existing.status) ? existing.status : "running",
+        sessionId: launch.sessionId ?? existing.sessionId,
+        sessionFile: launch.sessionFile ?? existing.sessionFile,
+        sessionFileUnavailableReason: launch.sessionFile ? null : launch.sessionFileUnavailableReason ?? existing.sessionFileUnavailableReason,
+        model: launch.resolvedModel ?? existing.model,
+        launchMode: launch.launchMode,
+        lastSeenAt: now,
+        warnings: mergeWarnings(existing.warnings, launch.warnings),
+      };
+    });
+  }
+
+  function markSubagentRunSessionMetadata(
+    recordId: string,
+    metadata: SpawnSessionMetadata,
+    warnings: string[],
+  ): void {
+    safeUpdateSubagentRunRecordWith(recordId, "session metadata", warnings, (existing) => ({
+      sessionId: metadata.sessionId ?? existing.sessionId,
+      sessionFile: metadata.sessionFile ?? existing.sessionFile,
+      sessionFileUnavailableReason: metadata.sessionFile ? null : existing.sessionFileUnavailableReason,
+      lastSeenAt: new Date().toISOString(),
+    }));
+    sendSubagentSessionReadyNotice(recordId, "session metadata");
+  }
+
+  function markSubagentRunFromRegistration(recordId: string, childName: string | undefined, warnings: string[]): void {
+    if (!childName) return;
+    const registration = readAgentRegistration(dirs, childName);
+    if (!registration) return;
+
+    safeUpdateSubagentRunRecordWith(recordId, "registration metadata", warnings, (existing) => ({
+      sessionId: existing.sessionId ?? registration.sessionId,
+      sessionFile: existing.sessionFile ?? registration.sessionFile,
+      sessionFileUnavailableReason: registration.sessionFile ? null : existing.sessionFileUnavailableReason,
+      lastSeenAt: new Date().toISOString(),
+    }));
+    sendSubagentSessionReadyNotice(recordId, "registration metadata");
+  }
+
+  function findCompletedSubagentSnapshot(name: string | undefined): AgentRegistration | undefined {
+    if (!name) return undefined;
+    return state.completedSubagents.find((agent) => agent.name === name);
+  }
+
+  function markSubagentRunCompleted(recordId: string, result: SpawnResult, warnings: string[]): void {
+    const live = result.name ? getAgentByName(dirs, result.name) : undefined;
+    const registration = result.name ? readAgentRegistration(dirs, result.name) : undefined;
+    const previous = findCompletedSubagentSnapshot(result.name);
+    const now = new Date().toISOString();
+
+    safeUpdateSubagentRunRecordWith(recordId, "completion", warnings, (existing) => {
+      const sessionId = existing.sessionId ?? result.sessionId ?? live?.sessionId ?? registration?.sessionId ?? previous?.sessionId;
+      const sessionFile =
+        existing.sessionFile ??
+        result.sessionFile ??
+        live?.sessionFile ??
+        registration?.sessionFile ??
+        previous?.sessionFile ??
+        findSessionFileBySessionId(sessionId);
+      const sessionFileUnavailableReason =
+        sessionFile
+          ? undefined
+          : result.sessionFileUnavailableReason ??
+            (result.launchMode === "process" && sessionId ? PROCESS_MODE_SESSION_FILE_UNAVAILABLE_REASON : undefined);
+      result.sessionId = sessionId ?? result.sessionId;
+      result.sessionFile = sessionFile ?? result.sessionFile;
+      result.sessionFileUnavailableReason = sessionFile ? undefined : sessionFileUnavailableReason;
+
+      return {
+        name: existing.name ?? result.name,
+        displayName: existing.displayName ?? formatAgentDisplayName(result.name),
+        status: result.exitCode === 0 ? "completed" : "failed",
+        sessionId,
+        sessionFile,
+        sessionFileUnavailableReason: sessionFile ? null : sessionFileUnavailableReason,
+        model: existing.model ?? result.resolvedModel ?? live?.model ?? registration?.model ?? previous?.model,
+        lastSeenAt: now,
+        completedAt: now,
+        exitCode: result.exitCode,
+        outputPreview: result.output,
+        warnings: mergeWarnings(existing.warnings, result.warnings),
+      };
+    });
+    sendSubagentSessionReadyNotice(recordId, "completion");
   }
 
   function buildSubagentStatusSendOptions(ctx: ExtensionContext): { triggerTurn: true; deliverAs?: "steer" } {
@@ -1239,7 +2076,88 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     return "A subagent run is already in progress. Do not wait for direct subagent messages; final outputs are auto-collected and posted when the run completes.";
   }
 
-  function launchSubagentsInBackground(params: SubagentLaunchParams, ctx: ExtensionContext): void {
+  function createSubagentBatchRunId(): string {
+    return randomUUID().slice(0, 8);
+  }
+
+  function getSubagentTaskItems(params: SubagentLaunchParams): Array<{ task: string; cwd?: string }> {
+    if (typeof params.task === "string" && params.task.trim().length > 0) {
+      return [{ task: params.task, cwd: params.cwd }];
+    }
+
+    return params.tasks ?? [];
+  }
+
+  function createChildRunIds(batchRunId: string, taskCount: number): string[] {
+    return Array.from({ length: taskCount }, (_value, index) => `${batchRunId}-${index}`);
+  }
+
+  function createPlannedSubagentRunRecords(
+    params: SubagentLaunchParams,
+    ctx: ExtensionContext,
+    batchRunId: string,
+    type: string,
+    warnings?: string[],
+  ): string[] {
+    config = loadConfig(ctx.cwd);
+
+    const tasks = getSubagentTaskItems(params);
+    const childRunIds = createChildRunIds(batchRunId, tasks.length);
+    const now = new Date().toISOString();
+    const parentSessionFile = ctx.sessionManager.getSessionFile() ?? coordinatorSessionFile ?? localSessionFile;
+
+    tasks.forEach((task, taskIndex) => {
+      const record: SubagentRunRecord = {
+        recordId: childRunIds[taskIndex]!,
+        batchRunId,
+        taskIndex,
+        parentAgent: state.agentName,
+        parentSessionId: ctx.sessionManager.getSessionId(),
+        parentSessionFile,
+        parentPid: process.pid,
+        type,
+        taskPreview: task.task,
+        requestedCwd: task.cwd ?? params.cwd,
+        cwd: task.cwd ?? params.cwd ?? ctx.cwd,
+        status: "launching",
+        launchMode: config.subagentLaunchMode,
+        startedAt: now,
+        lastSeenAt: now,
+      };
+
+      try {
+        const ok = writeSubagentRunRecord(dirs, record);
+        if (!ok && warnings) appendRunRecordWarning(warnings, record.recordId, "planning");
+      } catch {
+        if (warnings) appendRunRecordWarning(warnings, record.recordId, "planning");
+      }
+    });
+
+    return childRunIds;
+  }
+
+  function formatSubagentLaunchQueuedText(mode: "single" | "parallel", taskCount: number, batchRunId: string, childRunIds: string[]): string {
+    const label =
+      mode === "single"
+        ? "Subagent launched in background."
+        : `${taskCount} subagents launched in background.`;
+    const runLabel = mode === "single" ? `Run ID: ${childRunIds[0]}` : `Run IDs: ${childRunIds.join(", ")}`;
+    return [
+      label,
+      `Batch ID: ${batchRunId}`,
+      runLabel,
+      'Use agent_message({ action: "sessions" }) or agent_message({ action: "tail", to: "latest" }) to inspect progress.',
+      "Do not wait for direct subagent messages; final outputs are auto-collected and posted on completion.",
+    ].join("\n");
+  }
+
+  function launchSubagentsInBackground(
+    params: SubagentLaunchParams,
+    ctx: ExtensionContext,
+    options?: { batchRunId?: string },
+  ): { batchRunId: string; childRunIds: string[] } {
+    const batchRunId = options?.batchRunId ?? createSubagentBatchRunId();
+    const childRunIds = createChildRunIds(batchRunId, getSubagentTaskItems(params).length);
     const launchSessionFile = ctx.sessionManager.getSessionFile() ?? coordinatorSessionFile ?? localSessionFile;
 
     state.activeSubagentRuns += 1;
@@ -1253,8 +2171,9 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           params,
           ctx,
           {
+            batchRunId,
             includeLaunchBlock: false,
-            onLaunch: ({ profile, launch }) => sendSubagentLaunchUpdate(profile, launch),
+            onLaunch: ({ profile, launch, recordId, batchRunId }) => sendSubagentLaunchUpdate(profile, launch, recordId, batchRunId),
           },
         );
 
@@ -1278,6 +2197,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         updateStatus(ctx);
       }
     })();
+
+    return { batchRunId, childRunIds };
   }
 
   pi.registerTool({
@@ -1288,12 +2209,17 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 Actions:
 - status: Current agent identity/focus/peer count
 - list: List active agents
+- sessions: List scoped subagent run/session records (active by default; pass includeCompleted: true for completed/failed)
+- session: Resolve one subagent run/session record
+- tail: Read a concise transcript tail for one subagent run/session
 - send: Send direct message to one active agent (set urgent: true to interrupt immediately)
 - broadcast: Send message to all active peers (set urgent: true to interrupt immediately)
 - feed: Read recent global messages
 - thread: Read direct-message thread with one peer agent
 - reserve: Reserve files/directories for exclusive write/edit intent
-- release: Release reservations (specific paths or all)`,
+- release: Release reservations (specific paths or all)
+
+Subagent run selectors for session/tail: child run id/recordId, display name, canonical name, batch id when unambiguous, session id prefix, or latest. Prefer the Run ID returned by subagent launch/completion output. Do not scan ~/.pi/agent/sessions manually for normal subagent inspection; use sessions/session/tail so lookups stay scoped to this coordinator.`,
     parameters: AgentMessageParams,
     renderCall(args, theme) {
       const text = [
@@ -1361,6 +2287,31 @@ Actions:
           content: [{ type: "text", text: `Active agents:\n${lines.join("\n")}` }],
           details: { action, agents: peers },
         };
+      }
+
+      if (action === "sessions") {
+        return handleAgentMessageSessions(dirs, params, {
+          parentAgent: state.agentName,
+          parentSessionId: ctx.sessionManager.getSessionId(),
+          parentPid: process.pid,
+        });
+      }
+
+      if (action === "session") {
+        return handleAgentMessageSession(dirs, params, {
+          parentAgent: state.agentName,
+          parentSessionId: ctx.sessionManager.getSessionId(),
+          parentPid: process.pid,
+        });
+      }
+
+      if (action === "tail") {
+        return handleAgentMessageTail(dirs, params, {
+          parentAgent: state.agentName,
+          parentSessionId: ctx.sessionManager.getSessionId(),
+          parentPid: process.pid,
+          completedSubagents: state.completedSubagents,
+        });
       }
 
       if (action === "send") {
@@ -1602,6 +2553,8 @@ Modes:
 - Single: { task }
 - Parallel: { tasks: [{ task, cwd? }, ...] }
 
+Launch results include a Batch ID plus one child Run ID per spawned subagent. Inspect progress with agent_message({ action: "sessions" }), agent_message({ action: "session", runId: "<run-id>" }), and agent_message({ action: "tail", runId: "<run-id>" }).
+
 By default subagents use the same model as the spawning session.` ,
     parameters: SubagentParams,
     renderCall(args, theme) {
@@ -1640,21 +2593,24 @@ By default subagents use the same model as the spawning session.` ,
       }
 
       if (ctx.hasUI) ctx.ui.notify("Launching subagent in background...", "info");
-      launchSubagentsInBackground(params, ctx);
-
-      const label =
-        validation.mode === "single"
-          ? "Subagent launched in background."
-          : `${validation.taskCount} subagents launched in background.`;
+      const batchRunId = createSubagentBatchRunId();
+      const { childRunIds } = launchSubagentsInBackground(params, ctx, { batchRunId });
 
       return {
-        content: [{ type: "text", text: `${label} Do not wait for direct subagent messages; final outputs are auto-collected and posted on completion.` }],
+        content: [
+          {
+            type: "text",
+            text: formatSubagentLaunchQueuedText(validation.mode, validation.taskCount, batchRunId, childRunIds),
+          },
+        ],
         details: {
           mode: "subagent",
           queued: true,
           background: true,
           launchMode: validation.mode,
           taskCount: validation.taskCount,
+          batchRunId,
+          childRunIds,
         },
       };
     },
@@ -1716,9 +2672,14 @@ By default subagents use the same model as the spawning session.` ,
       }
 
       const typeLabel = type ? ` (${type})` : "";
-      ctx.ui.notify(`Launching subagent${typeLabel} in background...`, "info");
+      const batchRunId = createSubagentBatchRunId();
+      const childRunIds = createChildRunIds(batchRunId, 1);
+      ctx.ui.notify(
+        `Launching subagent${typeLabel} in background. Batch ID: ${batchRunId}. Run ID: ${childRunIds[0]}.`,
+        "info",
+      );
 
-      launchSubagentsInBackground({ task, type }, ctx);
+      launchSubagentsInBackground({ task, type }, ctx, { batchRunId });
     },
   });
 

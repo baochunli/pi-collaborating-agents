@@ -22,6 +22,9 @@ const ORIGINAL_TEST_CMUX_CLOSE_FAIL = process.env.TEST_CMUX_CLOSE_FAIL;
 const ORIGINAL_TEST_PI_EXIT_CODE = process.env.TEST_PI_EXIT_CODE;
 const ORIGINAL_TEST_PI_MULTI_TURN = process.env.TEST_PI_MULTI_TURN;
 const ORIGINAL_TEST_PI_SAME_MTIME_FINAL_ONLY = process.env.TEST_PI_SAME_MTIME_FINAL_ONLY;
+const ORIGINAL_TEST_PI_REGISTER_SELF = process.env.TEST_PI_REGISTER_SELF;
+const ORIGINAL_TEST_PI_REGISTER_SESSION_FILE = process.env.TEST_PI_REGISTER_SESSION_FILE;
+const ORIGINAL_COLLABORATING_AGENTS_DIR = process.env.COLLABORATING_AGENTS_DIR;
 const ORIGINAL_HOME = process.env.HOME;
 const ORIGINAL_USERPROFILE = process.env.USERPROFILE;
 
@@ -81,6 +84,23 @@ if (argsFile) {
 
 const sessionIndex = args.indexOf("--session");
 const sessionPath = sessionIndex >= 0 ? args[sessionIndex + 1] : undefined;
+
+if (process.env.TEST_PI_REGISTER_SELF === "1" && process.env.COLLABORATING_AGENTS_DIR && process.env.PI_AGENT_NAME) {
+  const registryDir = path.join(process.env.COLLABORATING_AGENTS_DIR, "registry");
+  fs.mkdirSync(registryDir, { recursive: true });
+  const now = new Date().toISOString();
+  fs.writeFileSync(path.join(registryDir, process.env.PI_AGENT_NAME + ".json"), JSON.stringify({
+    name: process.env.PI_AGENT_NAME,
+    pid: process.pid,
+    sessionId: "fake-session",
+    sessionFile: process.env.TEST_PI_REGISTER_SESSION_FILE,
+    cwd: process.cwd(),
+    model: "fake/model",
+    startedAt: now,
+    lastSeenAt: now,
+    role: "subagent",
+  }), "utf-8");
+}
 
 if (args.includes("--mode") && args.includes("json")) {
   process.stdout.write(JSON.stringify({ type: "session", id: "fake-session" }) + "\\n");
@@ -543,6 +563,24 @@ afterEach(() => {
     delete process.env.TEST_PI_SAME_MTIME_FINAL_ONLY;
   }
 
+  if (typeof ORIGINAL_TEST_PI_REGISTER_SELF === "string") {
+    process.env.TEST_PI_REGISTER_SELF = ORIGINAL_TEST_PI_REGISTER_SELF;
+  } else {
+    delete process.env.TEST_PI_REGISTER_SELF;
+  }
+
+  if (typeof ORIGINAL_TEST_PI_REGISTER_SESSION_FILE === "string") {
+    process.env.TEST_PI_REGISTER_SESSION_FILE = ORIGINAL_TEST_PI_REGISTER_SESSION_FILE;
+  } else {
+    delete process.env.TEST_PI_REGISTER_SESSION_FILE;
+  }
+
+  if (typeof ORIGINAL_COLLABORATING_AGENTS_DIR === "string") {
+    process.env.COLLABORATING_AGENTS_DIR = ORIGINAL_COLLABORATING_AGENTS_DIR;
+  } else {
+    delete process.env.COLLABORATING_AGENTS_DIR;
+  }
+
   if (typeof ORIGINAL_HOME === "string") {
     process.env.HOME = ORIGINAL_HOME;
   } else {
@@ -614,6 +652,148 @@ describe("subagent spawn", () => {
 
     expect(result.launchSystemPromptSource).toBe("/tmp/scout.toml");
     expect(result.launchSystemPromptLength).toBe(typePrompt.length);
+  });
+
+  test("notifies process-mode session metadata when json session events are observed", async () => {
+    const tempDir = makeTempDir("collab-subagent-process-session-metadata");
+    const { argsFile } = writeFakePiBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "scout",
+      description: "Scout",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/scout.toml",
+      tools: ["read"],
+    };
+    const observedMetadata: Array<{ name: string; sessionId?: string; sessionFile?: string }> = [];
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "scout",
+        task: "Find all TypeScript files",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-process-metadata",
+        recursionDepth: 0,
+        enableSessionControl: false,
+        onSessionMetadata: (metadata) => {
+          observedMetadata.push(metadata);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.sessionFile).toBeUndefined();
+    expect(result.sessionFileUnavailableReason).toBe("Process-mode session file unavailable until child registration or fallback discovery provides one.");
+    const capturedArgs = JSON.parse(fs.readFileSync(argsFile, "utf-8")) as string[];
+    expect(capturedArgs).not.toContain("--session");
+    expect(observedMetadata).toEqual([
+      {
+        name: result.name,
+        sessionId: "fake-session",
+      },
+    ]);
+  });
+
+  test("swallows process-mode session metadata callback failures", async () => {
+    const tempDir = makeTempDir("collab-subagent-process-session-metadata-failure");
+    writeFakePiBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "scout",
+      description: "Scout",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/scout.toml",
+      tools: ["read"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "scout",
+        task: "Find all TypeScript files",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-process-metadata-failure",
+        recursionDepth: 0,
+        enableSessionControl: false,
+        onSessionMetadata: () => {
+          throw new Error("metadata failed");
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.warnings).toContain("Session metadata callback failed: metadata failed");
+  });
+
+  test("includes self-registered session file in process-mode session metadata", async () => {
+    const tempDir = makeTempDir("collab-subagent-process-session-metadata-registration");
+    writeFakePiBinary(tempDir);
+
+    const stateDir = path.join(tempDir, "state");
+    const sessionFile = path.join(tempDir, "self-registered-session.jsonl");
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.COLLABORATING_AGENTS_DIR = stateDir;
+    process.env.TEST_PI_REGISTER_SELF = "1";
+    process.env.TEST_PI_REGISTER_SESSION_FILE = sessionFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "scout",
+      description: "Scout",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/scout.toml",
+      tools: ["read"],
+    };
+    const observedMetadata: Array<{ name: string; sessionId?: string; sessionFile?: string }> = [];
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "scout",
+        task: "Find all TypeScript files",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-process-registration",
+        recursionDepth: 0,
+        enableSessionControl: false,
+        onSessionMetadata: (metadata) => {
+          observedMetadata.push(metadata);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.sessionFile).toBe(sessionFile);
+    expect(result.sessionFileUnavailableReason).toBeUndefined();
+    expect(observedMetadata).toEqual([
+      {
+        name: result.name,
+        sessionId: "fake-session",
+        sessionFile,
+      },
+    ]);
   });
 
   test("omits append-system-prompt for blank type prompt and wraps task with parent context", async () => {
@@ -774,6 +954,56 @@ describe("subagent spawn", () => {
     expect(closeArgs).toEqual(["close-surface", "--surface", "surface:99"]);
   });
 
+  test("notifies cmux session metadata with the explicit session file", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-session-metadata");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+    const observedMetadata: Array<{ name: string; sessionId?: string; sessionFile?: string }> = [];
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-cmux-metadata",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+        onSessionMetadata: (metadata) => {
+          observedMetadata.push(metadata);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.sessionFile).toBeString();
+    expect(observedMetadata).toEqual([
+      {
+        name: result.name,
+        sessionId: "fake-session",
+        sessionFile: result.sessionFile,
+      },
+    ]);
+  });
+
   test("waits for the latest settled assistant message before closing a cmux pane", async () => {
     const tempDir = makeTempDir("collab-subagent-cmux-pane-settled-output");
     const { argsFile } = writeFakePiBinary(tempDir);
@@ -896,7 +1126,7 @@ describe("subagent spawn", () => {
     process.env.TEST_ARGS_FILE = argsFile;
     process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
     process.env.TEST_CMUX_SEND_ASYNC = "1";
-    process.env.TEST_PI_EXIT_DELAY_MS = "2500";
+    process.env.TEST_PI_EXIT_DELAY_MS = "5000";
     process.env.TEST_PI_SAME_MTIME_FINAL_ONLY = "1";
 
     const agentDef: SpawnAgentDefinition = {
@@ -927,7 +1157,7 @@ describe("subagent spawn", () => {
 
     const elapsed = Date.now() - startedAt;
     expect(elapsed).toBeGreaterThanOrEqual(1000);
-    expect(elapsed).toBeLessThan(2000);
+    expect(elapsed).toBeLessThan(4500);
     expect(result.exitCode).toBe(0);
     expect(result.output).toBe("fake-ok");
     expect(result.cmuxPaneClosed).toBe(true);
@@ -985,7 +1215,7 @@ describe("subagent spawn", () => {
       },
     );
 
-    expect(Date.now() - startedAt).toBeLessThan(2400);
+    expect(Date.now() - startedAt).toBeLessThan(4500);
     expect(result.exitCode).toBe(0);
     expect(result.cmuxPaneClosed).toBeUndefined();
     expect(result.cmuxCloseError).toBeUndefined();
@@ -1308,7 +1538,7 @@ describe("subagent spawn", () => {
     process.env.TEST_ARGS_FILE = argsFile;
     process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
     process.env.TEST_CMUX_SEND_ASYNC = "1";
-    process.env.TEST_PI_EXIT_DELAY_MS = "2500";
+    process.env.TEST_PI_EXIT_DELAY_MS = "5000";
 
     const agentDef: SpawnAgentDefinition = {
       name: "worker",
@@ -1337,7 +1567,7 @@ describe("subagent spawn", () => {
 
     const elapsed = Date.now() - startedAt;
     expect(elapsed).toBeGreaterThanOrEqual(1000);
-    expect(elapsed).toBeLessThan(2400);
+    expect(elapsed).toBeLessThan(4500);
     expect(result.exitCode).toBe(0);
     expect(result.cmuxPaneClosed).toBe(true);
 

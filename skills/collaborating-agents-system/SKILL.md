@@ -1,6 +1,6 @@
 ---
 name: collaborating-agents-system
-description: Operating guide for coordinator and spawned subagents using the collaborating-agents extension. Covers agent_message actions, subagent spawning, reservations, delivery semantics, limits, defaults, and failure handling.
+description: Operating guide for coordinator and spawned subagents using the collaborating-agents extension. Covers agent_message actions, subagent spawning, subagent session inspection, reservations, delivery semantics, limits, defaults, and failure handling.
 ---
 
 # Collaborating Agents System (Coordinator + Subagent Playbook)
@@ -23,6 +23,9 @@ Actions:
 
 - `status` — self identity, focus, peer count, reservations
 - `list` — active agents
+- `sessions` — scoped subagent run/session records; active by default, completed/failed with `includeCompleted: true`
+- `session` — resolve one subagent run/session record
+- `tail` — read a concise transcript tail for one subagent run/session
 - `send` — direct message to one peer (`to`, `message`, optional `replyTo`, optional `urgent`)
 - `broadcast` — message all peers (`message`, optional `urgent`)
 - `feed` — recent global message log (`limit`, default 20, max 400)
@@ -40,6 +43,11 @@ Common calls:
 ```ts
 agent_message({ action: "status" })
 agent_message({ action: "list" })
+agent_message({ action: "sessions" })
+agent_message({ action: "sessions", includeCompleted: true })
+agent_message({ action: "session", runId: "subagent-run-id" })
+agent_message({ action: "tail", runId: "subagent-run-id" })
+agent_message({ action: "tail", to: "latest" })
 agent_message({ action: "send", to: "BlueFalcon", message: "Started task X" })
 agent_message({ action: "send", to: "BlueFalcon", message: "Need decision now", urgent: true })
 agent_message({ action: "broadcast", message: "Wave 2 complete" })
@@ -52,6 +60,33 @@ Notes:
 
 - In the `/agents` overlay, prefix message text with `!!` to send urgent.
 - Use urgent only for blockers/decisions that cannot wait.
+
+### Subagent session inspection
+
+Coordinators should inspect spawned subagents through the run registry:
+
+```ts
+agent_message({ action: "sessions" })
+agent_message({ action: "sessions", includeCompleted: true })
+agent_message({ action: "session", runId: "subagent-run-id" })
+agent_message({ action: "tail", runId: "subagent-run-id" })
+agent_message({ action: "tail", to: "latest" })
+```
+
+Do not scan `~/.pi/agent/sessions` manually for normal subagent inspection. The `session` and `tail` actions scope lookups to the current coordinator and return helpful ambiguity or unavailable-session errors.
+
+Supported selectors for `session` and `tail`:
+
+- child run id / `recordId`: stable per-child id returned by `subagent`
+- display name: readable launch/completion name
+- canonical name: runtime subagent name stored in the registry/run record
+- batch id: works only when one child matches; parallel batches are ambiguous and return candidates
+- session id prefix: prefix of the Pi session id
+- `latest`: newest subagent run for the current coordinator
+
+`sessions` lists active/running records by default. Use `includeCompleted: true` to include completed and failed child runs. `tail` accepts selectors only, not raw file paths.
+
+Process mode launches a background `pi` child without a deterministic `--session` file. The extension records the session id from child output and attaches a session file after child self-registration or fallback discovery by session id. Until that happens, tailing may report: `Process-mode session file unavailable until child registration or fallback discovery provides one.` In `cmux-pane` mode, the extension creates an explicit session file under `~/.pi/agent/sessions/collaborating-agents-subagents/`.
 
 ## 2) `subagent` (spawn workers)
 
@@ -158,7 +193,7 @@ Users can also spawn subagents via the `/subagent` command:
 1. **Discover peers**: `agent_message({ action: "list" })`
 2. **Plan work split**
 3. **Spawn workers** with `subagent`
-4. **Track progress** using `thread`/`feed`
+4. **Track progress** using `sessions`, `session`, and `tail`; use `thread`/`feed` for explicit messages
 5. **Coordinate reservations** so only one writer owns a target path
 6. **Collect worker completion output** (auto-collected by orchestrator)
 7. **Release reservations** after merge/finalization
@@ -220,6 +255,7 @@ Stored state:
 
 - `registry/` — active agent registrations + reservations
 - `inbox/` — per-agent message queue files
+- `runs/` — durable subagent run/session records
 - `messages.jsonl` — append-only global message log
 
 Agent naming:
@@ -234,7 +270,21 @@ Agent naming:
 - `thread`: requires `to`
 - `reserve`: requires non-empty `paths`
 - `release`: if `paths` provided, must contain valid entries
+- `session`/`tail`: return explicit errors for unknown selectors, ambiguous batch/display-name matches, missing session files, unavailable process-mode session files, unreadable files, and invalid non-JSONL files
 - Subagent spawn may fail on recursion depth guard or process failure; inspect returned launch/result details
+
+## Validation
+
+Prefer `bun test` for validation. Useful focused checks:
+
+```bash
+bun test extensions/collaborating-agents/docs.test.ts
+bun test extensions/collaborating-agents/index.test.ts --test-name-pattern "tool documentation metadata|agent_message subagent sessions|subagent launch identity"
+bun test extensions/collaborating-agents/session-tail.test.ts
+npm pack --dry-run
+```
+
+Keep `npm pack --dry-run` as the packaging check.
 
 ## Team protocol (concise)
 

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDefaultSubagentType } from "./subagent-types.js";
+import { resolveDirs } from "./paths.js";
 import type { SubagentTypeConfig } from "./types.js";
 
 export interface SpawnAgentDefinition {
@@ -29,8 +30,10 @@ export interface SpawnResult {
   exitCode: number;
   output: string;
   error?: string;
+  warnings?: string[];
   sessionId?: string;
   sessionFile?: string;
+  sessionFileUnavailableReason?: string;
   launchMode: "process" | "cmux-pane";
   workingDirectory: string;
   launchArgs: string[];
@@ -52,6 +55,17 @@ export interface SpawnResult {
   cmuxPaneClosed?: boolean;
   cmuxCloseError?: string;
 }
+
+export const PROCESS_MODE_SESSION_FILE_UNAVAILABLE_REASON =
+  "Process-mode session file unavailable until child registration or fallback discovery provides one.";
+
+export interface SpawnSessionMetadata {
+  name: string;
+  sessionId?: string;
+  sessionFile?: string;
+}
+
+type SpawnSessionMetadataCallback = (metadata: SpawnSessionMetadata) => void | Promise<void>;
 
 export const DEFAULT_SUBAGENT_TOOLS = ["read", "write", "edit", "bash", "agent_message"];
 
@@ -626,7 +640,77 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function createPiEventProcessor(result: SpawnResult): {
+function pushSpawnWarning(result: SpawnResult, warning: string): void {
+  result.warnings ??= [];
+  if (!result.warnings.includes(warning)) result.warnings.push(warning);
+}
+
+function formatCallbackWarning(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message ? `Session metadata callback failed: ${message}` : "Session metadata callback failed";
+}
+
+function createSessionMetadataNotifier(
+  result: SpawnResult,
+  callback?: SpawnSessionMetadataCallback,
+): {
+  notify: (metadata: { sessionId?: string; sessionFile?: string }) => void;
+  flush: () => Promise<void>;
+} {
+  const pending: Promise<void>[] = [];
+  let lastMetadataKey: string | undefined;
+
+  const handleFailure = (error: unknown) => {
+    pushSpawnWarning(result, formatCallbackWarning(error));
+  };
+
+  return {
+    notify: (metadata) => {
+      if (!callback) return;
+
+      const nextMetadata: SpawnSessionMetadata = { name: result.name };
+      if (metadata.sessionId) nextMetadata.sessionId = metadata.sessionId;
+      if (metadata.sessionFile) nextMetadata.sessionFile = metadata.sessionFile;
+
+      const metadataKey = `${nextMetadata.sessionId ?? ""}\0${nextMetadata.sessionFile ?? ""}`;
+      if (metadataKey === lastMetadataKey) return;
+      lastMetadataKey = metadataKey;
+
+      try {
+        const maybePromise = callback(nextMetadata);
+        if (maybePromise && typeof (maybePromise as Promise<void>).then === "function") {
+          pending.push(Promise.resolve(maybePromise).catch(handleFailure));
+        }
+      } catch (error) {
+        handleFailure(error);
+      }
+    },
+    flush: async () => {
+      if (pending.length === 0) return;
+      await Promise.allSettled(pending);
+    },
+  };
+}
+
+function readSelfRegisteredSessionFile(agentName: string, sessionId: string): string | undefined {
+  const registrationPath = path.join(resolveDirs().registry, `${agentName}.json`);
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(registrationPath, "utf-8")) as Record<string, unknown>;
+    if (parsed.name !== agentName) return undefined;
+    if (parsed.sessionId !== sessionId) return undefined;
+    return typeof parsed.sessionFile === "string" && parsed.sessionFile.length > 0
+      ? parsed.sessionFile
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function createPiEventProcessor(
+  result: SpawnResult,
+  onSessionMetadata?: (metadata: { sessionId?: string; sessionFile?: string }) => void,
+): {
   processLine: (line: string) => void;
   finalize: (stderr: string) => void;
 } {
@@ -646,6 +730,9 @@ function createPiEventProcessor(result: SpawnResult): {
 
     if (e.type === "session" && typeof e.id === "string") {
       result.sessionId = e.id;
+      result.sessionFile ??= readSelfRegisteredSessionFile(result.name, e.id);
+      if (result.sessionFile) result.sessionFileUnavailableReason = undefined;
+      onSessionMetadata?.({ sessionId: e.id, sessionFile: result.sessionFile });
       return;
     }
 
@@ -1368,6 +1455,7 @@ export async function runSpawnTask(
     closeCompletedCmuxPane?: boolean;
     cmuxResultTimeoutMs?: number;
     onLaunch?: (launch: SpawnResult) => void | Promise<void>;
+    onSessionMetadata?: SpawnSessionMetadataCallback;
   },
 ): Promise<SpawnResult> {
   const generatedCallsign = reserveReadableCallsign(options.runId, options.index);
@@ -1424,6 +1512,9 @@ export async function runSpawnTask(
   const cwd = task.cwd || options.defaultCwd || runtimeCwd;
 
   const launchMode = options.launchMode ?? "process";
+  // Process-mode uses Pi JSON events for the first iteration. We do not pass
+  // `--session` here until support is proven end-to-end, so transcript tailing
+  // is best-effort until child registration or a fallback scan finds a file.
   const sessionFile = launchMode === "cmux-pane" ? createSubagentSessionFilePath(childName, options.runId.slice(0, 8)) : undefined;
   const exitMarkerPath = sessionFile ? createSubagentExitMarkerPath(sessionFile) : undefined;
 
@@ -1450,6 +1541,7 @@ export async function runSpawnTask(
     exitCode: 1,
     output: "",
     sessionFile,
+    sessionFileUnavailableReason: launchMode === "process" ? PROCESS_MODE_SESSION_FILE_UNAVAILABLE_REASON : undefined,
     launchMode,
     workingDirectory: cwd,
     launchArgs,
@@ -1466,6 +1558,7 @@ export async function runSpawnTask(
     resolvedTools: agentDef.tools ? [...agentDef.tools] : undefined,
     coordinator: options.parentAgentName,
   };
+  const sessionMetadata = createSessionMetadataNotifier(result, options.onSessionMetadata);
 
   if (launchDelayMs > 0) {
     await sleep(launchDelayMs);
@@ -1554,9 +1647,13 @@ export async function runSpawnTask(
       exitMarkerPath: exitMarkerPath!,
       timeoutMs: cmuxResultTimeoutMs,
       onUpdate: (state) => {
-        if (state.sessionId) result.sessionId = state.sessionId;
+        if (state.sessionId) {
+          result.sessionId = state.sessionId;
+          sessionMetadata.notify({ sessionId: state.sessionId, sessionFile: result.sessionFile });
+        }
       },
     });
+    await sessionMetadata.flush();
 
     if (sessionState.exitCode !== null && sessionState.exitCode !== 0) {
       result.sessionId = sessionState.sessionId ?? result.sessionId;
@@ -1639,7 +1736,7 @@ export async function runSpawnTask(
         stdio: ["ignore", "pipe", "pipe"],
       });
 
-      const processor = createPiEventProcessor(result);
+      const processor = createPiEventProcessor(result, sessionMetadata.notify);
 
       if (options.onLaunch) {
         const launchSnapshot: SpawnResult = {
@@ -1680,6 +1777,8 @@ export async function runSpawnTask(
         resolve(1);
       });
     });
+
+  await sessionMetadata.flush();
 
   if (result.exitCode !== 0 && !result.error) {
     result.error = result.output || "Subagent process failed";
