@@ -132,6 +132,32 @@ describe("session transcript tail parser", () => {
     ]);
   });
 
+  test("parseSessionJsonlLine accepts direct tool and stop event shapes", () => {
+    expect(
+      parseSessionJsonlLine(
+        jsonLine({ type: "tool_call", name: "edit", arguments: { filePath: "src/app.ts", oldText: "a" } }).trim(),
+      ).entries,
+    ).toEqual([
+      {
+        kind: "tool-use",
+        name: "edit",
+        args: { filePath: "src/app.ts", oldText: "a" },
+        compactArgs: "filePath=src/app.ts oldText=a",
+        paths: ["src/app.ts"],
+      },
+    ]);
+
+    expect(
+      parseSessionJsonlLine(
+        jsonLine({ type: "tool_result", toolName: "edit", content: [{ type: "text", text: "Applied 1 edit" }] }).trim(),
+      ).entries,
+    ).toEqual([{ kind: "tool-result", name: "edit", summary: "Applied 1 edit" }]);
+
+    expect(parseSessionJsonlLine(jsonLine({ stopReason: "stop", timestamp: "2026-06-17T02:04:00.000Z" }).trim()).entries).toEqual([
+      { kind: "stop", stopReason: "stop", timestamp: "2026-06-17T02:04:00.000Z" },
+    ]);
+  });
+
   test("readSessionTail skips malformed JSONL, reports count, enforces limit, and honors maxBytes", () => {
     const dir = makeTempDir();
     const sessionFile = path.join(dir, "session.jsonl");

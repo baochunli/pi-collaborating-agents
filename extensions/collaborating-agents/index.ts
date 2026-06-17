@@ -1599,6 +1599,46 @@ Actions:
         };
       }
 
+      if (action === "tail") {
+        const resolved = resolveRunRecordForTool(params);
+        if (!resolved.ok) {
+          return {
+            content: [{ type: "text", text: formatSubagentRunResolutionError(resolved) }],
+            isError: true,
+            details: { action, error: resolved.reason, selector: resolved.selector, candidates: resolved.candidates },
+          };
+        }
+
+        const record = resolveSessionFileLazily(resolved.record);
+        if (!record.sessionFile) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${formatSubagentSession(record)}\n\nSession file is not available yet; transcript tail cannot be read.`,
+              },
+            ],
+            isError: true,
+            details: { action, record, missingSessionFile: true },
+          };
+        }
+
+        const limit = normalizeLimit(params.limit, 30, 200);
+        const tail = readSessionTail(record.sessionFile, { limit });
+        const formatted = formatSessionTail(tail.entries, { raw: params.raw === true });
+        const body = formatted || "(no transcript entries found)";
+        const malformedNote = tail.malformedLineCount > 0 ? `\n\nSkipped malformed transcript lines: ${tail.malformedLineCount}` : "";
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Tail for ${formatAgentDisplayName(record.name)}:\n${body}${malformedNote}`,
+            },
+          ],
+          details: { action, record, entries: tail.entries, malformedLineCount: tail.malformedLineCount, bytesRead: tail.bytesRead, truncatedStart: tail.truncatedStart },
+        };
+      }
+
       if (action === "send") {
         if (!params.to || params.to.trim().length === 0) {
           return {
