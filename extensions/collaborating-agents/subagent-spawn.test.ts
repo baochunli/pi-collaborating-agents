@@ -616,6 +616,91 @@ describe("subagent spawn", () => {
     expect(result.launchSystemPromptLength).toBe(typePrompt.length);
   });
 
+  test("notifies process-mode session metadata when json session events are observed", async () => {
+    const tempDir = makeTempDir("collab-subagent-process-session-metadata");
+    const { argsFile } = writeFakePiBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "scout",
+      description: "Scout",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/scout.toml",
+      tools: ["read"],
+    };
+    const observedMetadata: Array<{ name: string; sessionId?: string; sessionFile?: string }> = [];
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "scout",
+        task: "Find all TypeScript files",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-process-metadata",
+        recursionDepth: 0,
+        enableSessionControl: false,
+        onSessionMetadata: (metadata) => {
+          observedMetadata.push(metadata);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.sessionId).toBe("fake-session");
+    expect(observedMetadata).toEqual([
+      {
+        name: result.name,
+        sessionId: "fake-session",
+      },
+    ]);
+  });
+
+  test("swallows process-mode session metadata callback failures", async () => {
+    const tempDir = makeTempDir("collab-subagent-process-session-metadata-failure");
+    writeFakePiBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "scout",
+      description: "Scout",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/scout.toml",
+      tools: ["read"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "scout",
+        task: "Find all TypeScript files",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-process-metadata-failure",
+        recursionDepth: 0,
+        enableSessionControl: false,
+        onSessionMetadata: () => {
+          throw new Error("metadata failed");
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.warnings).toContain("Session metadata callback failed: metadata failed");
+  });
+
   test("omits append-system-prompt for blank type prompt and wraps task with parent context", async () => {
     const tempDir = makeTempDir("collab-subagent-parent-context");
     const { argsFile } = writeFakePiBinary(tempDir);
@@ -772,6 +857,56 @@ describe("subagent spawn", () => {
 
     const closeArgs = capturedCmuxArgs[10]!;
     expect(closeArgs).toEqual(["close-surface", "--surface", "surface:99"]);
+  });
+
+  test("notifies cmux session metadata with the explicit session file", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-session-metadata");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+    const observedMetadata: Array<{ name: string; sessionId?: string; sessionFile?: string }> = [];
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-cmux-metadata",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+        onSessionMetadata: (metadata) => {
+          observedMetadata.push(metadata);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.sessionFile).toBeString();
+    expect(observedMetadata).toEqual([
+      {
+        name: result.name,
+        sessionId: "fake-session",
+        sessionFile: result.sessionFile,
+      },
+    ]);
   });
 
   test("waits for the latest settled assistant message before closing a cmux pane", async () => {
