@@ -149,4 +149,23 @@ describe("session tail reading and formatting", () => {
       ].join("\n"),
     );
   });
+
+  test("does not label tool-use assistant text as final", () => {
+    const output = formatSessionTail(
+      [
+        { kind: "assistant_text", text: "I will inspect the file", stopReason: "toolUse" },
+        { kind: "assistant_tool_call", toolCallId: "tool-1", toolName: "read" },
+        { kind: "stop", stopReason: "toolUse" },
+      ],
+      { runStatus: "failed" },
+    );
+
+    expect(output).toBe(
+      [
+        "assistant: I will inspect the file",
+        "assistant tool call read tool-1",
+        "stop: toolUse",
+      ].join("\n"),
+    );
+  });
 });

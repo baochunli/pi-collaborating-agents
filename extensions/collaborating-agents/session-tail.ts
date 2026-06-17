@@ -246,10 +246,26 @@ function entryPrefix(timestamp: string | undefined): string {
   return timestamp ? `[${timestamp}] ` : "";
 }
 
+function isToolUseStopReason(stopReason: string | undefined): boolean {
+  return stopReason?.replace(/[^a-z0-9]/gi, "").toLowerCase() === "tooluse";
+}
+
+function isFinalAssistantTextCandidate(entries: SessionTailEntry[], index: number): boolean {
+  const entry = entries[index];
+  if (entry?.kind !== "assistant_text") return false;
+  if (isToolUseStopReason(entry.stopReason)) return false;
+
+  return !entries.slice(index + 1).some((later) =>
+    later.kind === "assistant_tool_call" ||
+    later.kind === "tool_result" ||
+    (later.kind === "stop" && isToolUseStopReason(later.stopReason))
+  );
+}
+
 export function formatSessionTail(entries: SessionTailEntry[], options: SessionTailFormatOptions = {}): string {
   const finalEligible = options.runStatus === "completed" || options.runStatus === "failed";
   const finalAssistantIndex = finalEligible
-    ? entries.map((entry, index) => entry.kind === "assistant_text" ? index : -1).filter((index) => index >= 0).pop()
+    ? entries.map((_, index) => isFinalAssistantTextCandidate(entries, index) ? index : -1).filter((index) => index >= 0).pop()
     : undefined;
 
   return entries.map((entry, index) => {
