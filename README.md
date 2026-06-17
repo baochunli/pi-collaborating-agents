@@ -123,6 +123,9 @@ Actions:
 - `thread` – direct-message thread with one peer (`to`, `limit` optional)
 - `reserve` – reserve files/directories for write/edit coordination (`paths`, optional `reason`)
 - `release` – release reservations (`paths` optional; omit to release all)
+- `sessions` – list active and recently completed subagent run/session metadata
+- `session` – resolve one subagent session by exact name, unique name prefix, run id, session id prefix, or `latest`
+- `tail` – format recent transcript events for a resolved subagent session
 
 Reservation patterns are validated. Empty patterns are rejected, and broad patterns (for example `.`, `/`, `./`, `../`, or a top-level directory like `src/`) are allowed but return warnings.
 
@@ -138,7 +141,27 @@ agent_message({ action: "thread", to: "BlueFalcon", limit: 10 })
 agent_message({ action: "reserve", paths: ["src/server/", "src/routes/account.tsx"], reason: "auth refactor" })
 agent_message({ action: "release", paths: ["src/server/"] })
 agent_message({ action: "release" })
+agent_message({ action: "sessions" })
+agent_message({ action: "session", to: "latest" })
+agent_message({ action: "tail", to: "latest", limit: 30 })
 ```
+
+### Inspecting subagent sessions
+
+After spawning a subagent, use first-class `agent_message` actions instead of
+manually scanning `~/.pi/agent/sessions`:
+
+```ts
+agent_message({ action: "sessions" })
+agent_message({ action: "session", to: "latest" })
+agent_message({ action: "tail", to: "latest", limit: 30 })
+```
+
+The extension persists subagent run metadata under its collaborating-agents
+storage root and can resolve active or recently completed sessions by exact
+name, unique name prefix, run id or run id prefix, session id prefix, or
+`latest`. If a run has a session id but no recorded session file yet, the
+session inspection actions attempt lazy resolution before returning.
 
 ### The `subagent` Tool
 

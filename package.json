@@ -3,6 +3,9 @@
   "version": "0.4.5",
   "description": "Collaborative multi-agent messaging and remote focus overlay extension for Pi",
   "license": "MIT",
+  "scripts": {
+    "test": "bun test extensions/collaborating-agents/*.test.ts"
+  },
   "type": "module",
   "repository": {
     "type": "git",

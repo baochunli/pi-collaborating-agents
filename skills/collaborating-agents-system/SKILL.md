@@ -29,6 +29,9 @@ Actions:
 - `thread` — DM history with one peer (`to`, optional `limit`)
 - `reserve` — reserve write/edit targets (`paths`, optional `reason`)
 - `release` — release specific `paths`, or all if omitted
+- `sessions` — list active and recently completed subagent run/session metadata
+- `session` — resolve one subagent session by name, run id, session id prefix, or `latest`
+- `tail` — format recent transcript events for a resolved subagent session
 
 Delivery semantics (important):
 
@@ -46,7 +49,26 @@ agent_message({ action: "broadcast", message: "Wave 2 complete" })
 agent_message({ action: "thread", to: "BlueFalcon", limit: 20 })
 agent_message({ action: "reserve", paths: ["src/server/"], reason: "auth refactor" })
 agent_message({ action: "release", paths: ["src/server/"] })
+agent_message({ action: "sessions" })
+agent_message({ action: "session", to: "latest" })
+agent_message({ action: "tail", to: "latest", limit: 30 })
 ```
+
+## Inspecting subagent sessions
+
+Use:
+
+```ts
+agent_message({ action: "sessions" })
+agent_message({ action: "session", to: "latest" })
+agent_message({ action: "tail", to: "latest", limit: 30 })
+```
+
+Do not scan `~/.pi/agent/sessions` manually. The extension records subagent
+run metadata and can resolve active or recently completed sessions by exact
+name, unique name prefix, run id or run id prefix, session id prefix, or
+`latest`. If a session id is known but the transcript file is not yet recorded,
+`session` and `tail` attempt lazy session-file resolution.
 
 Notes:
 
@@ -221,6 +243,7 @@ Stored state:
 - `registry/` — active agent registrations + reservations
 - `inbox/` — per-agent message queue files
 - `messages.jsonl` — append-only global message log
+- `runs/` — durable subagent run/session metadata for `sessions`, `session`, and `tail`
 
 Agent naming:
 
