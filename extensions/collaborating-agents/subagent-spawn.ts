@@ -1352,6 +1352,29 @@ async function closeCmuxSurface(surfaceRef: string): Promise<{ ok: true } | { ok
   return { ok: true };
 }
 
+function cloneSpawnResultForCallback(result: SpawnResult): SpawnResult {
+  return {
+    ...result,
+    launchArgs: [...result.launchArgs],
+    launchEnv: { ...result.launchEnv },
+    resolvedTools: result.resolvedTools ? [...result.resolvedTools] : undefined,
+  };
+}
+
+function notifySpawnCallback(
+  callback: ((snapshot: SpawnResult) => void | Promise<void>) | undefined,
+  result: SpawnResult,
+): void {
+  if (!callback) return;
+  try {
+    void Promise.resolve(callback(cloneSpawnResultForCallback(result))).catch(() => {
+      // Registry/message callbacks are best-effort and must not fail the spawn.
+    });
+  } catch {
+    // Registry/message callbacks are best-effort and must not fail the spawn.
+  }
+}
+
 export async function runSpawnTask(
   runtimeCwd: string,
   task: SpawnTask,
@@ -1367,6 +1390,7 @@ export async function runSpawnTask(
     launchMode?: "process" | "cmux-pane";
     closeCompletedCmuxPane?: boolean;
     cmuxResultTimeoutMs?: number;
+    onPlanned?: (planned: SpawnResult) => void | Promise<void>;
     onLaunch?: (launch: SpawnResult) => void | Promise<void>;
   },
 ): Promise<SpawnResult> {
@@ -1467,6 +1491,8 @@ export async function runSpawnTask(
     coordinator: options.parentAgentName,
   };
 
+  notifySpawnCallback(options.onPlanned, result);
+
   if (launchDelayMs > 0) {
     await sleep(launchDelayMs);
   }
@@ -1519,17 +1545,7 @@ export async function runSpawnTask(
     result.cmuxPaneRef = cmuxLaunch.paneRef;
     result.cmuxSurfaceRef = cmuxLaunch.surfaceRef;
 
-    if (options.onLaunch) {
-      const launchSnapshot: SpawnResult = {
-        ...result,
-        launchArgs: [...result.launchArgs],
-        launchEnv: { ...result.launchEnv },
-        resolvedTools: result.resolvedTools ? [...result.resolvedTools] : undefined,
-      };
-      void Promise.resolve(options.onLaunch(launchSnapshot)).catch(() => {
-        // ignore launch callback errors
-      });
-    }
+    notifySpawnCallback(options.onLaunch, result);
 
     const didCreateSession = await waitForFileWithTimeout(result.sessionFile!, 10000);
     if (!didCreateSession) {
@@ -1641,17 +1657,7 @@ export async function runSpawnTask(
 
       const processor = createPiEventProcessor(result);
 
-      if (options.onLaunch) {
-        const launchSnapshot: SpawnResult = {
-          ...result,
-          launchArgs: [...result.launchArgs],
-          launchEnv: { ...result.launchEnv },
-          resolvedTools: result.resolvedTools ? [...result.resolvedTools] : undefined,
-        };
-        void Promise.resolve(options.onLaunch(launchSnapshot)).catch(() => {
-          // ignore launch callback errors
-        });
-      }
+      notifySpawnCallback(options.onLaunch, result);
 
       let stdoutBuffer = "";
       let stderr = "";

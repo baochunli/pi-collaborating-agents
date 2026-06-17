@@ -14,16 +14,20 @@ import {
   getAgentByName,
   getConflictsWithOtherAgents,
   listActiveAgents,
+  listSubagentRunRecords,
   processInbox,
   readMessageLog,
   readMessageLogTail,
   registerSelf,
   resolveActiveAgentName,
+  resolveSubagentRunRecord,
   resolveThreadPeerName,
   sendBroadcast,
   sendDirect,
   unregisterSelf,
   updateSelfHeartbeat,
+  updateSubagentRunRecord,
+  writeSubagentRunRecord,
 } from "./store.js";
 import { registerRenderers } from "./renderers.js";
 import type {
@@ -34,6 +38,7 @@ import type {
   ExtensionState,
   InboxMessage,
   MessageLogEvent,
+  SubagentRunRecord,
 } from "./types.js";
 import {
   createSpawnAgentDefinitionFromType,
@@ -57,6 +62,7 @@ import {
   formatSubagentType,
   getDefaultSubagentType,
 } from "./subagent-types.js";
+import { formatSessionTail, readSessionTail } from "./session-tail.js";
 
 const STATUS_KEY = "collab";
 const WATCH_DEBOUNCE_MS = 40;
@@ -85,11 +91,14 @@ const AGENT_MESSAGE_ACTIONS = [
   "thread",
   "reserve",
   "release",
+  "sessions",
+  "session",
+  "tail",
 ] as const;
 
 const AgentMessageParams = Type.Object({
   action: StringEnum(AGENT_MESSAGE_ACTIONS, {
-    description: "Action: status | list | send | broadcast | feed | thread | reserve | release",
+    description: "Action: status | list | send | broadcast | feed | thread | reserve | release | sessions | session | tail",
   }),
   to: Type.Optional(Type.String({ description: "Target agent name (required for send/thread)" })),
   message: Type.Optional(Type.String({ description: "Message text (required for send/broadcast)" })),
@@ -99,9 +108,12 @@ const AgentMessageParams = Type.Object({
       description: "If true, interrupt recipients immediately. If false, queue after current turn.",
     }),
   ),
-  limit: Type.Optional(Type.Number({ description: "Max messages to return (feed/thread), default 20" })),
+  limit: Type.Optional(Type.Number({ description: "Max messages/records/tail entries to return, default 20" })),
   paths: Type.Optional(Type.Array(Type.String(), { description: "Reservation path patterns (reserve/release)" })),
   reason: Type.Optional(Type.String({ description: "Optional reservation reason (reserve)" })),
+  runId: Type.Optional(Type.String({ description: "Subagent run id selector (session/tail)" })),
+  raw: Type.Optional(Type.Boolean({ description: "Return raw structured transcript tail formatting" })),
+  includeCompleted: Type.Optional(Type.Boolean({ description: "Include completed subagent runs when listing/resolving sessions" })),
 });
 
 const SubagentTaskItem = Type.Object({
@@ -173,6 +185,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   let remoteSessionSwitchContext: ExtensionCommandContext | null = null;
 
   const pendingSubagentCompletionUpdates: PendingSubagentCompletionUpdate[] = [];
+  const sessionReadyNotices = new Set<string>();
 
   registerRenderers(pi);
 
@@ -760,6 +773,11 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
     options?: {
       includeLaunchBlock?: boolean;
+      runId?: string;
+      onPlanned?: (payload: {
+        profile: string;
+        launch: SpawnResult;
+      }) => void | Promise<void>;
       onLaunch?: (payload: {
         profile: string;
         launch: SpawnResult;
@@ -829,7 +847,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 
     markAsOrchestrator(ctx);
 
-    const runId = randomUUID().slice(0, 8);
+    const runId = options?.runId ?? randomUUID().slice(0, 8);
     const enableSessionControl = params.sessionControl !== false;
     const includeLaunchBlock = options?.includeLaunchBlock ?? true;
 
@@ -866,14 +884,27 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         parentAgentName: state.agentName,
         launchMode: config.subagentLaunchMode,
         closeCompletedCmuxPane: config.closeCompletedCmuxPanes,
-        onLaunch: options?.onLaunch
-          ? (launch) =>
-              options.onLaunch?.({
-                profile,
-                launch,
-              })
-          : undefined,
+        onPlanned: (launch) => {
+          writeRunRecordBestEffort(buildSubagentRunRecord(runId, profile, launch, "launching"));
+          void options?.onPlanned?.({ profile, launch });
+        },
+        onLaunch: (launch) => {
+          updateRunRecordBestEffort(runId, launch.name, {
+            name: launch.name,
+            type: profile,
+            cwd: launch.workingDirectory,
+            model: launch.resolvedModel,
+            launchMode: launch.launchMode,
+            sessionFile: launch.sessionFile,
+            status: "running",
+            lastSeenAt: new Date().toISOString(),
+          });
+          observeSubagentRegistration(runId, launch.name);
+          void options?.onLaunch?.({ profile, launch });
+        },
       });
+
+      completeRunRecordBestEffort(runId, result);
 
       const resolutionLine = typeNotFoundWarning
         ? `⚠️ ${typeNotFoundWarning}\n\nUsing subagent type '${typeConfig.name}'.`
@@ -935,15 +966,28 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         launchDelayMs: launchStaggerMs * index,
         launchMode: config.subagentLaunchMode,
         closeCompletedCmuxPane: config.closeCompletedCmuxPanes,
-        onLaunch: options?.onLaunch
-          ? (launch) =>
-              options.onLaunch?.({
-                profile: entry.def.name,
-                launch,
-              })
-          : undefined,
+        onPlanned: (launch) => {
+          writeRunRecordBestEffort(buildSubagentRunRecord(runId, entry.def.name, launch, "launching"));
+          void options?.onPlanned?.({ profile: entry.def.name, launch });
+        },
+        onLaunch: (launch) => {
+          updateRunRecordBestEffort(runId, launch.name, {
+            name: launch.name,
+            type: entry.def.name,
+            cwd: launch.workingDirectory,
+            model: launch.resolvedModel,
+            launchMode: launch.launchMode,
+            sessionFile: launch.sessionFile,
+            status: "running",
+            lastSeenAt: new Date().toISOString(),
+          });
+          observeSubagentRegistration(runId, launch.name);
+          void options?.onLaunch?.({ profile: entry.def.name, launch });
+        },
       });
     });
+
+    for (const result of results) completeRunRecordBestEffort(runId, result);
 
     const successCount = results.filter((r) => r.exitCode === 0).length;
     const lines = results.map((r) => {
@@ -1028,7 +1072,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     return { ok: true, mode: "single", taskCount: 1, type };
   }
 
-  function sendSubagentLaunchUpdate(profile: string, launch: SpawnResult): void {
+  function sendSubagentLaunchUpdate(runId: string, profile: string, launch: SpawnResult): void {
     pi.sendMessage(
       {
         customType: "collab_focus_status",
@@ -1045,16 +1089,25 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           launch.launchPrompt,
           "```",
           "",
+          `Run ID: ${runId}`,
           `Profile: ${profile}`,
+          `Runtime subagent name: ${launch.name}`,
+          `Session ID: ${launch.sessionId ?? "pending"}`,
+          `Session file: ${launch.sessionFile ?? "pending"}`,
           `Working directory: ${launch.workingDirectory}`,
           `Launch mode: ${launch.launchMode}`,
           `cmux target: ${launch.cmuxWorkspaceRef ? `${launch.cmuxWorkspaceRef}${launch.cmuxPaneRef ? ` / ${launch.cmuxPaneRef}` : ""}${launch.cmuxSurfaceRef ? ` / ${launch.cmuxSurfaceRef}` : ""}` : "(not using cmux)"}`,
           `Type system prompt: ${launch.launchSystemPromptSource ? `${launch.launchSystemPromptSource} (${launch.launchSystemPromptLength ?? 0} chars)` : "(none)"}`,
           "(Type system prompt content is redacted in launch updates.)",
+          "",
+          "Inspect with:",
+          `agent_message({ action: "session", to: "${launch.name}" })`,
+          `agent_message({ action: "tail", to: "${launch.name}", limit: 30 })`,
         ].join("\n"),
         display: true,
         details: {
           mode: "subagent_launch",
+          runId,
           profile,
           launch,
         },
@@ -1095,6 +1148,125 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     }
 
     return undefined;
+  }
+
+  function truncateOutputPreview(output: string | undefined): string | undefined {
+    const text = output?.trim();
+    if (!text) return undefined;
+    return text.length > 500 ? `${text.slice(0, 497)}...` : text;
+  }
+
+  function bestSessionFileForRun(result: SpawnResult): string | undefined {
+    const live = getAgentByName(dirs, result.name);
+    const completed = state.completedSubagents.find((agent) => agent.name === result.name);
+    const sessionId = result.sessionId ?? live?.sessionId ?? completed?.sessionId;
+    return (
+      result.sessionFile ??
+      live?.sessionFile ??
+      completed?.sessionFile ??
+      findSessionFileBySessionId(sessionId)
+    );
+  }
+
+  function writeRunRecordBestEffort(record: SubagentRunRecord): void {
+    try {
+      writeSubagentRunRecord(dirs, record);
+    } catch {
+      // Run registry writes are best-effort and must not affect subagent execution.
+    }
+  }
+
+  function updateRunRecordBestEffort(runId: string, name: string, patch: Partial<SubagentRunRecord>): void {
+    try {
+      updateSubagentRunRecord(dirs, runId, name, patch);
+    } catch {
+      // Run registry updates are best-effort and must not affect subagent execution.
+    }
+  }
+
+  function buildSubagentRunRecord(runId: string, profile: string, launch: SpawnResult, status: SubagentRunRecord["status"]): SubagentRunRecord {
+    const now = new Date().toISOString();
+    return {
+      runId,
+      parentAgent: state.agentName,
+      name: launch.name,
+      type: profile,
+      task: launch.task,
+      status,
+      sessionId: launch.sessionId,
+      sessionFile: launch.sessionFile,
+      cwd: launch.workingDirectory,
+      model: launch.resolvedModel,
+      launchMode: launch.launchMode,
+      startedAt: now,
+      lastSeenAt: now,
+    };
+  }
+
+  function maybeSendSubagentSessionReadyNotice(runId: string, name: string, sessionId?: string, sessionFile?: string): void {
+    if (!sessionId && !sessionFile) return;
+    const key = `${runId}:${name}`;
+    if (sessionReadyNotices.has(key)) return;
+    sessionReadyNotices.add(key);
+
+    try {
+      pi.sendMessage(
+        {
+          customType: "collab_focus_status",
+          content: [
+            `Subagent session ready: ${formatAgentDisplayName(name)}`,
+            `Run ID: ${runId}`,
+            `Session ID: ${sessionId ?? "pending"}`,
+            `Session file: ${sessionFile ?? "pending"}`,
+            "",
+            "Inspect with:",
+            `agent_message({ action: "session", to: "${name}" })`,
+            `agent_message({ action: "tail", to: "${name}", limit: 30 })`,
+          ].join("\n"),
+          display: true,
+          details: { mode: "subagent_session_ready", runId, name, sessionId, sessionFile },
+        },
+        { triggerTurn: false },
+      );
+    } catch {
+      // Session-ready notices are best-effort.
+    }
+  }
+
+  function observeSubagentRegistration(runId: string, name: string): void {
+    const started = Date.now();
+    const poll = () => {
+      const live = getAgentByName(dirs, name);
+      if (live) {
+        updateRunRecordBestEffort(runId, name, {
+          sessionId: live.sessionId,
+          sessionFile: live.sessionFile,
+          lastSeenAt: new Date().toISOString(),
+        });
+        maybeSendSubagentSessionReadyNotice(runId, name, live.sessionId, live.sessionFile);
+        return;
+      }
+      if (Date.now() - started >= 30_000) return;
+      setTimeout(poll, 500);
+    };
+    setTimeout(poll, 500);
+  }
+
+  function completeRunRecordBestEffort(runId: string, result: SpawnResult): void {
+    const live = getAgentByName(dirs, result.name);
+    const sessionId = result.sessionId ?? live?.sessionId;
+    const sessionFile = bestSessionFileForRun({ ...result, sessionId });
+    const completedAt = new Date().toISOString();
+    updateRunRecordBestEffort(runId, result.name, {
+      status: result.exitCode === 0 ? "completed" : "failed",
+      sessionId,
+      sessionFile,
+      completedAt,
+      exitCode: result.exitCode,
+      outputPreview: truncateOutputPreview(result.output),
+      lastSeenAt: completedAt,
+    });
+    maybeSendSubagentSessionReadyNotice(runId, result.name, sessionId, sessionFile);
   }
 
   function snapshotCompletedSubagents(results: SpawnResult[]): void {
@@ -1239,7 +1411,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     return "A subagent run is already in progress. Do not wait for direct subagent messages; final outputs are auto-collected and posted when the run completes.";
   }
 
-  function launchSubagentsInBackground(params: SubagentLaunchParams, ctx: ExtensionContext): void {
+  function launchSubagentsInBackground(params: SubagentLaunchParams, ctx: ExtensionContext, options?: { runId?: string }): void {
+    const runId = options?.runId ?? randomUUID().slice(0, 8);
     const launchSessionFile = ctx.sessionManager.getSessionFile() ?? coordinatorSessionFile ?? localSessionFile;
 
     state.activeSubagentRuns += 1;
@@ -1254,7 +1427,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           ctx,
           {
             includeLaunchBlock: false,
-            onLaunch: ({ profile, launch }) => sendSubagentLaunchUpdate(profile, launch),
+            runId,
+            onLaunch: ({ profile, launch }) => sendSubagentLaunchUpdate(runId, profile, launch),
           },
         );
 
@@ -1640,17 +1814,28 @@ By default subagents use the same model as the spawning session.` ,
       }
 
       if (ctx.hasUI) ctx.ui.notify("Launching subagent in background...", "info");
-      launchSubagentsInBackground(params, ctx);
+      const runId = randomUUID().slice(0, 8);
+      launchSubagentsInBackground(params, ctx, { runId });
 
       const label =
         validation.mode === "single"
           ? "Subagent launched in background."
           : `${validation.taskCount} subagents launched in background.`;
 
+      const text = [
+        label,
+        `Run ID: ${runId}`,
+        "Do not wait for direct subagent messages; final outputs are auto-collected and posted on completion.",
+        "Inspect with:",
+        "agent_message({ action: \"sessions\" })",
+        "agent_message({ action: \"tail\", to: \"latest\" })",
+      ].join("\n");
+
       return {
-        content: [{ type: "text", text: `${label} Do not wait for direct subagent messages; final outputs are auto-collected and posted on completion.` }],
+        content: [{ type: "text", text }],
         details: {
           mode: "subagent",
+          runId,
           queued: true,
           background: true,
           launchMode: validation.mode,

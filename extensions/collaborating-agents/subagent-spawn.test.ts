@@ -616,6 +616,90 @@ describe("subagent spawn", () => {
     expect(result.launchSystemPromptLength).toBe(typePrompt.length);
   });
 
+  test("reports planned and launched process-mode lifecycle snapshots", async () => {
+    const tempDir = makeTempDir("collab-subagent-lifecycle-callbacks");
+    writeFakePiBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return status",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read"],
+    };
+
+    const planned: string[] = [];
+    const launched: string[] = [];
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Run lifecycle",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "life1234",
+        recursionDepth: 0,
+        onPlanned: (snapshot) => {
+          planned.push(`${snapshot.name}:${snapshot.launchMode}:${snapshot.workingDirectory}`);
+        },
+        onLaunch: (snapshot) => {
+          launched.push(`${snapshot.name}:${snapshot.launchMode}:${snapshot.workingDirectory}`);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("fake-session");
+    expect(planned).toEqual([`${result.name}:process:${tempDir}`]);
+    expect(launched).toEqual([`${result.name}:process:${tempDir}`]);
+  });
+
+  test("callback failures do not fail process-mode spawn results", async () => {
+    const tempDir = makeTempDir("collab-subagent-callback-failure");
+    writeFakePiBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return status",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Run lifecycle despite callback failures",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "life1235",
+        recursionDepth: 0,
+        onPlanned: () => {
+          throw new Error("planned registry write failed");
+        },
+        onLaunch: () => {
+          throw new Error("launch registry write failed");
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.sessionId).toBe("fake-session");
+  });
+
   test("omits append-system-prompt for blank type prompt and wraps task with parent context", async () => {
     const tempDir = makeTempDir("collab-subagent-parent-context");
     const { argsFile } = writeFakePiBinary(tempDir);
