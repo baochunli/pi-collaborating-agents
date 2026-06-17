@@ -519,7 +519,7 @@ export function resolveSubagentRunRecord(
   selector: string | undefined,
   context: SubagentRunResolutionContext,
 ): SubagentRunResolutionResult {
-  const normalizedSelector = selector?.trim() || "latest";
+  const normalizedSelector = normalizeAgentSpecifier(selector?.trim() || "latest");
   const records = listSubagentRunRecords(dirs, {
     now: context.now,
     staleAfterMs: context.staleAfterMs,

@@ -391,6 +391,10 @@ describe("store subagent run records", () => {
       status: "ok",
       record: { recordId: "sunny-run-0" },
     });
+    expect(resolveSubagentRunRecord(dirs, "SunnyBreeze (subagent)", context)).toMatchObject({
+      status: "ok",
+      record: { recordId: "sunny-run-0" },
+    });
     expect(resolveSubagentRunRecord(dirs, "reviewer-bb", context)).toMatchObject({
       status: "ok",
       record: { recordId: "misty-run-0" },
