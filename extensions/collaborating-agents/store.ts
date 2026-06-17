@@ -297,6 +297,15 @@ function normalizeSubagentRunRecord(record: SubagentRunRecord): SubagentRunRecor
   };
 }
 
+function definedPatch<T extends Record<string, unknown>>(patch: Partial<T>): Partial<T> {
+  const result: Partial<T> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (typeof value === "undefined") continue;
+    result[key as keyof T] = value as T[keyof T];
+  }
+  return result;
+}
+
 function writeFileAtomic(path: string, content: string): boolean {
   const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
 
@@ -359,7 +368,7 @@ export function updateSubagentRunRecord(
 
     const merged = normalizeSubagentRunRecord({
       ...existing,
-      ...patch,
+      ...definedPatch<SubagentRunRecord>(patch),
       recordId: existing.recordId,
       batchRunId: existing.batchRunId,
       taskIndex: existing.taskIndex,

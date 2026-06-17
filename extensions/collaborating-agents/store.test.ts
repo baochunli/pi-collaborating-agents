@@ -256,6 +256,38 @@ describe("store subagent run records", () => {
     });
   });
 
+  test("updateSubagentRunRecord ignores undefined patch fields so metadata is not erased", () => {
+    const dirs = makeDirs("collab-store-runs-undefined");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          sessionId: "session-live",
+          sessionFile: "/tmp/session-live.jsonl",
+        }),
+      ),
+    ).toBe(true);
+
+    expect(
+      updateSubagentRunRecord(dirs, "batch-1-0", {
+        status: "completed",
+        sessionId: undefined,
+        sessionFile: undefined,
+        completedAt: "2026-01-01T00:00:02.000Z",
+      }),
+    ).toBe(true);
+
+    const [stored] = listSubagentRunRecords(dirs);
+    expect(stored).toMatchObject({
+      recordId: "batch-1-0",
+      status: "completed",
+      sessionId: "session-live",
+      sessionFile: "/tmp/session-live.jsonl",
+      completedAt: "2026-01-01T00:00:02.000Z",
+    });
+  });
+
   test("listSubagentRunRecords ignores corrupt files and returns newest records first", () => {
     const dirs = makeDirs("collab-store-runs-list");
 
