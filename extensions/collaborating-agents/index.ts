@@ -15,6 +15,7 @@ import {
   getConflictsWithOtherAgents,
   listActiveAgents,
   processInbox,
+  readAgentRegistration,
   readMessageLog,
   readMessageLogTail,
   registerSelf,
@@ -24,6 +25,7 @@ import {
   sendDirect,
   unregisterSelf,
   updateSelfHeartbeat,
+  updateSubagentRunRecordWith,
   writeSubagentRunRecord,
 } from "./store.js";
 import { registerRenderers } from "./renderers.js";
@@ -36,6 +38,7 @@ import type {
   InboxMessage,
   MessageLogEvent,
   SubagentRunRecord,
+  SubagentRunStatus,
 } from "./types.js";
 import {
   createSpawnAgentDefinitionFromType,
@@ -43,6 +46,7 @@ import {
   runSpawnTask,
   type SpawnAgentDefinition,
   type SpawnResult,
+  type SpawnSessionMetadata,
   type SpawnTask,
 } from "./subagent-spawn.js";
 import {
@@ -76,6 +80,16 @@ function generateName(): string {
 function getInitialAgentName(): string {
   const envName = process.env.PI_AGENT_NAME?.trim();
   return envName && envName.length > 0 ? envName : generateName();
+}
+
+function resolveHomeDir(): string {
+  const envHome = process.env.HOME?.trim();
+  if (envHome) return envHome;
+
+  const envUserProfile = process.env.USERPROFILE?.trim();
+  if (envUserProfile) return envUserProfile;
+
+  return homedir();
 }
 
 const AGENT_MESSAGE_ACTIONS = [
@@ -860,7 +874,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
       model: baseAgentDef.model || resolvedModel.model,
     };
 
-    createPlannedSubagentRunRecords(params, ctx, batchRunId, typeConfig.name);
+    const runRecordWarnings: string[] = [];
+    const childRunIds = createPlannedSubagentRunRecords(params, ctx, batchRunId, typeConfig.name, runRecordWarnings);
 
     if (hasSingle) {
       const profile = runtimeAgent.name;
@@ -879,14 +894,23 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         parentAgentName: state.agentName,
         launchMode: config.subagentLaunchMode,
         closeCompletedCmuxPane: config.closeCompletedCmuxPanes,
-        onLaunch: options?.onLaunch
-          ? (launch) =>
-              options.onLaunch?.({
+        onLaunch: (launch) => {
+          markSubagentRunLaunched(childRunIds[0]!, typeConfig.name, launch, runRecordWarnings);
+          return options?.onLaunch
+            ? options.onLaunch({
                 profile,
                 launch,
               })
-          : undefined,
+            : undefined;
+        },
+        onSessionMetadata: (metadata) => {
+          markSubagentRunSessionMetadata(childRunIds[0]!, metadata, runRecordWarnings);
+        },
       });
+      markSubagentRunFromRegistration(childRunIds[0]!, result.name, runRecordWarnings);
+      markSubagentRunCompleted(childRunIds[0]!, result, runRecordWarnings);
+
+      const lifecycleWarnings = runRecordWarnings.length > 0 ? [...runRecordWarnings] : undefined;
 
       const resolutionLine = typeNotFoundWarning
         ? `⚠️ ${typeNotFoundWarning}\n\nUsing subagent type '${typeConfig.name}'.`
@@ -907,11 +931,12 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           mode: "subagent",
           runId: batchRunId,
           batchRunId,
-          childRunIds: [`${batchRunId}-0`],
+          childRunIds: [childRunIds[0]],
           single: true,
           profile,
           type: typeConfig.name,
           result,
+          lifecycleWarnings,
           modelResolutionWarning: resolvedModel.warning,
           typeNotFoundWarning,
         },
@@ -940,7 +965,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     const launchStaggerMs = SUBAGENT_LAUNCH_STAGGER_MS;
 
     const results = await mapWithConcurrencyLimit(resolvedTasks, concurrency, async (entry, index) => {
-      return await runSpawnTask(ctx.cwd, entry.task, entry.def, {
+      const recordId = childRunIds[index]!;
+      const result = await runSpawnTask(ctx.cwd, entry.task, entry.def, {
         index,
         runId: batchRunId,
         defaultCwd: params.cwd,
@@ -950,15 +976,25 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         launchDelayMs: launchStaggerMs * index,
         launchMode: config.subagentLaunchMode,
         closeCompletedCmuxPane: config.closeCompletedCmuxPanes,
-        onLaunch: options?.onLaunch
-          ? (launch) =>
-              options.onLaunch?.({
+        onLaunch: (launch) => {
+          markSubagentRunLaunched(recordId, typeConfig.name, launch, runRecordWarnings);
+          return options?.onLaunch
+            ? options.onLaunch({
                 profile: entry.def.name,
                 launch,
               })
-          : undefined,
+            : undefined;
+        },
+        onSessionMetadata: (metadata) => {
+          markSubagentRunSessionMetadata(recordId, metadata, runRecordWarnings);
+        },
       });
+      markSubagentRunFromRegistration(recordId, result.name, runRecordWarnings);
+      markSubagentRunCompleted(recordId, result, runRecordWarnings);
+      return result;
     });
+
+    const lifecycleWarnings = runRecordWarnings.length > 0 ? [...runRecordWarnings] : undefined;
 
     const successCount = results.filter((r) => r.exitCode === 0).length;
     const lines = results.map((r) => {
@@ -998,13 +1034,14 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         mode: "subagent",
         runId: batchRunId,
         batchRunId,
-        childRunIds: results.map((_result, index) => `${batchRunId}-${index}`),
+        childRunIds,
         single: false,
         concurrency,
         launchStaggerMs,
         profile: typeConfig.name,
         type: typeConfig.name,
         results,
+        lifecycleWarnings,
         modelResolutionWarning: resolvedModel.warning,
         typeNotFoundWarning,
       },
@@ -1083,7 +1120,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
   function findSessionFileBySessionId(sessionId: string | undefined): string | undefined {
     if (!sessionId) return undefined;
 
-    const sessionsRoot = join(homedir(), ".pi", "agent", "sessions");
+    const sessionsRoot = join(resolveHomeDir(), ".pi", "agent", "sessions");
     if (!fs.existsSync(sessionsRoot)) return undefined;
 
     const targetSuffix = `_${sessionId}.jsonl`;
@@ -1141,6 +1178,115 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     });
 
     state.completedSubagents = snapshots.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  function isTerminalRunStatus(status: SubagentRunStatus): boolean {
+    return status === "completed" || status === "failed";
+  }
+
+  function mergeWarnings(existing: string[] | undefined, next: string[] | undefined): string[] | undefined {
+    if (!existing?.length && !next?.length) return undefined;
+    const merged: string[] = [];
+    for (const warning of [...(existing ?? []), ...(next ?? [])]) {
+      if (!merged.includes(warning)) merged.push(warning);
+    }
+    return merged;
+  }
+
+  function appendRunRecordWarning(warnings: string[], recordId: string, phase: string): void {
+    const warning = `Failed to update subagent run record ${recordId} during ${phase}`;
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
+
+  function safeUpdateSubagentRunRecordWith(
+    recordId: string,
+    phase: string,
+    warnings: string[],
+    updater: (existing: SubagentRunRecord) => Partial<SubagentRunRecord> | undefined,
+  ): boolean {
+    const ok = updateSubagentRunRecordWith(dirs, recordId, updater);
+    if (!ok) appendRunRecordWarning(warnings, recordId, phase);
+    return ok;
+  }
+
+  function markSubagentRunLaunched(recordId: string, type: string, launch: SpawnResult, warnings: string[]): void {
+    safeUpdateSubagentRunRecordWith(recordId, "launch", warnings, (existing) => {
+      const now = new Date().toISOString();
+      return {
+        name: launch.name,
+        displayName: formatAgentDisplayName(launch.name),
+        type,
+        cwd: launch.workingDirectory,
+        status: isTerminalRunStatus(existing.status) ? existing.status : "running",
+        sessionId: launch.sessionId ?? existing.sessionId,
+        sessionFile: launch.sessionFile ?? existing.sessionFile,
+        model: launch.resolvedModel ?? existing.model,
+        launchMode: launch.launchMode,
+        lastSeenAt: now,
+        warnings: mergeWarnings(existing.warnings, launch.warnings),
+      };
+    });
+  }
+
+  function markSubagentRunSessionMetadata(
+    recordId: string,
+    metadata: SpawnSessionMetadata,
+    warnings: string[],
+  ): void {
+    safeUpdateSubagentRunRecordWith(recordId, "session metadata", warnings, (existing) => ({
+      sessionId: metadata.sessionId ?? existing.sessionId,
+      sessionFile: metadata.sessionFile ?? existing.sessionFile,
+      lastSeenAt: new Date().toISOString(),
+    }));
+  }
+
+  function markSubagentRunFromRegistration(recordId: string, childName: string | undefined, warnings: string[]): void {
+    if (!childName) return;
+    const registration = readAgentRegistration(dirs, childName);
+    if (!registration) return;
+
+    safeUpdateSubagentRunRecordWith(recordId, "registration metadata", warnings, (existing) => ({
+      sessionId: existing.sessionId ?? registration.sessionId,
+      sessionFile: existing.sessionFile ?? registration.sessionFile,
+      lastSeenAt: new Date().toISOString(),
+    }));
+  }
+
+  function findCompletedSubagentSnapshot(name: string | undefined): AgentRegistration | undefined {
+    if (!name) return undefined;
+    return state.completedSubagents.find((agent) => agent.name === name);
+  }
+
+  function markSubagentRunCompleted(recordId: string, result: SpawnResult, warnings: string[]): void {
+    const live = result.name ? getAgentByName(dirs, result.name) : undefined;
+    const registration = result.name ? readAgentRegistration(dirs, result.name) : undefined;
+    const previous = findCompletedSubagentSnapshot(result.name);
+    const now = new Date().toISOString();
+
+    safeUpdateSubagentRunRecordWith(recordId, "completion", warnings, (existing) => {
+      const sessionId = existing.sessionId ?? result.sessionId ?? live?.sessionId ?? registration?.sessionId ?? previous?.sessionId;
+      const sessionFile =
+        existing.sessionFile ??
+        result.sessionFile ??
+        live?.sessionFile ??
+        registration?.sessionFile ??
+        previous?.sessionFile ??
+        findSessionFileBySessionId(sessionId);
+
+      return {
+        name: existing.name ?? result.name,
+        displayName: existing.displayName ?? formatAgentDisplayName(result.name),
+        status: result.exitCode === 0 ? "completed" : "failed",
+        sessionId,
+        sessionFile,
+        model: existing.model ?? result.resolvedModel ?? live?.model ?? registration?.model ?? previous?.model,
+        lastSeenAt: now,
+        completedAt: now,
+        exitCode: result.exitCode,
+        outputPreview: result.output,
+        warnings: mergeWarnings(existing.warnings, result.warnings),
+      };
+    });
   }
 
   function buildSubagentStatusSendOptions(ctx: ExtensionContext): { triggerTurn: true; deliverAs?: "steer" } {
@@ -1277,6 +1423,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
     batchRunId: string,
     type: string,
+    warnings?: string[],
   ): string[] {
     config = loadConfig(ctx.cwd);
 
@@ -1304,7 +1451,8 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
         lastSeenAt: now,
       };
 
-      writeSubagentRunRecord(dirs, record);
+      const ok = writeSubagentRunRecord(dirs, record);
+      if (!ok && warnings) appendRunRecordWarning(warnings, record.recordId, "planning");
     });
 
     return childRunIds;

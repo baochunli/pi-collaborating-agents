@@ -388,6 +388,14 @@ export function updateSubagentRunRecord(
   recordId: string,
   patch: Partial<SubagentRunRecord>,
 ): boolean {
+  return updateSubagentRunRecordWith(dirs, recordId, () => patch);
+}
+
+export function updateSubagentRunRecordWith(
+  dirs: Dirs,
+  recordId: string,
+  updater: (existing: SubagentRunRecord) => Partial<SubagentRunRecord> | undefined,
+): boolean {
   ensureDirSync(dirs.base);
   ensureDirSync(dirs.runs);
 
@@ -399,6 +407,9 @@ export function updateSubagentRunRecord(
 
     const existing = readJsonFile<unknown>(path);
     if (!existing || !isValidSubagentRunRecord(existing)) return false;
+
+    const patch = updater({ ...existing });
+    if (!patch) return true;
 
     const merged = normalizeSubagentRunRecord({
       ...existing,
@@ -680,6 +691,12 @@ export function listActiveAgents(dirs: Dirs, excludeAgentName?: string): AgentRe
 
 export function getAgentByName(dirs: Dirs, name: string): AgentRegistration | undefined {
   return listActiveAgents(dirs).find((a) => a.name === name);
+}
+
+export function readAgentRegistration(dirs: Dirs, name: string): AgentRegistration | undefined {
+  const parsed = readJsonFile<unknown>(registrationPath(dirs, name));
+  if (!parsed || !isValidRegistration(parsed)) return undefined;
+  return parsed.name === name ? parsed : undefined;
 }
 
 export function formatAgentDisplayName(agentName: string): string {

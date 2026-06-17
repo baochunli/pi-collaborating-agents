@@ -19,6 +19,7 @@ import {
   listSubagentRunRecords,
   unregisterSelf,
   updateSubagentRunRecord,
+  updateSubagentRunRecordWith,
   updateSelfHeartbeat,
   writeSubagentRunRecord,
 } from "./store.ts";
@@ -286,6 +287,49 @@ describe("store subagent run records", () => {
       sessionId: "session-live",
       sessionFile: "/tmp/session-live.jsonl",
       completedAt: "2026-01-01T00:00:02.000Z",
+    });
+  });
+
+  test("updateSubagentRunRecordWith merges against the latest stored record", () => {
+    const dirs = makeDirs("collab-store-runs-update-with");
+
+    expect(
+      writeSubagentRunRecord(
+        dirs,
+        makeRunRecord({
+          status: "completed",
+          sessionId: "session-live",
+          sessionFile: "/tmp/session-live.jsonl",
+          completedAt: "2026-01-01T00:00:02.000Z",
+          exitCode: 0,
+          outputPreview: "done",
+        }),
+      ),
+    ).toBe(true);
+
+    expect(
+      updateSubagentRunRecordWith(dirs, "batch-1-0", (existing) => ({
+        status: existing.status === "completed" || existing.status === "failed" ? existing.status : "running",
+        name: "worker-aa-SunnyBreeze",
+        displayName: formatAgentDisplayName("worker-aa-SunnyBreeze"),
+        sessionId: existing.sessionId ?? "new-session",
+        sessionFile: existing.sessionFile ?? "/tmp/new-session.jsonl",
+        lastSeenAt: "2026-01-01T00:00:03.000Z",
+      })),
+    ).toBe(true);
+
+    const [stored] = listSubagentRunRecords(dirs);
+    expect(stored).toMatchObject({
+      recordId: "batch-1-0",
+      status: "completed",
+      name: "worker-aa-SunnyBreeze",
+      displayName: "SunnyBreeze",
+      sessionId: "session-live",
+      sessionFile: "/tmp/session-live.jsonl",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      exitCode: 0,
+      outputPreview: "done",
+      lastSeenAt: "2026-01-01T00:00:03.000Z",
     });
   });
 
