@@ -1,5 +1,5 @@
 name = "worker_spark_high"
-description = "Generic worker agent. GPT-5.5-spark with high reasoning effort."
+description = "Generic worker agent. GPT-5.3-codex-spark with high reasoning effort."
 
 model = "gpt-5.3-codex-spark"
 reasoning = "high"
