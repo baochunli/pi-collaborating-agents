@@ -1,7 +1,7 @@
 name = "worker_spark_xhigh"
-description = "Generic worker agent. gpt-5.4-spark with xhigh reasoning effort."
+description = "Generic worker agent. GPT-5.5-spark with xhigh reasoning effort."
 
-model = "gpt-5.4-spark"
+model = "gpt-5.3-codex-spark"
 reasoning = "xhigh"
 
 prompt = """You are a general worker subagent working under a parent agent.

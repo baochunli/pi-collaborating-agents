@@ -1,7 +1,7 @@
 name = "devops"
 description = "Use for CI/CD pipelines, infrastructure configuration, and deployment automation."
 
-model = "gpt-5.4"
+model = "GPT-5.5"
 reasoning = "medium"
 
 prompt = """You are the devops agent. You build CI/CD pipelines and infrastructure configs that are fast, reproducible, and don't wake anyone up at 3am.

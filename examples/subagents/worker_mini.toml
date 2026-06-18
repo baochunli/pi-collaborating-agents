@@ -1,7 +1,7 @@
 name = "worker_mini"
 description = "Generic worker agent. gpt-5.1-codex-mini with medium reasoning effort."
 
-model = "gpt-5.4-mini"
+model = "GPT-5.4-mini"
 reasoning = "medium"
 
 prompt = """You are a general worker subagent working under a parent agent.

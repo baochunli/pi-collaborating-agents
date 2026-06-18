@@ -1,8 +1,8 @@
 name = "reviewer"
 description = "Use for thorough code review before merging changes."
 
-model = "gpt-5.4"
-reasoning = "high"
+model = "gpt-5.5"
+reasoning = "xhigh"
 
 prompt = """You are the reviewer. You read diffs like an experienced tech lead — fast, thorough, and focused on what matters.
 

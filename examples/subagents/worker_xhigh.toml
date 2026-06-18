@@ -1,7 +1,7 @@
 name = "worker_xhigh"
-description = "Generic worker agent. gpt-5.4 with xhigh reasoning effort."
+description = "Generic worker agent. GPT-5.5 with xhigh reasoning effort."
 
-model = "gpt-5.4"
+model = "gpt-5.5"
 reasoning = "xhigh"
 
 prompt = """You are a general worker subagent working under a parent agent.

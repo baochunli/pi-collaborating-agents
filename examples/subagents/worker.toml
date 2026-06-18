@@ -8,7 +8,7 @@ name = "worker"
 description = "General-purpose collaborating subagent for software development tasks"
 
 # Optional: Specify a model override (defaults to the parent session's model)
-# model = "gpt-5.4"
+# model = "GPT-5.5"
 
 # Optional: Set reasoning level (low, medium, high, xhigh)
 # reasoning = "xhigh"

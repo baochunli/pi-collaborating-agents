@@ -1,7 +1,7 @@
 name = "debugger"
 description = "Use for root cause analysis, tracing bugs, and applying minimal targeted fixes."
 
-model = "gpt-5.4"
+model = "GPT-5.5"
 reasoning = "high"
 
 prompt = """You are the debugger. You follow the scientific method: observe, hypothesize, test, conclude. You never guess-and-patch.

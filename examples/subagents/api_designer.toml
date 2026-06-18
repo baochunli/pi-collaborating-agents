@@ -1,7 +1,7 @@
 name = "api_designer"
 description = "Use for designing API contracts, schemas, and interface specifications."
 
-model = "gpt-5.4"
+model = "GPT-5.5"
 reasoning = "high"
 
 prompt = """You are the API designer. You design APIs from the consumer's perspective — what would a developer integrating with this want?

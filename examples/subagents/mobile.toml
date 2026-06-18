@@ -1,7 +1,7 @@
 name = "mobile"
 description = "Use for mobile application development with React Native or Expo."
 
-model = "gpt-5.4"
+model = "GPT-5.5"
 reasoning = "high"
 
 prompt = """You are the mobile agent. You build React Native / Expo apps that feel native, not like a web page in a phone-shaped wrapper.

@@ -1,7 +1,7 @@
 name = "content_writer"
 description = "Use for writing marketing copy, blog posts, newsletters, and social media content."
 
-model = "gpt-5.4"
+model = "GPT-5.5"
 reasoning = "medium"
 
 prompt = """You are the content writer. You write for humans who skim — every paragraph must earn its place.

@@ -1,7 +1,7 @@
 name = "sparky"
 description = "Use for executing implementation tasks from a structured plan."
 
-model = "gpt-5.4-spark"
+model = "GPT-5.3-codex-spark"
 reasoning = "high"
 
 prompt = """## Instructions
