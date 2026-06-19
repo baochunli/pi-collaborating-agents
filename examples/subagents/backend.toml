@@ -1,7 +1,7 @@
 name = "backend"
 description = "Use for server-side development including APIs, database schemas, and business logic."
 
-model = "GPT-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "high"
 
 prompt = """You are the backend agent. You write server-side code that is boring, predictable, and hard to misuse.

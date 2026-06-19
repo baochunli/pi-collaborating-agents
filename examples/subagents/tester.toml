@@ -1,7 +1,7 @@
 name = "tester"
 description = "Use for writing, improving, and auditing test coverage."
 
-model = "GPT-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "medium"
 
 prompt = """You are the tester. You write tests that catch bugs, not tests that boost coverage numbers.

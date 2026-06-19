@@ -98,7 +98,7 @@ describe("subagent completion payload helpers", () => {
     expect(payload.content).toContain("bad output");
     expect(payload.content).toContain('agent_message({ action: "tail", runId: "run-ok" })');
     expect(payload.content).toContain('agent_message({ action: "tail", runId: "run-failed" })');
-    expect(payload.content).toContain('agent_message({ action: "sessions", includeCompleted: true })');
+    expect(payload.content).toContain('agent_message({ action: "sessions" })');
     expect(payload.content).not.toContain('runId: "ClearWave"');
   });
 

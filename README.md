@@ -117,7 +117,7 @@ Actions:
 
 - `status` – current identity, focus mode, peer count, and your reservation count
 - `list` – list active agents (includes reservation counts when present)
-- `sessions` – list scoped subagent run/session records; active runs by default, completed/failed when `includeCompleted: true`
+- `sessions` – list scoped subagent run/session records; completed/failed are included by default, set `includeCompleted: false` for active runs only
 - `session` – resolve one subagent run/session record
 - `tail` – read a concise transcript tail for one resolved subagent run/session
 - `send` – send direct message (`to` + `message`, optional `replyTo`, optional `urgent`)
@@ -134,7 +134,7 @@ Examples:
 ```ts
 agent_message({ action: "list" })
 agent_message({ action: "sessions" })
-agent_message({ action: "sessions", includeCompleted: true })
+agent_message({ action: "sessions", includeCompleted: false })
 agent_message({ action: "session", runId: "subagent-run-id" })
 agent_message({ action: "tail", runId: "subagent-run-id" })
 agent_message({ action: "tail", to: "latest" })
@@ -156,7 +156,7 @@ Common calls:
 
 ```ts
 agent_message({ action: "sessions" })
-agent_message({ action: "sessions", includeCompleted: true })
+agent_message({ action: "sessions", includeCompleted: false })
 agent_message({ action: "session", runId: "subagent-run-id" })
 agent_message({ action: "tail", runId: "subagent-run-id" })
 agent_message({ action: "tail", to: "latest" })
@@ -171,7 +171,7 @@ Selectors accepted by `session` and `tail`:
 - session id prefix: matches the reported Pi session id prefix
 - `latest`: newest subagent run for the current coordinator
 
-`sessions` lists active/running records by default. Pass `includeCompleted: true` to include completed and failed runs. `session` returns run metadata, session id, session file status, launch mode, cwd, and task preview. `tail` reads and formats the resolved session JSONL tail; it rejects raw file paths so agents do not bypass selector scoping.
+`sessions` lists active, completed, and failed records for the current coordinator by default. Pass `includeCompleted: false` to show only launching/running runs. `session` returns run metadata, session id, session file status, launch mode, cwd, and task preview. `tail` reads and formats the resolved session JSONL tail; it rejects raw file paths so agents do not bypass selector scoping.
 
 Process-mode subagents are launched as background `pi` child processes without a deterministic `--session` file. The extension records the session id from child output and attaches a session file only after child self-registration or fallback discovery by session id. Until then, tailing can report: `Process-mode session file unavailable until child registration or fallback discovery provides one.` In `cmux-pane` mode, the extension creates an explicit session file under `~/.pi/agent/sessions/collaborating-agents-subagents/` and tails that file after it appears.
 
@@ -222,7 +222,7 @@ subagent({
 })
 ```
 
-Launch responses and background launch notices include a Batch ID plus one child Run ID per spawned subagent. Prefer those Run IDs for `agent_message({ action: "session", runId: "..." })` and `agent_message({ action: "tail", runId: "..." })`; use `agent_message({ action: "sessions" })` to rediscover current active runs and `includeCompleted: true` for recent completed runs.
+Launch responses and background launch notices include a Batch ID plus one child Run ID per spawned subagent. Prefer those Run IDs for `agent_message({ action: "session", runId: "..." })` and `agent_message({ action: "tail", runId: "..." })`; use `agent_message({ action: "sessions" })` to rediscover active and recent completed runs, or `includeCompleted: false` for active runs only.
 
 ## Subagent Type Configuration
 

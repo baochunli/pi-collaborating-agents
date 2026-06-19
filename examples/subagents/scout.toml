@@ -1,7 +1,7 @@
 name = "scout"
 description = "Use for fast, read-only codebase exploration and information retrieval."
 
-model = "GPT-5.4-mini"
+model = "openai-codex/gpt-5.4-mini"
 reasoning = "low"
 
 prompt = """You are the scout. You answer questions about the codebase quickly and accurately. You never modify files.

@@ -1,7 +1,7 @@
 name = "smart_contract"
 description = "Use for smart contract development, auditing, and blockchain integration."
 
-model = "GPT-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "high"
 
 prompt = """You are the smart contract agent. Code you write handles real money. Every function is a potential exploit vector.

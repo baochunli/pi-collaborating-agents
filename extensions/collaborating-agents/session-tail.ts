@@ -25,6 +25,12 @@ export type SessionTailEntry =
       stopReason?: string;
     }
   | {
+      kind: "assistant_error";
+      errorText: string;
+      timestamp?: string;
+      stopReason?: string;
+    }
+  | {
       kind: "tool_result";
       toolCallId?: string;
       toolName?: string;
@@ -51,6 +57,7 @@ export interface SessionTailReadResult {
   malformedLineCount: number;
   bytesRead: number;
   truncatedStart: boolean;
+  truncatedLineCount: number;
 }
 
 export interface SessionTailFormatOptions {
@@ -108,6 +115,29 @@ function contentToolCalls(content: unknown): Array<{ id?: string; name?: string;
   });
 }
 
+function assistantErrorText(message: Record<string, unknown>, options: SessionTailParseOptions): string | undefined {
+  const direct = typeof message.errorMessage === "string" ? message.errorMessage.trim() : "";
+  const diagnostic = Array.isArray(message.diagnostics)
+    ? message.diagnostics
+        .map((diagnostic) => {
+          if (!diagnostic || typeof diagnostic !== "object") return "";
+          const record = diagnostic as Record<string, unknown>;
+          const error = record.error;
+          if (error && typeof error === "object") {
+            const nested = error as Record<string, unknown>;
+            if (typeof nested.message === "string" && nested.message.trim()) return nested.message.trim();
+          }
+          if (typeof record.message === "string" && record.message.trim()) return record.message.trim();
+          return "";
+        })
+        .find((message) => message.length > 0) ?? ""
+    : "";
+  const text = direct || diagnostic;
+  if (!text) return undefined;
+  const formatted = text.startsWith("Error:") ? text : `Error: ${text}`;
+  return truncateText(formatted, options.textLimit);
+}
+
 function parseMessageEvent(event: Record<string, unknown>, options: SessionTailParseOptions): SessionTailEntry[] {
   const message = event.message && typeof event.message === "object"
     ? event.message as Record<string, unknown>
@@ -142,6 +172,15 @@ function parseMessageEvent(event: Record<string, unknown>, options: SessionTailP
         ...(toolCall.id ? { toolCallId: toolCall.id } : {}),
         ...(toolCall.name ? { toolName: toolCall.name } : {}),
         ...(toolCall.argumentsText ? { argumentsText: truncateText(toolCall.argumentsText, options.textLimit) } : {}),
+        ...(stopReason ? { stopReason } : {}),
+      }, timestamp));
+    }
+
+    const errorText = assistantErrorText(message, options);
+    if (errorText) {
+      entries.push(withTimestamp({
+        kind: "assistant_error",
+        errorText,
         ...(stopReason ? { stopReason } : {}),
       }, timestamp));
     }
@@ -225,11 +264,12 @@ export function readSessionTail(filePath: string, options: SessionTailReadOption
     content = firstNewline >= 0 ? content.slice(firstNewline + 1) : "";
   }
 
-  const lines = content
+  const availableLines = content
     .replace(/\r\n/g, "\n")
     .split("\n")
-    .filter((line) => line.trim().length > 0)
-    .slice(-maxLines);
+    .filter((line) => line.trim().length > 0);
+  const truncatedLineCount = Math.max(0, availableLines.length - maxLines);
+  const lines = truncatedLineCount > 0 ? availableLines.slice(-maxLines) : availableLines;
 
   const entries: SessionTailEntry[] = [];
   let malformedLineCount = 0;
@@ -239,7 +279,7 @@ export function readSessionTail(filePath: string, options: SessionTailReadOption
     entries.push(...parsed.entries);
   }
 
-  return { entries, malformedLineCount, bytesRead: length, truncatedStart };
+  return { entries, malformedLineCount, bytesRead: length, truncatedStart, truncatedLineCount };
 }
 
 function entryPrefix(timestamp: string | undefined): string {
@@ -280,6 +320,9 @@ export function formatSessionTail(entries: SessionTailEntry[], options: SessionT
       const id = entry.toolCallId ? ` ${entry.toolCallId}` : "";
       const args = entry.argumentsText ? `: ${entry.argumentsText}` : "";
       return `${prefix}assistant tool call ${name}${id}${args}`;
+    }
+    if (entry.kind === "assistant_error") {
+      return `${prefix}assistant error: ${entry.errorText}`;
     }
     if (entry.kind === "tool_result") {
       const name = entry.toolName ?? "tool";

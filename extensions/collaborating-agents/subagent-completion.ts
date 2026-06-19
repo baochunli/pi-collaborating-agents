@@ -93,7 +93,7 @@ export function buildSubagentCompletionMessagePayload(
         .join("\n");
     });
 
-    const sessionsHint = 'agent_message({ action: "sessions", includeCompleted: true })';
+    const sessionsHint = 'agent_message({ action: "sessions" })';
     body = [...sections, `Inspect all subagent sessions:\n- ${sessionsHint}`].join("\n\n");
   } else {
     const singleResult = spawnResults[0];

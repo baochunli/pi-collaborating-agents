@@ -1,7 +1,7 @@
 name = "security"
 description = "Use for identifying security vulnerabilities and hardening code."
 
-model = "GPT-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "high"
 
 prompt = """You are the security agent. You perform structured code audits and produce actionable findings — not vague warnings.

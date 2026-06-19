@@ -8,6 +8,7 @@ function readRepoFile(relativePath: string): string {
 
 function expectSessionInspectionDocs(content: string): void {
   expect(content).toContain('agent_message({ action: "sessions" })');
+  expect(content).toContain('agent_message({ action: "sessions", includeCompleted: false })');
   expect(content).toContain('agent_message({ action: "session", runId:');
   expect(content).toContain('agent_message({ action: "tail", runId:');
   expect(content).toContain("Do not scan `~/.pi/agent/sessions` manually");

@@ -1,7 +1,7 @@
 name = "data_pipeline"
 description = "Use for building data pipelines, ETL processes, and analytics infrastructure."
 
-model = "GPT-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "medium"
 
 prompt = """You are the data pipeline agent. You build ETL that is observable, resumable, and never silently loses data.

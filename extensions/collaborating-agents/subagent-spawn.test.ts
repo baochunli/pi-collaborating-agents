@@ -19,10 +19,16 @@ const ORIGINAL_TEST_CMUX_SEND_ASYNC = process.env.TEST_CMUX_SEND_ASYNC;
 const ORIGINAL_TEST_CMUX_SEND_TRUNCATE_AT = process.env.TEST_CMUX_SEND_TRUNCATE_AT;
 const ORIGINAL_TEST_PI_EXIT_DELAY_MS = process.env.TEST_PI_EXIT_DELAY_MS;
 const ORIGINAL_TEST_PI_SESSION_CREATE_DELAY_MS = process.env.TEST_PI_SESSION_CREATE_DELAY_MS;
+const ORIGINAL_TEST_PI_PROCESS_MESSAGE_EVENT = process.env.TEST_PI_PROCESS_MESSAGE_EVENT;
+const ORIGINAL_TEST_PI_SESSION_MESSAGE_END_EVENT = process.env.TEST_PI_SESSION_MESSAGE_END_EVENT;
+const ORIGINAL_TEST_PI_PROCESS_STDERR = process.env.TEST_PI_PROCESS_STDERR;
+const ORIGINAL_TEST_PI_PROCESS_EXIT_CODE = process.env.TEST_PI_PROCESS_EXIT_CODE;
 const ORIGINAL_TEST_CMUX_CLOSE_FAIL = process.env.TEST_CMUX_CLOSE_FAIL;
 const ORIGINAL_TEST_PI_EXIT_CODE = process.env.TEST_PI_EXIT_CODE;
 const ORIGINAL_TEST_PI_MULTI_TURN = process.env.TEST_PI_MULTI_TURN;
 const ORIGINAL_TEST_PI_SAME_MTIME_FINAL_ONLY = process.env.TEST_PI_SAME_MTIME_FINAL_ONLY;
+const ORIGINAL_TEST_PI_ASSISTANT_ERROR = process.env.TEST_PI_ASSISTANT_ERROR;
+const ORIGINAL_TEST_PI_ASSISTANT_ERROR_THEN_FINAL = process.env.TEST_PI_ASSISTANT_ERROR_THEN_FINAL;
 const ORIGINAL_TEST_PI_REGISTER_SELF = process.env.TEST_PI_REGISTER_SELF;
 const ORIGINAL_TEST_PI_REGISTER_SESSION_FILE = process.env.TEST_PI_REGISTER_SESSION_FILE;
 const ORIGINAL_COLLABORATING_AGENTS_DIR = process.env.COLLABORATING_AGENTS_DIR;
@@ -105,14 +111,43 @@ if (process.env.TEST_PI_REGISTER_SELF === "1" && process.env.COLLABORATING_AGENT
 
 if (args.includes("--mode") && args.includes("json")) {
   process.stdout.write(JSON.stringify({ type: "session", id: "fake-session" }) + "\\n");
-  process.stdout.write(JSON.stringify({
-    type: "message_end",
-    message: {
-      role: "assistant",
-      content: [{ type: "text", text: "fake-ok" }],
-    },
-  }) + "\\n");
-  process.exit(0);
+  if (process.env.TEST_PI_ASSISTANT_ERROR === "1" || process.env.TEST_PI_ASSISTANT_ERROR_THEN_FINAL === "1") {
+    process.stdout.write(JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "fetch failed",
+      },
+    }) + "\\n");
+  }
+  if (process.env.TEST_PI_ASSISTANT_ERROR_THEN_FINAL === "1") {
+    process.stdout.write(JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "fake-final-after-error" }],
+        stopReason: "stop",
+      },
+    }) + "\\n");
+  } else if (process.env.TEST_PI_ASSISTANT_ERROR !== "1") {
+    const processMessageType = process.env.TEST_PI_PROCESS_MESSAGE_EVENT === "1" ? "message" : "message_end";
+    process.stdout.write(JSON.stringify({
+      type: processMessageType,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "fake-ok" }],
+        ...(processMessageType === "message" ? { stopReason: "stop" } : {}),
+      },
+    }) + "\\n");
+  }
+  const processStderr = process.env.TEST_PI_PROCESS_STDERR;
+  if (processStderr) {
+    process.stderr.write(processStderr);
+  }
+  const processExitCode = Number(process.env.TEST_PI_PROCESS_EXIT_CODE || "0");
+  process.exit(processExitCode);
 }
 
 if (sessionPath) {
@@ -139,6 +174,37 @@ if (sessionPath) {
           },
         }, true);
       }, 120);
+    } else if (process.env.TEST_PI_ASSISTANT_ERROR_THEN_FINAL === "1") {
+      appendSessionLine({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "fetch failed",
+        },
+      });
+
+      setTimeout(() => {
+        appendSessionLine({
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "fake-final-after-error" }],
+            stopReason: "stop",
+          },
+        });
+      }, 1500);
+    } else if (process.env.TEST_PI_ASSISTANT_ERROR === "1") {
+      appendSessionLine({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "fetch failed",
+        },
+      });
     } else if (process.env.TEST_PI_MULTI_TURN === "1") {
       setTimeout(() => {
         appendSessionLine({
@@ -185,12 +251,13 @@ if (sessionPath) {
         });
       }, 620);
     } else {
+      const sessionMessageType = process.env.TEST_PI_SESSION_MESSAGE_END_EVENT === "1" ? "message_end" : "message";
       appendSessionLine({
-        type: "message",
+        type: sessionMessageType,
         message: {
           role: "assistant",
           content: [{ type: "text", text: "fake-ok" }],
-          stopReason: "stop",
+          ...(sessionMessageType === "message" ? { stopReason: "stop" } : {}),
         },
       });
     }
@@ -555,6 +622,30 @@ afterEach(() => {
     delete process.env.TEST_PI_SESSION_CREATE_DELAY_MS;
   }
 
+  if (typeof ORIGINAL_TEST_PI_PROCESS_MESSAGE_EVENT === "string") {
+    process.env.TEST_PI_PROCESS_MESSAGE_EVENT = ORIGINAL_TEST_PI_PROCESS_MESSAGE_EVENT;
+  } else {
+    delete process.env.TEST_PI_PROCESS_MESSAGE_EVENT;
+  }
+
+  if (typeof ORIGINAL_TEST_PI_SESSION_MESSAGE_END_EVENT === "string") {
+    process.env.TEST_PI_SESSION_MESSAGE_END_EVENT = ORIGINAL_TEST_PI_SESSION_MESSAGE_END_EVENT;
+  } else {
+    delete process.env.TEST_PI_SESSION_MESSAGE_END_EVENT;
+  }
+
+  if (typeof ORIGINAL_TEST_PI_PROCESS_STDERR === "string") {
+    process.env.TEST_PI_PROCESS_STDERR = ORIGINAL_TEST_PI_PROCESS_STDERR;
+  } else {
+    delete process.env.TEST_PI_PROCESS_STDERR;
+  }
+
+  if (typeof ORIGINAL_TEST_PI_PROCESS_EXIT_CODE === "string") {
+    process.env.TEST_PI_PROCESS_EXIT_CODE = ORIGINAL_TEST_PI_PROCESS_EXIT_CODE;
+  } else {
+    delete process.env.TEST_PI_PROCESS_EXIT_CODE;
+  }
+
   if (typeof ORIGINAL_TEST_CMUX_CLOSE_FAIL === "string") {
     process.env.TEST_CMUX_CLOSE_FAIL = ORIGINAL_TEST_CMUX_CLOSE_FAIL;
   } else {
@@ -577,6 +668,18 @@ afterEach(() => {
     process.env.TEST_PI_SAME_MTIME_FINAL_ONLY = ORIGINAL_TEST_PI_SAME_MTIME_FINAL_ONLY;
   } else {
     delete process.env.TEST_PI_SAME_MTIME_FINAL_ONLY;
+  }
+
+  if (typeof ORIGINAL_TEST_PI_ASSISTANT_ERROR === "string") {
+    process.env.TEST_PI_ASSISTANT_ERROR = ORIGINAL_TEST_PI_ASSISTANT_ERROR;
+  } else {
+    delete process.env.TEST_PI_ASSISTANT_ERROR;
+  }
+
+  if (typeof ORIGINAL_TEST_PI_ASSISTANT_ERROR_THEN_FINAL === "string") {
+    process.env.TEST_PI_ASSISTANT_ERROR_THEN_FINAL = ORIGINAL_TEST_PI_ASSISTANT_ERROR_THEN_FINAL;
+  } else {
+    delete process.env.TEST_PI_ASSISTANT_ERROR_THEN_FINAL;
   }
 
   if (typeof ORIGINAL_TEST_PI_REGISTER_SELF === "string") {
@@ -718,6 +821,157 @@ describe("subagent spawn", () => {
         sessionId: "fake-session",
       },
     ]);
+  });
+
+  test("accepts process-mode assistant output emitted as message events", async () => {
+    const tempDir = makeTempDir("collab-subagent-process-assistant-message");
+    const { argsFile } = writeFakePiBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_PI_PROCESS_MESSAGE_EVENT = "1";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "scout",
+      description: "Scout",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/scout.toml",
+      tools: ["read"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "scout",
+        task: "Find all TypeScript files",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-process-message",
+        recursionDepth: 0,
+        enableSessionControl: false,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.error).toBeUndefined();
+    expect(result.sessionId).toBe("fake-session");
+  });
+
+  test("treats process-mode assistant errors as failed even when pi exits cleanly", async () => {
+    const tempDir = makeTempDir("collab-subagent-process-assistant-error");
+    writeFakePiBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_PI_ASSISTANT_ERROR = "1";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "scout",
+      description: "Scout",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/scout.toml",
+      tools: ["read"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "scout",
+        task: "Find all TypeScript files",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-process-assistant-error",
+        recursionDepth: 0,
+        enableSessionControl: false,
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.output).toBe("Error: fetch failed");
+    expect(result.error).toBe("Error: fetch failed");
+    expect(result.sessionId).toBe("fake-session");
+  });
+
+  test("keeps process-mode assistant errors preferred over stderr on non-zero exit", async () => {
+    const tempDir = makeTempDir("collab-subagent-process-assistant-error-stderr");
+    writeFakePiBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_PI_ASSISTANT_ERROR = "1";
+    process.env.TEST_PI_PROCESS_STDERR = "subagent crashed";
+    process.env.TEST_PI_PROCESS_EXIT_CODE = "2";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "scout",
+      description: "Scout",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/scout.toml",
+      tools: ["read"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "scout",
+        task: "Find all TypeScript files",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-process-assistant-error-stderr",
+        recursionDepth: 0,
+        enableSessionControl: false,
+      },
+    );
+
+    expect(result.exitCode).toBe(2);
+    expect(result.output).toBe("Error: fetch failed");
+    expect(result.error).toBe("Error: fetch failed");
+    expect(result.sessionId).toBe("fake-session");
+  });
+
+  test("uses the latest process-mode assistant message after a transient assistant error", async () => {
+    const tempDir = makeTempDir("collab-subagent-process-transient-assistant-error");
+    writeFakePiBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_PI_ASSISTANT_ERROR_THEN_FINAL = "1";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "scout",
+      description: "Scout",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/scout.toml",
+      tools: ["read"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "scout",
+        task: "Find all TypeScript files",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun-process-transient-assistant-error",
+        recursionDepth: 0,
+        enableSessionControl: false,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-final-after-error");
+    expect(result.error).toBeUndefined();
+    expect(result.sessionId).toBe("fake-session");
   });
 
   test("swallows process-mode session metadata callback failures", async () => {
@@ -969,6 +1223,137 @@ describe("subagent spawn", () => {
     const closeArgs = capturedCmuxArgs[10]!;
     expect(closeArgs).toEqual(["close-surface", "--surface", "surface:99"]);
   });
+
+  test("accepts cmux-pane assistant output emitted as message_end events", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-assistant-message-end");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+    process.env.TEST_CMUX_SEND_ASYNC = "1";
+    process.env.TEST_PI_EXIT_DELAY_MS = "1800";
+    process.env.TEST_PI_SESSION_MESSAGE_END_EVENT = "1";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun4-message-end",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-ok");
+    expect(result.error).toBeUndefined();
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.cmuxPaneClosed).toBe(true);
+  }, 10000);
+
+  test("treats cmux-pane assistant errors as failed even when pi exits cleanly", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-assistant-error");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+    process.env.TEST_PI_ASSISTANT_ERROR = "1";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun4-error",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.output).toBe("Error: fetch failed");
+    expect(result.error).toBe("Error: fetch failed");
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.cmuxPaneClosed).toBeUndefined();
+
+    const capturedCmuxArgs = getCapturedCmuxArgs(cmuxArgsFile);
+    expect(getCmuxCommandNames(capturedCmuxArgs)).not.toContain("close-surface");
+  });
+
+  test("does not fail a still-running cmux-pane subagent on a transient assistant error", async () => {
+    const tempDir = makeTempDir("collab-subagent-cmux-pane-transient-assistant-error");
+    const { argsFile } = writeFakePiBinary(tempDir);
+    const { argsFile: cmuxArgsFile } = writeFakeCmuxBinary(tempDir);
+
+    process.env.PATH = `${tempDir}:${process.env.PATH ?? ""}`;
+    process.env.TEST_ARGS_FILE = argsFile;
+    process.env.TEST_CMUX_ARGS_FILE = cmuxArgsFile;
+    process.env.TEST_CMUX_SEND_ASYNC = "1";
+    process.env.TEST_PI_ASSISTANT_ERROR_THEN_FINAL = "1";
+    process.env.TEST_PI_EXIT_DELAY_MS = "1800";
+
+    const agentDef: SpawnAgentDefinition = {
+      name: "worker",
+      description: "Worker",
+      systemPrompt: "Return concise findings.",
+      source: "bundled",
+      filePath: "/tmp/worker.toml",
+      tools: ["read", "bash"],
+    };
+
+    const result = await runSpawnTask(
+      tempDir,
+      {
+        agent: "worker",
+        task: "Inspect the repository",
+      },
+      agentDef,
+      {
+        index: 0,
+        runId: "testrun4-transient-error",
+        recursionDepth: 0,
+        launchMode: "cmux-pane",
+        cmuxResultTimeoutMs: 5000,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("fake-final-after-error");
+    expect(result.error).toBeUndefined();
+    expect(result.sessionId).toBe("fake-session");
+    expect(result.cmuxPaneClosed).toBe(true);
+  }, 10000);
 
   test("does not fail a cmux-pane subagent whose session file appears after the startup grace", async () => {
     const tempDir = makeTempDir("collab-subagent-cmux-pane-delayed-session");

@@ -23,7 +23,7 @@ Actions:
 
 - `status` — self identity, focus, peer count, reservations
 - `list` — active agents
-- `sessions` — scoped subagent run/session records; active by default, completed/failed with `includeCompleted: true`
+- `sessions` — scoped subagent run/session records; completed/failed included by default, use `includeCompleted: false` for active only
 - `session` — resolve one subagent run/session record
 - `tail` — read a concise transcript tail for one subagent run/session
 - `send` — direct message to one peer (`to`, `message`, optional `replyTo`, optional `urgent`)
@@ -44,7 +44,7 @@ Common calls:
 agent_message({ action: "status" })
 agent_message({ action: "list" })
 agent_message({ action: "sessions" })
-agent_message({ action: "sessions", includeCompleted: true })
+agent_message({ action: "sessions", includeCompleted: false })
 agent_message({ action: "session", runId: "subagent-run-id" })
 agent_message({ action: "tail", runId: "subagent-run-id" })
 agent_message({ action: "tail", to: "latest" })
@@ -67,7 +67,7 @@ Coordinators should inspect spawned subagents through the run registry:
 
 ```ts
 agent_message({ action: "sessions" })
-agent_message({ action: "sessions", includeCompleted: true })
+agent_message({ action: "sessions", includeCompleted: false })
 agent_message({ action: "session", runId: "subagent-run-id" })
 agent_message({ action: "tail", runId: "subagent-run-id" })
 agent_message({ action: "tail", to: "latest" })
@@ -84,7 +84,7 @@ Supported selectors for `session` and `tail`:
 - session id prefix: prefix of the Pi session id
 - `latest`: newest subagent run for the current coordinator
 
-`sessions` lists active/running records by default. Use `includeCompleted: true` to include completed and failed child runs. `tail` accepts selectors only, not raw file paths.
+`sessions` lists active, completed, and failed records for the current coordinator by default. Use `includeCompleted: false` to show only launching/running child runs. `tail` accepts selectors only, not raw file paths.
 
 Process mode launches a background `pi` child without a deterministic `--session` file. The extension records the session id from child output and attaches a session file after child self-registration or fallback discovery by session id. Until that happens, tailing may report: `Process-mode session file unavailable until child registration or fallback discovery provides one.` In `cmux-pane` mode, the extension creates an explicit session file under `~/.pi/agent/sessions/collaborating-agents-subagents/`.
 

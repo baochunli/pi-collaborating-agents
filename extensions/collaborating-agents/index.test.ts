@@ -14,7 +14,7 @@ import collaboratingAgentsExtension, {
   handleAgentMessageTail,
 } from "./index.ts";
 import { listSubagentRunRecords, registerSelf, updateSubagentRunRecord, writeSubagentRunRecord } from "./store.ts";
-import type { Dirs, SubagentRunListRecord, SubagentRunRecord } from "./types.ts";
+import type { AgentRegistration, Dirs, SubagentRunListRecord, SubagentRunRecord } from "./types.ts";
 
 const tempDirs: string[] = [];
 const ORIGINAL_COLLAB_DIR = process.env.COLLABORATING_AGENTS_DIR;
@@ -386,7 +386,27 @@ describe("agent_message subagent sessions", () => {
       lastSeenAt: "2026-01-05T00:00:00.000Z",
     }))).toBe(true);
 
-    const activeOnly = handleAgentMessageSessions(dirs, { limit: 10 }, {
+    const defaultSessions = handleAgentMessageSessions(dirs, { limit: 2 }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:05.000Z",
+      staleAfterMs: 1000,
+    });
+    expect(defaultSessions.content[0]?.text).toContain("batch batch-stale");
+    expect(defaultSessions.details).toMatchObject({
+      action: "sessions",
+      includeCompleted: true,
+      total: 3,
+      displayed: 2,
+      truncated: true,
+    });
+    expect((defaultSessions.details as { records: SubagentRunListRecord[] }).records.map((record) => record.recordId)).toEqual([
+      "run-stale",
+      "run-done",
+    ]);
+
+    const activeOnly = handleAgentMessageSessions(dirs, { limit: 10, includeCompleted: false }, {
       parentAgent: "Coordinator",
       parentSessionId: "parent-session",
       parentPid: 123,
@@ -470,6 +490,7 @@ describe("agent_message subagent sessions", () => {
       },
       sessionFileResolved: true,
     });
+    expect(byRunId.content[0]?.text).toContain("Run ID: run-target");
     expect(byRunId.content[0]?.text).toContain(fallbackSessionFile);
     expect(listRecords(stateDir).find((record) => record.recordId === "run-target")?.sessionFile).toBe(fallbackSessionFile);
 
@@ -486,6 +507,104 @@ describe("agent_message subagent sessions", () => {
         recordId: "run-selector",
       },
     });
+  });
+
+  test("session resolves missing session file from active registration metadata", () => {
+    const tempDir = makeTempDir("collab-index-session-active-registration");
+    const stateDir = path.join(tempDir, "state");
+    const dirs = makeDirs(stateDir);
+    const sessionFile = path.join(tempDir, "active-registration-session.jsonl");
+    writeSessionJsonl(sessionFile, [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "active registration done" }] } },
+    ]);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "active-run",
+      batchRunId: "batch-active",
+      name: "worker-active",
+      displayName: "Worker Active",
+      sessionId: "active-session",
+      sessionFileUnavailableReason: "waiting for active registration",
+      lastSeenAt: "2026-01-04T00:00:00.000Z",
+    }))).toBe(true);
+    expect(registerSelf(dirs, {
+      name: "worker-active",
+      pid: process.pid,
+      sessionId: "active-session",
+      sessionFile,
+      cwd: tempDir,
+      model: "fake/model",
+      startedAt: "2026-01-04T00:00:00.000Z",
+      lastSeenAt: "2026-01-04T00:00:00.000Z",
+      role: "subagent",
+    })).toBe(true);
+
+    const result = handleAgentMessageSession(dirs, { runId: "active-run" }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:00.000Z",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]?.text).toContain(sessionFile);
+    expect(result.details).toMatchObject({
+      action: "session",
+      requestedSelector: "active-run",
+      sessionFileResolved: true,
+      record: { recordId: "active-run", sessionFile },
+    });
+    expect(listRecords(stateDir).find((record) => record.recordId === "active-run")?.sessionFile).toBe(sessionFile);
+  });
+
+  test("session resolves missing session file from completed registration metadata", () => {
+    const tempDir = makeTempDir("collab-index-session-completed-registration");
+    const stateDir = path.join(tempDir, "state");
+    const dirs = makeDirs(stateDir);
+    const sessionFile = path.join(tempDir, "completed-registration-session.jsonl");
+    writeSessionJsonl(sessionFile, [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "completed registration done" }] } },
+    ]);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "completed-run",
+      batchRunId: "batch-completed",
+      name: "worker-completed",
+      displayName: "Worker Completed",
+      sessionId: "completed-session",
+      sessionFileUnavailableReason: "waiting for completed registration",
+      lastSeenAt: "2026-01-04T00:00:00.000Z",
+    }))).toBe(true);
+
+    const completedRegistration: AgentRegistration = {
+      name: "worker-completed",
+      pid: 0,
+      sessionId: "completed-session",
+      sessionFile,
+      cwd: tempDir,
+      model: "fake/model",
+      startedAt: "2026-01-03T00:00:00.000Z",
+      lastSeenAt: "2026-01-04T00:00:00.000Z",
+      role: "subagent",
+    };
+
+    const result = handleAgentMessageSession(dirs, { runId: "completed-run" }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-04T00:00:00.000Z",
+      completedSubagents: [completedRegistration],
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]?.text).toContain(sessionFile);
+    expect(result.details).toMatchObject({
+      action: "session",
+      requestedSelector: "completed-run",
+      sessionFileResolved: true,
+      record: { recordId: "completed-run", sessionFile },
+    });
+    expect(listRecords(stateDir).find((record) => record.recordId === "completed-run")?.sessionFile).toBe(sessionFile);
   });
 
   test("session runId resolution prefers record id over colliding names", () => {
@@ -708,6 +827,58 @@ describe("agent_message subagent sessions", () => {
         { kind: "stop", stopReason: "toolUse" },
         { kind: "assistant_text", text: "done" },
       ],
+    });
+  });
+
+  test("tail reports line truncation in formatted output and details", () => {
+    const tempDir = makeTempDir("collab-index-tail-line-truncation");
+    const stateDir = path.join(tempDir, "state");
+    const dirs = makeDirs(stateDir);
+    const sessionFile = path.join(tempDir, "truncated-session.jsonl");
+    writeSessionJsonl(sessionFile, [
+      { type: "session", id: "trunc-session", timestamp: "2026-01-05T00:00:00.000Z" },
+      {
+        type: "message_end",
+        timestamp: "2026-01-05T00:00:01.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "middle" }] },
+      },
+      {
+        type: "message_end",
+        timestamp: "2026-01-05T00:00:02.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "latest" }] },
+      },
+    ]);
+
+    expect(writeSubagentRunRecord(dirs, makeRunRecord({
+      recordId: "trunc-run",
+      batchRunId: "trunc-batch",
+      name: "worker-trunc",
+      displayName: "Worker Trunc",
+      status: "completed",
+      sessionId: "trunc-session",
+      sessionFile,
+      completedAt: "2026-01-05T00:00:03.000Z",
+      lastSeenAt: "2026-01-05T00:00:03.000Z",
+    }))).toBe(true);
+
+    const result = handleAgentMessageTail(dirs, { runId: "trunc-run", limit: 1 }, {
+      parentAgent: "Coordinator",
+      parentSessionId: "parent-session",
+      parentPid: 123,
+      now: "2026-01-05T00:00:04.000Z",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]?.text).toContain("Tail limit omitted 2 earlier lines.");
+    expect(result.content[0]?.text).toContain("assistant final: latest");
+    expect(result.details).toMatchObject({
+      action: "tail",
+      limit: 1,
+      truncatedStart: false,
+      truncatedLineCount: 2,
+      record: { recordId: "trunc-run" },
+      sessionFile,
+      entries: [{ kind: "assistant_text", text: "latest" }],
     });
   });
 

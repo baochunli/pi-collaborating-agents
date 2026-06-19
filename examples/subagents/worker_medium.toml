@@ -1,7 +1,7 @@
 name = "worker_medium"
-description = "Generic worker agent. GPT-5.5 with medium reasoning effort."
+description = "Generic worker agent. openai-codex/gpt-5.5 with medium reasoning effort."
 
-model = "GPT-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "medium"
 
 prompt = """You are a general worker subagent working under a parent agent.

@@ -85,6 +85,57 @@ describe("session tail parsing", () => {
     ).toEqual([{ kind: "assistant_text", text: "final answer", stopReason: "message_end" }]);
   });
 
+  test("parses assistant error messages so failed tails show the underlying cause", () => {
+    const parsed = parseSessionJsonlLine(
+      JSON.stringify({
+        type: "message",
+        timestamp: "2026-01-01T00:00:02.000Z",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "fetch failed",
+        },
+      }),
+    );
+
+    expect(parsed.entries).toEqual([
+      {
+        kind: "assistant_error",
+        errorText: "Error: fetch failed",
+        timestamp: "2026-01-01T00:00:02.000Z",
+        stopReason: "error",
+      },
+      { kind: "stop", stopReason: "error", timestamp: "2026-01-01T00:00:02.000Z" },
+    ]);
+    expect(formatSessionTail(parsed.entries, { runStatus: "failed" })).toBe(
+      [
+        "[2026-01-01T00:00:02.000Z] assistant error: Error: fetch failed",
+        "[2026-01-01T00:00:02.000Z] stop: error",
+      ].join("\n"),
+    );
+  });
+
+  test("tracks line truncation when maxLines drops earlier entries", () => {
+    const file = tempFile("session-truncated-lines.jsonl");
+    const lines = [
+      JSON.stringify({ type: "session", id: "session-2" }),
+      JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "middle" }] } }),
+      JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "latest" }] } }),
+    ];
+    fs.writeFileSync(file, `${lines.join("\n")}\n`, "utf-8");
+
+    const tail = readSessionTail(file, { maxLines: 2 });
+
+    expect(tail.truncatedStart).toBe(false);
+    expect(tail.truncatedLineCount).toBe(1);
+    expect(tail.malformedLineCount).toBe(0);
+    expect(tail.entries).toEqual([
+      { kind: "assistant_text", text: "middle", stopReason: "message_end" },
+      { kind: "assistant_text", text: "latest", stopReason: "message_end" },
+    ]);
+  });
+
   test("returns malformed for invalid json lines", () => {
     expect(parseSessionJsonlLine("{not-json")).toEqual({ entries: [], malformed: true });
   });

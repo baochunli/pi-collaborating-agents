@@ -128,7 +128,7 @@ const AgentMessageParams = Type.Object({
     }),
   ),
   limit: Type.Optional(Type.Number({ description: "Max messages, subagent runs, or tail entries to return; default 20" })),
-  includeCompleted: Type.Optional(Type.Boolean({ description: "For sessions, include completed/failed subagent runs; default lists active runs only" })),
+  includeCompleted: Type.Optional(Type.Boolean({ description: "For sessions, include completed/failed subagent runs; defaults to true. Set false for active runs only" })),
   raw: Type.Optional(Type.Boolean({ description: "For tail, include structured parsed session entries in details" })),
   paths: Type.Optional(Type.Array(Type.String(), { description: "Reservation path patterns (reserve/release)" })),
   reason: Type.Optional(Type.String({ description: "Optional reservation reason (reserve)" })),
@@ -252,6 +252,7 @@ export function formatSubagentRunList(args: {
     return [
       `- ${record.recordId}: ${formatRunName(record)}`,
       `${record.status}${stale}`,
+      `batch ${record.batchRunId}`,
       `type ${record.type}`,
       `session ${formatSessionId(record.sessionId)}`,
       sessionFile,
@@ -270,6 +271,7 @@ export function formatSubagentRunDetail(record: SubagentRunListRecord): string {
   const stale = record.isStale ? " [stale]" : "";
   const lines = [
     `Subagent session ${record.recordId}`,
+    `Run ID: ${record.recordId}`,
     `Name: ${formatRunName(record)}`,
     `Status: ${record.status}${stale}`,
     `Batch ID: ${record.batchRunId}`,
@@ -335,7 +337,7 @@ export function handleAgentMessageSessions(
   context: AgentMessageSubagentRunContext,
 ): AgentMessageToolResponse {
   const limit = normalizeSubagentSessionLimit(params.limit);
-  const includeCompleted = params.includeCompleted === true;
+  const includeCompleted = params.includeCompleted !== false;
   const scoped = scopedSubagentRunRecords(dirs, context);
   const filtered = includeCompleted ? scoped : scoped.filter((record) => isActiveRunStatus(record.status));
   const records = filtered.slice(0, limit);
@@ -361,23 +363,10 @@ function refreshResolvedRunRecord(
   record: SubagentRunListRecord,
   context: AgentMessageSubagentRunContext,
 ): { record: SubagentRunListRecord; sessionFileResolved: boolean } {
-  if (record.sessionFile || !record.sessionId) {
-    return { record, sessionFileResolved: false };
-  }
-
-  const sessionFile = findSessionFileBySessionId(record.sessionId);
-  if (!sessionFile) return { record, sessionFileResolved: false };
-
-  const updated = updateSubagentRunRecordWith(dirs, record.recordId, (existing) => ({
-    sessionFile: existing.sessionFile ?? sessionFile,
-    sessionFileUnavailableReason: null,
-  }));
-  if (!updated) return { record, sessionFileResolved: false };
-
-  const refreshed = resolveSubagentRunRecord(dirs, record.recordId, context);
+  const session = resolveTailSessionFile(dirs, record, context);
   return {
-    record: refreshed.status === "ok" ? refreshed.record : { ...record, sessionFile, sessionFileUnavailableReason: undefined },
-    sessionFileResolved: true,
+    record: session.record,
+    sessionFileResolved: session.resolved,
   };
 }
 
@@ -728,9 +717,14 @@ export function handleAgentMessageTail(
   }
 
   const formatted = formatSessionTail(tail.entries, { runStatus: record.status });
-  const malformed = tail.malformedLineCount > 0 ? `\nMalformed JSONL lines skipped: ${tail.malformedLineCount}` : "";
-  const truncated = tail.truncatedStart ? "\nStart of file was truncated before parsing." : "";
-  const rawNote = params.raw === true ? "\nStructured entries are available in details." : "";
+  const notes = [
+    tail.malformedLineCount > 0 ? `Malformed JSONL lines skipped: ${tail.malformedLineCount}` : undefined,
+    tail.truncatedStart ? "Start of file was truncated before parsing." : undefined,
+    tail.truncatedLineCount > 0
+      ? `Tail limit omitted ${tail.truncatedLineCount} earlier line${tail.truncatedLineCount === 1 ? "" : "s"}.`
+      : undefined,
+    params.raw === true ? "Structured entries are available in details." : undefined,
+  ].filter((line): line is string => typeof line === "string");
   return {
     content: [
       {
@@ -740,7 +734,7 @@ export function handleAgentMessageTail(
           `Session file: ${sessionFile}`,
           "",
           formatted || "(no parsed session events)",
-          `${malformed}${truncated}${rawNote}`,
+          ...notes,
         ].filter((line) => line.length > 0).join("\n"),
       },
     ],
@@ -759,6 +753,7 @@ export function handleAgentMessageTail(
       malformedLineCount: tail.malformedLineCount,
       bytesRead: tail.bytesRead,
       truncatedStart: tail.truncatedStart,
+      truncatedLineCount: tail.truncatedLineCount,
     },
   };
 }
@@ -1739,7 +1734,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
           "Inspect this subagent:",
           `- agent_message({ action: "session", runId: "${recordId}" })`,
           `- agent_message({ action: "tail", runId: "${recordId}" })`,
-          `- agent_message({ action: "sessions", includeCompleted: true })`,
+          `- agent_message({ action: "sessions" })`,
         ].join("\n"),
         display: true,
         details: {
@@ -2226,7 +2221,7 @@ export default function collaboratingAgentsExtension(pi: ExtensionAPI): void {
 Actions:
 - status: Current agent identity/focus/peer count
 - list: List active agents
-- sessions: List scoped subagent run/session records (active by default; pass includeCompleted: true for completed/failed)
+- sessions: List scoped subagent run/session records (completed/failed included by default; pass includeCompleted: false for active only)
 - session: Resolve one subagent run/session record
 - tail: Read a concise transcript tail for one subagent run/session
 - send: Send direct message to one active agent (set urgent: true to interrupt immediately)
@@ -2319,6 +2314,7 @@ Subagent run selectors for session/tail: child run id/recordId, display name, ca
           parentAgent: state.agentName,
           parentSessionId: ctx.sessionManager.getSessionId(),
           parentPid: process.pid,
+          completedSubagents: state.completedSubagents,
         });
       }
 

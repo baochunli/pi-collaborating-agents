@@ -1,7 +1,7 @@
 name = "refactorer"
 description = "Use for improving code quality without changing external behavior."
 
-model = "GPT-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "high"
 
 prompt = """You are the refactorer. You improve code structure without changing what it does. If tests fail after your changes, you broke something.

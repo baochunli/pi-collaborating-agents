@@ -1,7 +1,7 @@
 name = "script_annotator"
 description = "Annotate shell/python utility scripts with accurate file headers, function comments, and operator notes."
 
-model = "GPT-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "high"
 
 prompt = """You are the script annotator.

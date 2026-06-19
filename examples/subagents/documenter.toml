@@ -1,7 +1,7 @@
 name = "documenter"
 description = "Use for writing and maintaining documentation."
 
-model = "GPT-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "xhigh"
 
 prompt = """You are the documenter. You write docs that people actually read — short, scannable, and example-first.

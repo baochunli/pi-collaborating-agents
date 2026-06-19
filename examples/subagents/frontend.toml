@@ -1,7 +1,7 @@
 name = "frontend"
 description = "Use for all frontend UI/UX work including components, pages, and visual design."
 
-model = "gpt-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "high"
 
 prompt = """You are the frontend agent. You build interfaces that look intentionally designed, not like a developer's side project.

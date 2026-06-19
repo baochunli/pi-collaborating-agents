@@ -615,6 +615,27 @@ function extractAssistantText(content: unknown): string {
   return parts.join("\n").trim();
 }
 
+function formatAssistantError(message: Record<string, unknown>): string {
+  const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage.trim() : "";
+  const diagnosticMessage = Array.isArray(message.diagnostics)
+    ? message.diagnostics
+        .map((diagnostic) => {
+          if (!diagnostic || typeof diagnostic !== "object") return "";
+          const record = diagnostic as Record<string, unknown>;
+          const error = record.error;
+          if (error && typeof error === "object") {
+            const nested = error as Record<string, unknown>;
+            if (typeof nested.message === "string" && nested.message.trim()) return nested.message.trim();
+          }
+          if (typeof record.message === "string" && record.message.trim()) return record.message.trim();
+          return "";
+        })
+        .find((message) => message.length > 0) ?? ""
+    : "";
+  const base = errorMessage || diagnosticMessage || "assistant response failed";
+  return base.startsWith("Error:") ? base : `Error: ${base}`;
+}
+
 function quoteShellArg(value: string): string {
   if (/^[a-zA-Z0-9_./:@%+=,-]+$/.test(value)) return value;
 
@@ -715,6 +736,7 @@ function createPiEventProcessor(
   finalize: (stderr: string) => void;
 } {
   let lastAssistant = "";
+  let assistantError = "";
 
   const processLine = (line: string) => {
     if (!line.trim()) return;
@@ -728,25 +750,46 @@ function createPiEventProcessor(
     if (!event || typeof event !== "object") return;
     const e = event as Record<string, unknown>;
 
-    if (e.type === "session" && typeof e.id === "string") {
-      result.sessionId = e.id;
-      result.sessionFile ??= readSelfRegisteredSessionFile(result.name, e.id);
-      if (result.sessionFile) result.sessionFileUnavailableReason = undefined;
-      onSessionMetadata?.({ sessionId: e.id, sessionFile: result.sessionFile });
-      return;
+    if (e.type === "session") {
+      const sessionId = typeof e.id === "string" ? e.id : typeof e.sessionId === "string" ? e.sessionId : undefined;
+      if (sessionId) {
+        result.sessionId = sessionId;
+        result.sessionFile ??= readSelfRegisteredSessionFile(result.name, sessionId);
+        if (result.sessionFile) result.sessionFileUnavailableReason = undefined;
+        onSessionMetadata?.({ sessionId, sessionFile: result.sessionFile });
+        return;
+      }
     }
 
-    if (e.type === "message_end" && typeof e.message === "object" && e.message) {
+    if ((e.type === "message" || e.type === "message_end") && typeof e.message === "object" && e.message) {
       const msg = e.message as Record<string, unknown>;
       if (msg.role === "assistant") {
+        const stopReason =
+          typeof msg.stopReason === "string"
+            ? msg.stopReason
+            : typeof e.stopReason === "string"
+              ? e.stopReason
+              : e.type === "message_end"
+                ? "message_end"
+                : undefined;
+        if (stopReason === "toolUse") return;
+
         const text = extractAssistantText(msg.content);
-        if (text) lastAssistant = text;
+        if (stopReason === "error" || typeof msg.errorMessage === "string") {
+          assistantError = formatAssistantError(msg);
+          lastAssistant = text || assistantError;
+          return;
+        }
+
+        assistantError = "";
+        lastAssistant = text;
       }
     }
   };
 
   const finalize = (stderr: string) => {
-    result.output = lastAssistant || stderr.trim() || "(no output)";
+    if (assistantError) result.error = assistantError;
+    result.output = lastAssistant || assistantError || stderr.trim() || "(no output)";
   };
 
   return { processLine, finalize };
@@ -885,7 +928,9 @@ function didFileChange(current: FileChangeToken | null, previous: FileChangeToke
 
 function parseSessionMessageLine(line: string): {
   sessionId?: string;
+  terminalAssistantMessage?: boolean;
   terminalAssistantText?: string;
+  terminalError?: string;
 } {
   let event: unknown;
   try {
@@ -897,28 +942,47 @@ function parseSessionMessageLine(line: string): {
   if (!event || typeof event !== "object") return {};
   const parsed = event as Record<string, unknown>;
 
-  if (parsed.type === "session" && typeof parsed.id === "string") {
-    return { sessionId: parsed.id };
+  if (parsed.type === "session") {
+    const sessionId = typeof parsed.id === "string" ? parsed.id : typeof parsed.sessionId === "string" ? parsed.sessionId : undefined;
+    if (sessionId) return { sessionId };
   }
 
-  if (parsed.type !== "message" || !parsed.message || typeof parsed.message !== "object") {
+  if ((parsed.type !== "message" && parsed.type !== "message_end") || !parsed.message || typeof parsed.message !== "object") {
     return {};
   }
 
   const message = parsed.message as Record<string, unknown>;
   if (message.role !== "assistant") return {};
 
-  const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
+  const stopReason =
+    typeof message.stopReason === "string"
+      ? message.stopReason
+      : typeof parsed.stopReason === "string"
+        ? parsed.stopReason
+        : parsed.type === "message_end"
+          ? "message_end"
+          : undefined;
   if (stopReason === "toolUse") return {};
 
+  const terminalAssistantText = extractAssistantText(message.content);
+  if (stopReason === "error" || typeof message.errorMessage === "string") {
+    return {
+      terminalAssistantMessage: true,
+      terminalAssistantText,
+      terminalError: formatAssistantError(message),
+    };
+  }
+
   return {
-    terminalAssistantText: extractAssistantText(message.content),
+    terminalAssistantMessage: true,
+    terminalAssistantText,
   };
 }
 
 function readSpawnSessionState(sessionFile: string): {
   sessionId?: string;
   terminalAssistantText?: string;
+  terminalError?: string;
 } {
   if (!fs.existsSync(sessionFile)) return {};
 
@@ -931,24 +995,27 @@ function readSpawnSessionState(sessionFile: string): {
 
   let sessionId: string | undefined;
   let terminalAssistantText: string | undefined;
+  let terminalError: string | undefined;
 
   for (const line of content.split(/\r?\n/)) {
     if (!line.trim()) continue;
     const parsed = parseSessionMessageLine(line);
     if (parsed.sessionId) sessionId = parsed.sessionId;
-    if (parsed.terminalAssistantText !== undefined) {
+    if (parsed.terminalAssistantMessage) {
       terminalAssistantText = parsed.terminalAssistantText;
+      terminalError = parsed.terminalError;
     }
   }
 
-  return { sessionId, terminalAssistantText };
+  return { sessionId, terminalAssistantText, terminalError };
 }
 
 // A cmux-pane subagent session can emit multiple assistant messages before it is
 // truly done (for example, an interrupted partial response followed by more tool
-// work and a later final answer). Wait for the latest assistant output to remain
-// idle for a short grace period instead of returning the first non-toolUse
-// message we see.
+// work and a later final answer). Assistant error messages can also be transient
+// provider failures that the pane recovers from. Wait for the latest successful
+// assistant output to remain idle, or for the process to exit/timeout after an
+// error, instead of returning the first non-toolUse message we see.
 async function waitForSettledSessionResult(args: {
   sessionFile: string;
   exitMarkerPath: string;
@@ -958,6 +1025,7 @@ async function waitForSettledSessionResult(args: {
 }): Promise<{
   sessionId?: string;
   terminalAssistantText?: string;
+  terminalError?: string;
   exitCode: number | null;
   timedOut: boolean;
 }> {
@@ -978,6 +1046,7 @@ async function waitForSettledSessionResult(args: {
   let lastActivityAt = Date.now();
   let sessionId: string | undefined;
   let terminalAssistantText: string | undefined;
+  let terminalError: string | undefined;
 
   while (Date.now() - startedAt < hardTimeoutMs && Date.now() < activityDeadlineAt) {
     const currentToken = readFileChangeToken(args.sessionFile);
@@ -993,8 +1062,9 @@ async function waitForSettledSessionResult(args: {
         sessionId = state.sessionId;
         args.onUpdate?.({ sessionId });
       }
-      if (state.terminalAssistantText !== undefined) {
+      if (state.terminalAssistantText !== undefined || state.terminalError !== undefined) {
         terminalAssistantText = state.terminalAssistantText;
+        terminalError = state.terminalError;
       }
       if (currentToken) {
         lastParsedToken = currentToken;
@@ -1003,8 +1073,8 @@ async function waitForSettledSessionResult(args: {
 
     const exitCode = readExitMarkerCode(args.exitMarkerPath);
     if (exitCode !== null) {
-      if (exitCode !== 0) {
-        return { sessionId, terminalAssistantText, exitCode, timedOut: false };
+      if (exitCode !== 0 || terminalError !== undefined) {
+        return { sessionId, terminalAssistantText, terminalError, exitCode, timedOut: false };
       }
 
       // If the pane process has already exited cleanly, the session file is no
@@ -1017,25 +1087,26 @@ async function waitForSettledSessionResult(args: {
       }
     }
 
-    if (terminalAssistantText !== undefined && Date.now() - lastActivityAt >= idleGraceMs) {
-      return { sessionId, terminalAssistantText, exitCode, timedOut: false };
+    if (terminalAssistantText !== undefined && terminalError === undefined && Date.now() - lastActivityAt >= idleGraceMs) {
+      return { sessionId, terminalAssistantText, terminalError, exitCode, timedOut: false };
     }
 
     await sleep(100);
   }
 
   const exitCode = readExitMarkerCode(args.exitMarkerPath);
-  if (exitCode !== null && exitCode !== 0) {
-    return { sessionId, terminalAssistantText, exitCode, timedOut: false };
+  if (exitCode !== null && (exitCode !== 0 || terminalError !== undefined)) {
+    return { sessionId, terminalAssistantText, terminalError, exitCode, timedOut: false };
   }
 
-  if (terminalAssistantText !== undefined && Date.now() - lastActivityAt >= idleGraceMs) {
-    return { sessionId, terminalAssistantText, exitCode, timedOut: false };
+  if (terminalAssistantText !== undefined && terminalError === undefined && Date.now() - lastActivityAt >= idleGraceMs) {
+    return { sessionId, terminalAssistantText, terminalError, exitCode, timedOut: false };
   }
 
   return {
     sessionId,
     terminalAssistantText,
+    terminalError,
     exitCode,
     timedOut: true,
   };
@@ -1679,6 +1750,14 @@ export async function runSpawnTask(
     });
     await sessionMetadata.flush();
 
+    if (sessionState.terminalError !== undefined) {
+      result.sessionId = sessionState.sessionId ?? result.sessionId;
+      result.output = sessionState.terminalAssistantText?.trim() || sessionState.terminalError;
+      result.exitCode = sessionState.exitCode !== null && sessionState.exitCode !== 0 ? sessionState.exitCode : 1;
+      result.error = sessionState.terminalError;
+      return result;
+    }
+
     if (sessionState.exitCode !== null && sessionState.exitCode !== 0) {
       result.sessionId = sessionState.sessionId ?? result.sessionId;
       result.output = sessionState.terminalAssistantText || "(no output)";
@@ -1791,7 +1870,8 @@ export async function runSpawnTask(
       proc.on("close", (code) => {
         if (stdoutBuffer.trim()) processor.processLine(stdoutBuffer);
         processor.finalize(stderr);
-        if ((code ?? 0) !== 0 && stderr.trim()) result.error = stderr.trim();
+        const stderrText = stderr.trim();
+        if ((code ?? 0) !== 0 && stderrText && !result.error) result.error = stderrText;
         resolve(code ?? 0);
       });
 
@@ -1803,6 +1883,10 @@ export async function runSpawnTask(
     });
 
   await sessionMetadata.flush();
+
+  if (result.error && result.exitCode === 0) {
+    result.exitCode = 1;
+  }
 
   if (result.exitCode !== 0 && !result.error) {
     result.error = result.output || "Subagent process failed";

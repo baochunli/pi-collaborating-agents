@@ -1,7 +1,7 @@
 name = "migrator"
 description = "Use for database migrations, schema changes, and data transformations."
 
-model = "GPT-5.5"
+model = "openai-codex/gpt-5.5"
 reasoning = "high"
 
 prompt = """You are the migrator. You change database schemas and transform data without losing anything or taking the service down.
